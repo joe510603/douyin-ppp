@@ -28,6 +28,11 @@
 
 ## 🚀 快速开始
 
+### 环境要求
+
+- Python 3.10+
+- Node.js 18+ (用于签名服务)
+
 ### 本地运行
 
 ```bash
@@ -35,13 +40,22 @@
 git clone <repo-url>
 cd douyin-ppp
 
-# 2. 安装依赖
+# 2. 安装 Python 依赖
 pip install -r requirements.txt
 
-# 3. 启动服务
+# 3. 安装 Playwright 浏览器（用于自动获取 Cookie）
+playwright install chromium
+
+# 4. 初始化配置文件
+cp config.example.yaml config.yaml
+
+# 5. 启动签名服务（新终端窗口）
+cd websdk && npm install && npm start
+
+# 6. 启动主服务（新终端窗口）
 python3 app.py
 
-# 4. 打开浏览器访问 http://localhost:9527
+# 7. 打开浏览器访问 http://localhost:9527
 ```
 
 ## 📁 项目结构
@@ -49,9 +63,10 @@ python3 app.py
 ```
 douyin-ppp/
 ├── app.py                    # NiceGUI 应用入口
-├── config.yaml               # 配置文件
+├── config.example.yaml       # 配置文件模板（复制为 config.yaml 使用）
 ├── requirements.txt          # Python 依赖
 ├── proto/                    # Protobuf 定义 & JS 签名脚本
+├── websdk/                   # 签名服务（Node.js）
 ├── src/
 │   ├── web/                  # Web UI 页面模块
 │   │   ├── dashboard.py      #   仪表盘首页
@@ -76,9 +91,10 @@ douyin-ppp/
 │       ├── retry.py          #   重试机制
 │       ├── signer.py         #   签名算法
 │       └── cookie_manager.py #   Cookie 管理
-├── data/                      # 数据目录
+├── data/                      # 数据目录（运行时生成）
 │   ├── db/                   #   SQLite 数据库
 │   ├── exports/              #   Excel 导出文件
+│   ├── browser_data/         #   浏览器登录数据
 │   └── logs/                 #   日志文件
 └── tests/                     # 测试
 ```
@@ -88,6 +104,15 @@ douyin-ppp/
 ### 1. 配置 Cookie
 
 首次使用需要在 Web UI 的「配置管理」页面填写抖音 Cookie：
+
+**方式一：自动获取（推荐）**
+
+1. 进入「配置管理」页面
+2. 点击「自动获取 Cookie」按钮
+3. 在弹出的浏览器窗口中登录抖音
+4. 登录成功后程序自动获取并保存 Cookie
+
+**方式二：手动获取**
 
 1. 用浏览器登录 [抖音网页版](https://www.douyin.com/)
 2. 按 F12 打开开发者工具 → Application → Cookies → 复制 `ttwid` 值
