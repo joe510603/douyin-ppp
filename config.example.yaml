@@ -1,0 +1,37 @@
+app:
+  name: douyin-ppp
+  host: 0.0.0.0
+  port: 9527
+  debug: false
+douyin:
+  cookie: ''  # 在 Web 界面配置页面自动获取，或手动填写抖音 Cookie
+  cookie_expire_warning_hours: 24
+  websocket_url_template: ''
+monitors:
+- name: 示例账号
+  sec_user_id: ''  # 抖音用户 sec_user_id，在 Web 界面添加
+  room_id: ''
+  websocket_url: ''
+  enabled: true
+  tags: []
+live_detection:
+  interval: 60
+  timeout: 15
+  max_failures: 5
+  retry_interval: 300
+websocket:
+  heartbeat_interval: 5
+  reconnect_initial_delay: 2
+  reconnect_max_delay: 60
+  max_reconnect_attempts: 0
+  log_unknown_messages: false
+storage:
+  db_path: data/db/douyin_ppp.db
+  export_dir: data/exports
+  flush_interval: 10
+  excel_max_rows: 100000
+logging:
+  level: INFO
+  file_path: data/logs/app.log
+  rotation: 50 MB
+  retention: 7 days
