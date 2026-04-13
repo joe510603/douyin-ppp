@@ -197,3 +197,97 @@ class ExcelStorage:
             files.append(file_path)
         
         return files
+    
+    # 视频评论 Excel 列定义
+    VIDEO_EXCEL_COLUMNS = [
+        ("序号", "id"),
+        ("平台", "source"),
+        ("视频ID", "video_id"),
+        ("视频标题", "video_title"),
+        ("视频作者", "video_author"),
+        ("评论内容", "content"),
+        ("用户ID", "user_id"),
+        ("用户昵称", "user_nickname"),
+        ("点赞数", "like_count"),
+        ("回复数", "reply_count"),
+        ("发布时间", "publish_time"),
+        ("搜索关键词", "source_keyword"),
+        ("任务ID", "task_id"),
+        ("采集时间", "collected_at"),
+    ]
+    
+    async def export_video_comments(
+        self,
+        output_filename: Optional[str] = None,
+        source: Optional[str] = None,
+        task_id: Optional[str] = None,
+        keyword: Optional[str] = None,
+        source_keyword: Optional[str] = None,
+        start_time: Optional[datetime] = None,
+        end_time: Optional[datetime] = None,
+        max_rows: Optional[int] = None,
+    ) -> str:
+        """导出视频评论到 Excel"""
+        max_rows = max_rows or self.config.storage.excel_max_rows
+        
+        _, total = await self.storage.query_video_comments(
+            source=source, task_id=task_id, keyword=keyword,
+            source_keyword=source_keyword, start_time=start_time,
+            end_time=end_time, limit=1,
+        )
+        
+        if total == 0:
+            log.warning("没有视频评论数据可导出")
+            return ""
+        
+        actual_limit = min(total, max_rows)
+        comments, _ = await self.storage.query_video_comments(
+            source=source, task_id=task_id, keyword=keyword,
+            source_keyword=source_keyword, start_time=start_time,
+            end_time=end_time, limit=actual_limit,
+        )
+        
+        if not comments:
+            return ""
+        
+        df = pd.DataFrame(comments)
+        col_rename = {v: k for k, v in self.VIDEO_EXCEL_COLUMNS if v in df.columns}
+        df = df.rename(columns=col_rename)
+        ordered_cols = [k for k, _ in self.VIDEO_EXCEL_COLUMNS if k in df.columns]
+        df = df[ordered_cols]
+        
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        if not output_filename:
+            platform = source or "all"
+            output_filename = f"video_comments_{platform}_{timestamp}.xlsx"
+        
+        filepath = self.export_dir / output_filename
+        abs_path = str(filepath.resolve())
+        
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "视频评论"
+        
+        for col_idx, (header_name, _) in enumerate(self.VIDEO_EXCEL_COLUMNS, 1):
+            cell = ws.cell(row=1, column=col_idx, value=header_name)
+            cell.font = HEADER_FONT
+            cell.fill = HEADER_FILL
+            cell.alignment = HEADER_ALIGN
+            cell.border = THIN_BORDER
+        
+        for row_idx, row_data in enumerate(df.itertuples(index=False), 2):
+            for col_idx, value in enumerate(row_data, 1):
+                cell = ws.cell(row=row_idx, column=col_idx, value=value)
+                cell.alignment = CELL_ALIGN
+                cell.border = THIN_BORDER
+        
+        col_widths = [8, 10, 18, 40, 16, 60, 18, 16, 10, 10, 20, 16, 36, 20]
+        for i, width in enumerate(col_widths, 1):
+            if i <= 26:
+                ws.column_dimensions[chr(64 + i)].width = width
+        
+        ws.freeze_panes = "A2"
+        wb.save(abs_path)
+        log.info(f"视频评论 Excel 导出完成: {abs_path} ({total} 条记录)")
+        
+        return abs_path

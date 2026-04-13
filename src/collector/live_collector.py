@@ -13,6 +13,7 @@ from datetime import datetime
 from typing import Optional
 
 import websockets
+from websocket import WebSocketApp
 
 from ..config import get_config
 from ..models.comment import LiveComment, MessageType, LiveRoomInfo, MonitorAccount
@@ -178,16 +179,22 @@ class LiveCollector:
         self, 
         on_comment: Optional[callable] = None,
         on_status_change: Optional[callable] = None,
+        on_viewer_count_update: Optional[callable] = None,
+        on_stop_requested: Optional[callable] = None,  # 房间离线时通知停止采集
         monitor_name: str = "",
     ):
         """
         Args:
             on_comment: 新评论回调函数 signature: (comment: LiveComment) -> None
             on_status_change: 连接状态变化回调 signature: (connected: bool, msg: str) -> None
+            on_viewer_count_update: 在线人数更新回调 signature: (count: int, room_id: str) -> None
+            on_stop_requested: 房间离线时的停止请求回调 signature: () -> None
             monitor_name: 监控账号名称（用于标识数据来源）
         """
         self.on_comment = on_comment
         self.on_status_change = on_status_change
+        self.on_viewer_count_update = on_viewer_count_update
+        self.on_stop_requested = on_stop_requested
         self.monitor_name = monitor_name
         self._ws = None
         self._running = False
@@ -213,7 +220,18 @@ class LiveCollector:
     @property
     def stats(self) -> dict:
         return dict(self._stats)
-    
+
+    def _get_effective_cookie(self) -> str:
+        """获取包含 ttwid 的有效 cookie"""
+        config = get_config()
+        douyin_cookie = config.douyin.cookie or ""
+        video_cookie = config.douyin_video.cookie or ""
+        if "ttwid" in douyin_cookie:
+            return douyin_cookie
+        if "ttwid" in video_cookie:
+            return video_cookie
+        return douyin_cookie or video_cookie
+
     async def connect(self, room_id: str, cookie: str = "", ws_url_override: str = None) -> bool:
         """
         连接到指定直播间。
@@ -266,13 +284,20 @@ class LiveCollector:
         use_signer_first = True  # 标志：是否优先使用签名服务
         ttwid = None  # 存储 ttwid
         
-        # 尝试从 cookie 中提取 ttwid
-        if cookie:
-            import re
-            ttwid_match = re.search(r'ttwid=([^;]+)', cookie)
+        # 尝试从 cookie 中提取 ttwid，如果没有则使用 effective cookie
+        import re
+        effective_cookie = self._get_effective_cookie()
+        cookie_to_use = cookie if "ttwid" in cookie else effective_cookie
+
+        if cookie_to_use:
+            ttwid_match = re.search(r'ttwid=([^;]+)', cookie_to_use)
             if ttwid_match:
                 ttwid = ttwid_match.group(1)
-                log.debug(f"从配置中提取到 ttwid: {ttwid[:20]}...")
+                log.debug(f"从 cookie 中提取到 ttwid: {ttwid[:20]}...")
+            else:
+                log.warning("提供的 cookie 中没有 ttwid，弹幕功能可能受限")
+                # 仍然使用 cookie（可能没有 ttwid）作为备用
+                cookie_to_use = cookie_to_use or cookie
 
         while self._running:
             # 1. 首次尝试：使用账号指定的 URL
@@ -281,12 +306,18 @@ class LiveCollector:
                 log.info(f"使用账号指定的 WebSocket URL")
 
             # 2. 优先使用 Node.js 签名服务（高性能）
+            cursor = ""
+            internal_ext = ""
+            heartbeat_duration = 0
             if not ws_url and use_signer_first:
                 log.info("正在使用 Node.js 签名服务获取 WebSocket URL...")
-                
-                # 如果没有 ttwid，先从直播间页面获取
-                if not ttwid:
-                    log.info("未找到 ttwid，正在从直播间页面获取...")
+
+                # 如果 room_id 位数不够（是 web_rid 而非真实 room_id），必须先获取真实 room_id
+                # 或者如果没有 ttwid，也需要从页面获取
+                need_fetch_page = (len(str(room_id)) < 18) or (not ttwid)
+                if need_fetch_page:
+                    reason = "room_id 位数不足(可能是 web_rid)" if len(str(room_id)) < 18 else "未找到 ttwid"
+                    log.info(f"需要从直播间页面获取信息: {reason}")
                     # 构建直播间 URL（假设 room_id 是直播间的 web_rid）
                     live_url = f"https://live.douyin.com/{room_id}"
                     room_info = await self._fetch_room_info_from_page(live_url)
@@ -294,10 +325,42 @@ class LiveCollector:
                         ttwid = room_info.get('ttwid')
                         real_room_id = room_info.get('room_id')
                         if real_room_id and real_room_id != room_id:
-                            log.info(f"使用真实的 room_id: {real_room_id}")
+                            log.info(f"✅ 获取到真实 room_id: {real_room_id} (原 room_id={room_id})")
                             room_id = real_room_id
-                
-                ws_url = await self._fetch_signed_ws_url_from_signer(room_id)
+                        elif len(str(room_id)) < 18:
+                            log.warning(f"⚠️ 未能获取真实 room_id，当前 room_id={room_id} 可能不正确，弹幕功能可能异常")
+
+                # 【关键】先获取 cursor 和 internal_ext（参考 DouYin_Spider）
+                webcast_info = await self._fetch_webcast_detail(room_id, cookie_to_use)
+                if webcast_info:
+                    cursor = webcast_info.get("cursor", "")
+                    internal_ext = webcast_info.get("internal_ext", "")
+                    heartbeat_duration = webcast_info.get("heartbeat_duration", 0)
+                    log.info(f"✅ 获取 webcast detail: cursor={cursor[:30] if cursor else 'N/A'}..., internal_ext={len(internal_ext) if internal_ext else 0}B")
+                    # 如果 cursor 为空，说明房间已下播（或 room_id 陈旧），尝试从直播间页面获取真实 room_id
+                    if not cursor and not internal_ext:
+                        log.warning(f"⚠️ 直播间 {room_id} 暂无直播内容，尝试从直播间页面获取真实 room_id...")
+                        # 尝试直接请求直播间页面获取 room_id
+                        real_room_id = await self._fetch_room_id_from_live_page(room_id, cookie_to_use)
+                        if real_room_id and real_room_id != room_id:
+                            log.info(f"✅ 找到真实 room_id: {real_room_id}，重新获取 webcast detail...")
+                            room_id = real_room_id
+                            # 用新 room_id 重新获取 webcast detail
+                            webcast_info2 = await self._fetch_webcast_detail(room_id, cookie_to_use)
+                            if webcast_info2:
+                                cursor = webcast_info2.get("cursor", "")
+                                internal_ext = webcast_info2.get("internal_ext", "")
+                                heartbeat_duration = webcast_info2.get("heartbeat_duration", 0)
+                                if not cursor and not internal_ext:
+                                    log.warning(f"⚠️ 直播间 {room_id} 确实暂无直播内容，跳过采集")
+                                    self._notify_status(False, "房间暂无直播内容")
+                                    return
+                        else:
+                            log.warning(f"⚠️ 直播间 {room_id} 暂无直播内容（webcast detail 返回空），跳过采集")
+                            self._notify_status(False, "房间暂无直播内容")
+                            return
+
+                ws_url = await self._fetch_signed_ws_url_from_signer(room_id, cursor=cursor, internal_ext=internal_ext)
                 if ws_url:
                     log.info("✅ Node.js 签名服务获取成功")
                 else:
@@ -312,62 +375,237 @@ class LiveCollector:
                 else:
                     # 4. 最后手段：使用备用方式构建
                     log.warning("Playwright 失败，使用备用方式构建 WebSocket URL")
-                    ws_url = self._build_ws_url(room_id, cookie)
+                    ws_url = self._build_ws_url(room_id, cookie_to_use)
 
             try:
                 log.info(f"正在连接直播间 {room_id}...")
                 self._notify_status(True, f"连接中... {ws_url[:60]}...")
 
-                # 构建请求头（参考 douyin-parse-danmu）
-                headers = None
-                if ttwid or cookie:
-                    from websockets.http import Headers
-                    headers = Headers()
-                    # 使用 ttwid 构建 Cookie
-                    cookie_header = f"ttwid={ttwid}" if ttwid else cookie
-                    headers["Cookie"] = cookie_header
-                    headers["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36 Edg/126.0.0.0"
-                    log.debug(f"WebSocket 连接 Headers: Cookie={cookie_header[:30]}...")
+                # 构建请求头（参考 DouYin_Spider/dy_live/server.py）
+                cookie_str = f"ttwid={ttwid}" if ttwid else cookie_to_use
+                log.debug(f"WebSocket 连接 Cookie: {cookie_str[:30]}...")
 
-                # websockets 12.0+ 使用 additional_headers
-                ws_kwargs = {
-                    "ping_interval": config.websocket.heartbeat_interval,
-                    "ping_timeout": 15,
-                    "close_timeout": 5,
-                    "max_size": 10 * 1024 * 1024,  # 10MB max message
-                }
-                if headers:
-                    ws_kwargs["additional_headers"] = headers
+                # ------------------------------------------------------------
+                # 【核心修复】使用同步 websocket-client 在后台线程运行
+                # 原因：websockets 的 async for 迭代器在无消息时阻塞事件循环，
+                # 导致 Monitor 任务的 asyncio.sleep() 永远得不到执行。
+                # 参考 DouYin_Spider/dy_live/server.py 的架构：
+                #   - WebSocketApp 运行在独立线程
+                #   - 消息通过 Queue 传递到主事件循环
+                #   - 心跳在独立线程中发送
+                # ------------------------------------------------------------
+                import threading
+                from queue import Queue, Empty
+                from proto import dy_pb2
 
-                async with websockets.connect(ws_url, **ws_kwargs) as ws:
-                    self._ws = ws
-                    self._reconnect_mgr.record_success()
-                    self._stats["connect_time"] = datetime.now().isoformat()
-                    
-                    log.info(f"✅ 直播间 {room_id} 已连接")
-                    self._notify_status(True, f"已连接 - 直播间 {room_id}")
-                    
-                    # 注意：参考 douyin-parse-danmu 项目，不需要发送进入直播间请求
-                    # WebSocket 连接建立后，服务器会自动推送消息
-                    
-                    # 接收消息循环
-                    message_count = 0
-                    async for raw_msg in ws:
-                        if not self._running:
+                msg_queue: Queue = Queue()
+                shutdown_event = threading.Event()
+                ws_thread_exception: Exception | None = None
+
+                # 用于 ACK 的 WebSocket 实例（在子线程中持有）
+                _sync_ws_for_ack: list = []
+
+                def _on_ws_open(ws: WebSocketApp):
+                    log.info(f"[WS-THREAD] WebSocket 已连接 room={room_id}")
+                    _sync_ws_for_ack.append(ws)
+
+                def _on_ws_message(ws: WebSocketApp, raw_msg):
+                    """WebSocketApp 回调，在子线程中执行 — 只负责入队，不处理业务"""
+                    if shutdown_event.is_set():
+                        return
+                    try:
+                        msg_queue.put_nowait(raw_msg)
+                    except Exception:
+                        pass  # 队列满时丢弃（极端情况）
+
+                def _on_ws_error(ws: WebSocketApp, error):
+                    nonlocal ws_thread_exception
+                    log.warning(f"[WS-THREAD] WebSocket 错误: {error}")
+                    ws_thread_exception = error
+
+                def _on_ws_close(ws: WebSocketApp, close_status_code, close_msg):
+                    log.warning(f"[WS-THREAD] WebSocket 关闭: code={close_status_code}, msg={close_msg}")
+                    shutdown_event.set()
+
+                def _run_ws_thread():
+                    """在子线程中运行 WebSocket 客户端（同步 API）"""
+                    try:
+                        # 构建 header
+                        header_list = [
+                            "Pragma: no-cache",
+                            "Accept-Language: zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6",
+                            "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36 Edg/126.0.0.0",
+                            "Upgrade: websocket",
+                            "Cache-Control: no-cache",
+                            "Connection: Upgrade",
+                            "Origin: https://live.douyin.com",
+                        ]
+                        # 使用 ttwid 构建 Cookie
+                        cookie_str = f"ttwid={ttwid}" if ttwid else cookie_to_use
+
+                        app = WebSocketApp(
+                            url=ws_url,
+                            header=header_list,
+                            cookie=cookie_str,
+                            on_open=_on_ws_open,
+                            on_message=_on_ws_message,
+                            on_error=_on_ws_error,
+                            on_close=_on_ws_close,
+                        )
+
+                        # 使用 run_forever 的内置 ping（标准 WebSocket ping 帧）
+                        # 不要发送自定义 Protobuf hb 帧 — 抖音服务器可能不认识导致断开
+                        app.run_forever(ping_interval=20, ping_timeout=10)
+                    except Exception as e:
+                        nonlocal ws_thread_exception
+                        log.error(f"[WS-THREAD] 运行异常: {e}")
+                        ws_thread_exception = e
+                    finally:
+                        shutdown_event.set()
+
+                # 在后台线程中启动 WebSocket
+                ws_thread = threading.Thread(target=_run_ws_thread, daemon=True)
+                ws_thread.start()
+
+                self._reconnect_mgr.record_success()
+                self._stats["connect_time"] = datetime.now().isoformat()
+                log.info(f"✅ 直播间 {room_id} 已连接（后台线程模式）")
+                self._notify_status(True, f"已连接 - 直播间 {room_id}")
+
+                # ------------------------------------------------------------
+                # 主事件循环：消费消息队列 + 运行 Monitor 任务
+                # 由于 WebSocket 在子线程运行，事件循环始终保持响应
+                # ------------------------------------------------------------
+                message_count = 0
+                last_msg_time = import_time.time()
+                no_message_start: float | None = None
+                NO_MESSAGE_TIMEOUT = 120
+                NO_MESSAGE_WARN = 60
+                connection_start = import_time.time()
+                ws_closed_expected = False  # 是否是主动关闭
+
+                async def _monitor_timeout():
+                    nonlocal no_message_start, message_count
+                    last_warn_logged = False
+                    last_timeout_logged = False
+                    try:
+                        for i in range(200):  # 最多运行 200 * 5 = 1000 秒
+                            if not self._running:
+                                return
+                            await asyncio.sleep(5)
+                            elapsed_connect = import_time.time() - connection_start
+                            elapsed_no_msg = (import_time.time() - no_message_start
+                                if no_message_start is not None and message_count > 0
+                                else elapsed_connect)
+                            if elapsed_no_msg >= NO_MESSAGE_TIMEOUT and not last_timeout_logged:
+                                log.warning(f"⏰ 直播间 {room_id} 超过{NO_MESSAGE_TIMEOUT}秒无消息，标记为无数据状态")
+                                self._notify_status(False, f"无数据({int(elapsed_no_msg)}s无消息)")
+                                last_timeout_logged = True
+                                last_warn_logged = True
+                            elif elapsed_no_msg >= NO_MESSAGE_WARN and not last_warn_logged:
+                                log.warning(f"⚠️ 直播间 {room_id} 超过{NO_MESSAGE_WARN}秒无消息（已连接{int(elapsed_connect)}s）")
+                                last_warn_logged = True
+                    except asyncio.CancelledError:
+                        pass
+                    except Exception as e:
+                        log.error(f"[Monitor] 异常: {e}")
+
+                timeout_task = asyncio.create_task(_monitor_timeout())
+                log.info(f"[Monitor] 启动超时监控任务 for room={room_id}")
+
+                # 获取事件循环引用，用于从子线程上下文发送 ACK
+                loop = asyncio.get_running_loop()
+
+                async def _send_ack_from_thread(log_id: int, internal_ext: str):
+                    """从子线程调用：在主事件循环中发送 ACK"""
+                    sync_ws = _sync_ws_for_ack[0] if _sync_ws_for_ack else None
+                    if not sync_ws:
+                        return
+                    ack_frame = dy_pb2.PushFrame()
+                    ack_frame.payloadType = "ack"
+                    ack_frame.logId = log_id
+                    ack_frame.payload = internal_ext.encode('utf-8')
+                    sync_ws.send(ack_frame.SerializeToString(), opcode=0x02)
+
+                # 消费消息队列（关键：用 asyncio.to_thread 避免阻塞事件循环）
+                # 如果直接用 msg_queue.get(timeout=1)，会同步阻塞整个 asyncio 事件循环，
+                # 导致 uvicorn/NiceGUI 无法处理 HTTP 请求（curl 超时）
+                running = True
+                while running and self._running:
+                    try:
+                        # 在线程池中执行同步的 Queue.get()，让事件循环保持响应
+                        raw_msg = await asyncio.to_thread(msg_queue.get, timeout=1)
+                    except Empty:
+                        # 检查子线程是否异常退出
+                        if shutdown_event.is_set():
+                            if ws_thread_exception:
+                                raise ws_thread_exception
                             break
+                        continue
 
-                        message_count += 1
+                    now = import_time.time()
+                    if message_count == 0:
+                        no_message_start = now
+                    message_count += 1
+                    last_msg_time = now
+
+                    try:
+                        await self._handle_raw_message_async(
+                            raw_msg, room_id, _send_ack_from_thread
+                        )
+                    except Exception as e:
+                        log.error(f"处理消息异常: {e}", exc_info=True)
+
+                    # 让出事件循环，确保 Monitor 任务有机会运行
+                    await asyncio.sleep(0)
+
+                    elapsed_no_msg = now - no_message_start if no_message_start else 0
+                    if elapsed_no_msg >= NO_MESSAGE_TIMEOUT:
+                        log.warning(f"⏰ 直播间 {room_id} 超过{NO_MESSAGE_TIMEOUT}秒无消息")
+                        self._notify_status(False, f"无数据({int(elapsed_no_msg)}s无消息)")
+                        no_message_start = None
+                    elif elapsed_no_msg >= NO_MESSAGE_WARN and message_count > 1:
+                        log.warning(f"⚠️ 直播间 {room_id} 超过{NO_MESSAGE_WARN}秒无消息")
+
+                    # web_rid 重新检测
+                    if len(str(room_id)) <= 15 and elapsed_no_msg >= NO_MESSAGE_WARN:
                         try:
-                            if isinstance(raw_msg, bytes):
-                                log.debug(f"收到二进制消息 #{message_count}: {len(raw_msg)} bytes")
-                                await self._handle_raw_message(raw_msg, room_id, ws)  # 传递 ws 对象
-                            elif isinstance(raw_msg, str):
-                                log.debug(f"收到文本消息 #{message_count}: {raw_msg[:200]}")
-                                # frontier 协议可能发送文本消息
-                                self._stats["messages_total"] += 1
+                            live_url = f"https://live.douyin.com/{room_id}"
+                            room_info = await self._fetch_room_info_from_page(live_url)
+                            if room_info and room_info.get("room_id") and room_info["room_id"] != room_id:
+                                real_room_id = room_info["room_id"]
+                                log.info(f"🔄 成功获取真实 room_id={real_room_id}，将重新连接...")
+                                # 通知子线程关闭
+                                shutdown_event.set()
+                                room_id = real_room_id
+                                ws_url = None
+                                continue
                         except Exception as e:
-                            log.error(f"处理消息异常: {e}")
-                            
+                            log.warning(f"重新获取 room_id 失败: {e}")
+
+                    # 检查子线程状态
+                    if shutdown_event.is_set():
+                        break
+
+                # 清理
+                timeout_task.cancel()
+                try:
+                    await asyncio.wait_for(asyncio.shield(timeout_task), timeout=2)
+                except (asyncio.CancelledError, asyncio.TimeoutError):
+                    pass
+                self._ws = None
+                _sync_ws_for_ack.clear()
+                msg_queue.queue.clear()
+
+                if not self._running:
+                    break
+
+                # 检查子线程是否有异常
+                if ws_thread_exception:
+                    raise ws_thread_exception
+
+                self._reconnect_mgr.record_failure()
+
             except websockets.exceptions.ConnectionClosed as e:
                 log.warning(f"WebSocket 连接关闭: {e.code} {e.reason}")
                 self._notify_status(False, f"连接断开: {e.reason}")
@@ -437,7 +675,7 @@ class LiveCollector:
 
     async def _fetch_room_info_from_page(self, live_url: str) -> dict | None:
         """
-        从直播间页面获取 ttwid 和 room_id
+        从直播间页面获取 ttwid 和 room_id（使用 httpx 同步请求，在线程中运行）
         
         Args:
             live_url: 直播间 URL (https://live.douyin.com/xxx)
@@ -445,45 +683,47 @@ class LiveCollector:
         Returns:
             dict: {'ttwid': str, 'room_id': str} 或 None
         """
-        try:
-            import aiohttp
+        def _fetch_sync():
             import re
-            
-            headers = {
-                'authority': 'live.douyin.com',
-                'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8',
-                'accept-language': 'zh-CN,zh;q=0.9,en;q=0.8',
-                'cache-control': 'max-age=0',
-                'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36 Edg/126.0.0.0',
-            }
-            
-            async with aiohttp.ClientSession() as session:
-                async with session.get(live_url, headers=headers, ssl=False) as response:
-                    if response.status != 200:
-                        log.error(f"获取直播间页面失败: HTTP {response.status}")
+            try:
+                import httpx as _httpx
+                
+                headers = {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36 Edg/126.0.0.0',
+                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8',
+                    'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+                    'Accept-Encoding': 'gzip, deflate',
+                    'Referer': 'https://live.douyin.com/',
+                }
+                # 注意：带 Cookie 请求 live.douyin.com 会返回空页面(6KB)，
+                # 不带 Cookie 反而能获取到完整HTML(1MB+)，其中包含 roomId
+                
+                with _httpx.Client(timeout=15, follow_redirects=True) as client:
+                    resp = client.get(live_url, headers=headers)
+                    if resp.status_code != 200:
+                        log.error(f"获取直播间页面失败: HTTP {resp.status_code}")
                         return None
+                    
+                    html = resp.text
+                    if len(html) < 50000:
+                        log.warning(f"httpx 返回页面太短({len(html)}B)，可能被验证码拦截，尝试 Playwright")
+                        return _fetch_with_playwright()
                     
                     # 1. 从 Set-Cookie 中提取 ttwid
                     ttwid = None
-                    for header in response.headers.getall('Set-Cookie', []):
-                        if 'ttwid=' in header:
-                            ttwid_match = re.search(r'ttwid=([^;]+)', header)
+                    for header_value in resp.headers.get_list('set-cookie'):
+                        if 'ttwid=' in header_value:
+                            ttwid_match = re.search(r'ttwid=([^;]+)', header_value)
                             if ttwid_match:
                                 ttwid = ttwid_match.group(1)
                                 break
                     
-                    # 2. 从页面内容中提取 room_id
-                    html = await response.text()
-                    room_id_match = re.search(r'roomId\\\\":\\\\"(\d+)\\\\"', html)
-                    if not room_id_match:
-                        # 尝试另一种格式
-                        room_id_match = re.search(r'"roomId":"(\d+)"', html)
+                    # 2. 从页面内容中提取真实 room_id
+                    room_id = _extract_room_id_from_html(html, live_url)
                     
-                    if not room_id_match:
-                        log.error("无法从页面中提取 room_id")
+                    if not room_id:
+                        log.error(f"无法从页面中提取 room_id, html_len={len(html)}")
                         return None
-                    
-                    room_id = room_id_match.group(1)
                     
                     log.info(f"从页面获取到 ttwid={ttwid[:20] if ttwid else 'None'}..., room_id={room_id}")
                     
@@ -492,15 +732,143 @@ class LiveCollector:
                         'room_id': room_id
                     }
                     
+            except Exception as e:
+                log.error(f"httpx 获取直播间信息失败: {e}")
+                return _fetch_with_playwright()
+        
+        def _fetch_with_playwright():
+            """使用 Playwright 获取 room_id（httpx 失败时的回退方案）"""
+            import re
+            try:
+                from playwright.sync_api import sync_playwright
+                from pathlib import Path
+
+                browser_data_dir = Path("data/browser_data")
+                browser_data_dir.mkdir(parents=True, exist_ok=True)
+
+                with sync_playwright() as p:
+                    # 优先使用持久化上下文（包含登录状态）
+                    try:
+                        context = p.chromium.launch_persistent_context(
+                            user_data_dir=str(browser_data_dir),
+                            headless=True,
+                            viewport={'width': 1680, 'height': 1050},
+                            user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36 Edg/126.0.0.0',
+                            args=['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
+                        )
+                        page = context.pages[0] if context.pages else context.new_page()
+                        browser = None
+                    except Exception:
+                        # 回退：使用独立 browser
+                        browser = p.chromium.launch(
+                            headless=True,
+                            args=['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
+                        )
+                        context = browser.new_context(
+                            viewport={'width': 1680, 'height': 1050},
+                            user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36 Edg/126.0.0.0',
+                        )
+                        page = context.new_page()
+
+                    try:
+                        page.goto(live_url, wait_until='domcontentloaded', timeout=15000)
+                        page.wait_for_timeout(3000)
+
+                        # 从 JS 变量提取 room_id
+                        live_page_data = page.evaluate('''() => {
+                            try {
+                                const renderEl = document.getElementById('RENDER_DATA');
+                                if (renderEl) {
+                                    const text = decodeURIComponent(renderEl.textContent);
+                                    const m = text.match(/"room_id"\\s*:\\s*"?(\d{18,})"?/);
+                                    if (m) return {room_id: m[1], ttwid: null};
+                                }
+                            } catch(e) {}
+                            // 回退：尝试其他方式
+                            try {
+                                const nextData = document.getElementById('__NEXT_DATA__');
+                                if (nextData) {
+                                    const data = JSON.parse(nextData.textContent);
+                                    const rid = data?.props?.pageProps?.room?.room_id;
+                                    if (rid) return {room_id: String(rid), ttwid: null};
+                                }
+                            } catch(e) {}
+                            return null;
+                        }''')
+
+                        ttwid = None
+                        room_id = None
+                        if live_page_data and live_page_data.get('room_id'):
+                            room_id = str(live_page_data['room_id'])
+                            log.info(f"Playwright 获取到真实 room_id={room_id}")
+                        else:
+                            # 从 HTML 提取
+                            html = page.content()
+                            room_id = _extract_room_id_from_html(html, live_url)
+
+                        # 提取 ttwid
+                        for cookie in context.cookies():
+                            if cookie['name'] == 'ttwid':
+                                ttwid = cookie['value']
+                                break
+
+                        if room_id:
+                            log.info(f"Playwright 从页面获取到 room_id={room_id}")
+                            return {'ttwid': ttwid, 'room_id': room_id}
+                        else:
+                            log.error(f"Playwright 也无法提取 room_id")
+                            return None
+                    finally:
+                        page.close()
+                        context.close()
+                        if browser:
+                            browser.close()
+            except Exception as e:
+                log.error(f"Playwright 获取直播间信息失败: {e}")
+                return None
+        
+        def _extract_room_id_from_html(html, url):
+            """从 HTML 内容提取真实 room_id"""
+            room_id = None
+            web_rid_match = re.search(r'live\.douyin\.com/(\d+)', url)
+            web_rid = web_rid_match.group(1) if web_rid_match else None
+            
+            # 策略1: 找 web_rid 附近的 roomId
+            if web_rid:
+                nearby = re.findall(r'roomId.{0,50}?web_rid.{0,30}?' + re.escape(web_rid), html)
+                if nearby:
+                    context_match = re.search(r'roomId[^\d]*(\d{18,20})', nearby[0])
+                    if context_match:
+                        room_id = context_match.group(1)
+            # 策略2: 转义格式
+            if not room_id:
+                escaped_match = re.findall(r'roomId\\\\\":\\\\\"(\d{18,20})\\\\\"', html)
+                if escaped_match:
+                    room_id = escaped_match[0]
+            # 策略3: HTML 实体格式
+            if not room_id:
+                entity_match = re.findall(r'roomId&quot;:&quot;(\d{18,20})&quot;', html)
+                if entity_match:
+                    room_id = entity_match[0]
+            # 策略4: 回退
+            if not room_id:
+                all_matches = re.findall(r'roomId.*?(\d{18,20})', html)
+                if all_matches:
+                    room_id = all_matches[0]
+            return room_id
+        
+        try:
+            import asyncio
+            return await asyncio.to_thread(_fetch_sync)
         except Exception as e:
-            log.error(f"获取直播间信息失败: {e}", exc_info=True)
+            log.error(f"在线程中运行页面获取失败: {e}")
             return None
 
-    async def _fetch_signed_ws_url_from_signer(self, room_id: str) -> str | None:
+    async def _fetch_signed_ws_url_from_signer(self, room_id: str, cursor: str = "", internal_ext: str = "") -> str | None:
         """
         使用 Node.js 签名服务获取 WebSocket URL（高性能方式）
-        
-        参考自 douyin-parse-danmu 项目的实现
+
+        参考 DouYin_Spider/dy_live/server.py 的完整参数列表
         """
         try:
             from ..utils.signer_client import get_signer_client
@@ -542,6 +910,7 @@ class LiveCollector:
                 return None
             
             # 4. 构建 WebSocket URL（使用 webcast5 服务器）
+            # 【关键参数】参考 DouYin_Spider 的完整参数列表
             webcast_params = {
                 "room_id": str(room_id),
                 "compress": "gzip",
@@ -552,6 +921,35 @@ class LiveCollector:
                 "user_unique_id": user_unique_id,
                 "identity": "audience",
                 "signature": signature,
+                # 以下是参考项目添加的关键参数
+                "aid": "6383",
+                "device_platform": "web",
+                "cookie_enabled": "true",
+                "screen_width": "2560",
+                "screen_height": "1440",
+                "browser_language": "zh-CN",
+                "browser_platform": "Win32",
+                "browser_name": "Mozilla",
+                "browser_version": "5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36 Edg/126.0.0.0",
+                "browser_online": "true",
+                "tz_name": "Asia/Shanghai",
+                "update_version_code": version_code,
+                "app_name": "douyin_web",
+                "endpoint": "live_pc",
+                "support_wrds": "1",
+                # cursor 和 internal_ext 来自 get_webcast_detail API
+                "cursor": cursor,
+                "internal_ext": internal_ext,
+                "heartbeatDuration": "0",
+                "live_reason": "",
+                "im_path": "/webcast/im/fetch/",
+                "need_persist_msg_count": "15",
+                "insert_task_id": "",
+                "sub_room_id": "",
+                "sub_channel_id": "",
+                "device_type": "",
+                "ac": "",
+                "host": "https://live.douyin.com",
             }
             
             # 5. 构建基础 WebSocket URL
@@ -585,44 +983,289 @@ class LiveCollector:
             log.error(f"使用签名服务失败: {e}", exc_info=True)
             return None
 
+    async def _fetch_webcast_detail(self, room_id: str, cookie: str = "", user_unique_id: str = "") -> dict | None:
+        """
+        获取直播间的 cursor 和 internal_ext（参考 DouYin_Spider/dy_apis/douyin_api.py）
+
+        调用 https://live.douyin.com/webcast/im/fetch/ 返回 Protobuf Response，
+        其中包含 cursor、internalExt、heartbeatDuration 等关键参数。
+        这些参数必须传给 WebSocket 连接，服务器才知道从哪个位置开始推送消息。
+
+        关键修复：需要 a_bogus 签名 + msToken，否则返回 Content-Length: 0。
+        """
+        try:
+            import httpx
+            from proto import dy_pb2
+            import urllib.parse
+
+            # 从 cookie 提取 msToken
+            ms_token = ""
+            if cookie:
+                for part in cookie.split(";"):
+                    part = part.strip()
+                    if "=" in part:
+                        k, v = part.split("=", 1)
+                        if k.strip().lower() == "mstoken":
+                            ms_token = urllib.parse.unquote(v.strip())
+                            break
+
+            # user_unique_id：优先使用传入的值（来自浏览器检测），否则生成随机
+            if not user_unique_id:
+                user_unique_id = str(random.randint(7300000000000000000, 7999999999999999999))
+
+            # 构建请求参数（参考 DouYin_Spider 的 get_webcast_detail）
+            base_params = {
+                "resp_content_type": "protobuf",
+                "did_rule": "3",
+                "device_id": "",
+                "app_name": "douyin_web",
+                "endpoint": "live_pc",
+                "support_wrds": "1",
+                "user_unique_id": str(user_unique_id),
+                "identity": "audience",
+                "need_persist_msg_count": "15",
+                "insert_task_id": "",
+                "live_reason": "",
+                "room_id": str(room_id),
+                "version_code": "180800",
+                "last_rtt": "0",
+                "live_id": "1",
+                "aid": "6383",
+                "fetch_rule": "1",
+                "cursor": "",
+                "internal_ext": "",
+                "device_platform": "web",
+                "cookie_enabled": "true",
+                "screen_width": "2560",
+                "screen_height": "1440",
+                "browser_language": "zh-CN",
+                "browser_platform": "Win32",
+                "browser_name": "Mozilla",
+                "browser_version": "5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36 Edg/126.0.0.0",
+                "browser_online": "true",
+                "tz_name": "Asia/Shanghai",
+            }
+
+            # 生成 a_bogus 签名（关键！无签名服务器返回空）
+            a_bogus = ""
+            try:
+                from ..utils.signer import generate_a_bogus
+                params_str = "&".join(f"{k}={v}" for k, v in base_params.items())
+                a_bogus = generate_a_bogus(params_str, user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36 Edg/126.0.0.0")
+            except Exception as e:
+                log.debug(f"生成 a_bogus 失败: {e}")
+
+            if a_bogus:
+                base_params["a_bogus"] = a_bogus
+            if ms_token:
+                base_params["msToken"] = ms_token
+
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36 Edg/126.0.0.0",
+                "Accept": "*/*",
+                "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+                "Accept-Encoding": "gzip, deflate, br",
+                "Origin": "https://live.douyin.com",
+                "Referer": f"https://live.douyin.com/{room_id}",
+            }
+
+            # 将 cookie 字符串转换为 httpx 可接受的格式
+            cookie_dict = {}
+            if cookie:
+                for part in cookie.split(";"):
+                    part = part.strip()
+                    if "=" in part:
+                        k, v = part.split("=", 1)
+                        cookie_dict[k.strip()] = v.strip()
+
+            # 同步请求在异步函数中运行
+            def _fetch_sync():
+                with httpx.Client(timeout=10.0) as client:
+                    resp = client.get(
+                        "https://live.douyin.com/webcast/im/fetch/",
+                        params=base_params,
+                        headers=headers,
+                        cookies=cookie_dict,
+                    )
+                    return resp.content
+
+            raw_bytes = await asyncio.get_running_loop().run_in_executor(None, _fetch_sync)
+
+            if not raw_bytes or len(raw_bytes) == 0:
+                log.warning(f"[webcast_detail] 直播间 {room_id} 返回空（Content-Length: 0）")
+                return None
+
+            response = dy_pb2.Response()
+            response.ParseFromString(raw_bytes)
+
+            log.info(f"[webcast_detail] cursor={response.cursor[:50] if response.cursor else 'N/A'}, internalExt_len={len(response.internalExt)}, heartbeatDuration={response.heartbeatDuration}, needAck={response.needAck}")
+
+            return {
+                "cursor": str(response.cursor),
+                "internal_ext": response.internalExt,
+                "heartbeat_duration": response.heartbeatDuration,
+                "need_ack": response.needAck,
+            }
+
+        except Exception as e:
+            log.error(f"获取 webcast detail 失败: {e}", exc_info=True)
+            return None
+
+    async def _fetch_room_id_from_live_page(self, room_id_or_web_rid: str, cookie: str = "") -> str | None:
+        """
+        从直播间页面获取真实 room_id（18位长ID）。
+
+        当 detector 返回的 room_id 是陈旧的 web_rid 或已下播房间时，
+        此方法通过请求直播间页面来获取当前真实的 room_id。
+        """
+        try:
+            import httpx, re
+
+            def _fetch_sync():
+                headers = {
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36 Edg/126.0.0.0",
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+                    "Accept-Encoding": "gzip, deflate, br",
+                    "Referer": "https://live.douyin.com/",
+                }
+                cookies = {}
+                if cookie:
+                    for part in cookie.split(";"):
+                        part = part.strip()
+                        if "=" in part:
+                            k, v = part.split("=", 1)
+                            cookies[k.strip()] = v.strip()
+
+                with httpx.Client(timeout=10.0, follow_redirects=True) as client:
+                    resp = client.get(
+                        f"https://live.douyin.com/{room_id_or_web_rid}",
+                        headers=headers,
+                        cookies=cookies,
+                    )
+                    return resp.text
+
+            html = await asyncio.get_running_loop().run_in_executor(None, _fetch_sync)
+
+            # 策略1: 从 script 标签的 JSON 中提取 roomId（参考 DouYin_Spider）
+            room_id_match = re.search(r'"roomId"\s*:\s*"?(\d{18,20})"?', html)
+            if room_id_match:
+                return room_id_match.group(1)
+
+            # 策略2: 从 script 标签中提取 room_id（标准格式）
+            room_id_match2 = re.search(r'"room_id"\s*:\s*"?(\d{18,20})"?', html)
+            if room_id_match2:
+                return room_id_match2.group(1)
+
+            # 策略3: 查找 room_id 和 web_rid 关联（roomId ... web_rid XXX 格式）
+            room_id_match3 = re.search(r'roomId[^"]*?"(\d{18,20})"[^}]*?web_rid[^"]*?"' + re.escape(room_id_or_web_rid), html)
+            if room_id_match3:
+                return room_id_match3.group(1)
+
+            # 策略4: 从 HTML 中查找 18+ 位数字的房间 ID
+            long_ids = re.findall(r'\b(\d{18,20})\b', html)
+            for rid in long_ids[:5]:  # 取前5个
+                if rid == room_id_or_web_rid:
+                    continue
+                # 验证这个 ID 对应的房间是否有效
+                detail = self._check_room_by_webcast_detail(rid)
+                if detail:
+                    return rid
+
+            return None
+
+        except Exception as e:
+            log.debug(f"从直播间页面获取 room_id 失败: {e}")
+            return None
+
+    def _check_room_by_webcast_detail(self, room_id: str) -> bool:
+        """同步检查房间是否有效（通过 webcast detail）"""
+        try:
+            import httpx, gzip, re
+            from proto import dy_pb2
+
+            params = {
+                "room_id": room_id, "aid": "6383", "app_name": "douyin_web",
+                "version_code": "180800", "live_id": "1", "did_rule": "3",
+                "device_platform": "web", "endpoint": "live_pc",
+                "support_wrds": "1", "user_unique_id": "7500000000000000001",
+                "identity": "audience", "need_persist_msg_count": "15",
+                "fetch_rule": "1", "cursor": "", "internal_ext": "",
+                "resp_content_type": "protobuf",
+            }
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                "Origin": "https://live.douyin.com",
+                "Referer": f"https://live.douyin.com/{room_id}",
+            }
+            with httpx.Client(timeout=5.0) as client:
+                resp = client.get("https://live.douyin.com/webcast/im/fetch/",
+                                  params=params, headers=headers)
+                if len(resp.content) > 0:
+                    r = dy_pb2.Response()
+                    r.ParseFromString(resp.content)
+                    return bool(r.messagesList or r.cursor)
+            return False
+        except Exception:
+            return False
+            return None
+
     async def _fetch_signed_ws_url(self, room_id: str) -> str | None:
         """
         使用 Playwright 通过浏览器获取抖音直播间的 WebSocket 签名 URL。
         这是获取有效签名的最可靠方式。
         """
         config = get_config()
-        cookie_str = config.douyin.cookie
+        # 优先使用有 ttwid 的 Cookie
+        douyin_cookie = config.douyin.cookie or ""
+        video_cookie = config.douyin_video.cookie or ""
+        cookie_str = video_cookie if "ttwid" in video_cookie else (douyin_cookie if "ttwid" in douyin_cookie else douyin_cookie)
 
         # 同步版本在异步函数中运行
         def _fetch_with_playwright():
             import re
             from urllib.parse import unquote
+            from pathlib import Path
 
             try:
                 from playwright.sync_api import sync_playwright
 
+                browser_data_dir = Path("data/browser_data")
+                browser_data_dir.mkdir(parents=True, exist_ok=True)
+
                 with sync_playwright() as p:
-                    browser = p.chromium.launch(
-                        headless=True,
-                        args=[
-                            '--no-sandbox',
-                            '--disable-setuid-sandbox',
-                            '--disable-dev-shm-usage',
-                            '--disable-blink-features=AutomationControlled',
-                        ]
-                    )
-
-                    # 创建上下文
-                    context = browser.new_context(
-                        viewport={'width': 1680, 'height': 1050},
-                        user_agent='Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                    )
-
-                    # 首先访问抖音主页以设置必要的 cookies
+                    # 优先使用持久化上下文（包含登录状态）
                     try:
-                        main_page = context.new_page()
-                        main_page.goto('https://www.douyin.com/', wait_until='domcontentloaded', timeout=15000)
-                        main_page.wait_for_timeout(2000)
+                        context = p.chromium.launch_persistent_context(
+                            user_data_dir=str(browser_data_dir),
+                            headless=True,
+                            viewport={'width': 1680, 'height': 1050},
+                            user_agent='Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                            args=[
+                                '--no-sandbox',
+                                '--disable-setuid-sandbox',
+                                '--disable-dev-shm-usage',
+                                '--disable-blink-features=AutomationControlled',
+                            ],
+                        )
+                        page = context.pages[0] if context.pages else context.new_page()
+                        browser = None
+                    except Exception:
+                        # 回退：使用独立 browser + new_context
+                        browser = p.chromium.launch(
+                            headless=True,
+                            args=[
+                                '--no-sandbox',
+                                '--disable-setuid-sandbox',
+                                '--disable-dev-shm-usage',
+                                '--disable-blink-features=AutomationControlled',
+                            ]
+                        )
+                        context = browser.new_context(
+                            viewport={'width': 1680, 'height': 1050},
+                            user_agent='Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                        )
+                        page = context.new_page()
 
                         # 解析并添加 cookies
                         if cookie_str:
@@ -642,12 +1285,8 @@ class LiveCollector:
                                     context.add_cookies(cookies)
                                 except Exception as e:
                                     log.warning(f"设置 cookies 失败: {e}")
-                        main_page.close()
-                    except Exception as e:
-                        log.warning(f"访问抖音主页失败: {e}")
 
                     # 创建页面
-                    page = context.new_page()
                     ws_url = None
                     ws_urls_found = []  # 收集所有找到的 WebSocket URL
 
@@ -796,7 +1435,8 @@ class LiveCollector:
                     finally:
                         page.close()
                         context.close()
-                        browser.close()
+                        if browser:
+                            browser.close()
 
                     return ws_url
 
@@ -838,7 +1478,7 @@ class LiveCollector:
         await ws.send(frame)
         log.debug(f"已发送进入直播间请求: room_id={room_id}")
     
-    async def _handle_raw_message(self, raw_data: bytes, room_id: str, ws=None):
+    async def _handle_raw_message_async(self, raw_data: bytes, room_id: str, ack_callback=None):
         """
         处理原始二进制消息（参考 douyin-parse-danmu 的实现）
         
@@ -871,10 +1511,11 @@ class LiveCollector:
             response.ParseFromString(decompressed)
             
             internal_ext = response.internalExt
-            
+
             # 4. 如果需要 ACK，发送响应
-            if response.needAck and ws and log_id:
-                await self._send_ack(ws, log_id, internal_ext)
+            if response.needAck and ack_callback and log_id:
+                log.info(f"[ACK] needAck=True, log_id={log_id}, internalExt_len={len(internal_ext)}")
+                await ack_callback(log_id, internal_ext)
             
             # 5. 处理每条消息
             for message in response.messagesList:
@@ -897,16 +1538,16 @@ class LiveCollector:
                 await self._process_message_by_type(msg_type_code, payload, room_id)
     
     async def _send_ack(self, ws, log_id: int, internal_ext: str):
-        """发送 ACK 响应"""
+        """发送 ACK 响应（参考 DouYin_Spider 的实现）"""
         try:
             from proto import dy_pb2
-            
-            # 构建 ACK PushFrame
+
+            # 构建 ACK PushFrame（参考 dy_live/server.py）
             ack_frame = dy_pb2.PushFrame()
-            ack_frame.payloadType = 'ack'
+            ack_frame.payloadType = "ack"
             ack_frame.logId = log_id
-            ack_frame.payloadType = internal_ext
-            
+            ack_frame.payload = internal_ext.encode('utf-8')
+
             ack_data = ack_frame.SerializeToString()
             await ws.send(ack_data)
             log.debug(f"已发送 ACK: log_id={log_id}")
@@ -914,87 +1555,149 @@ class LiveCollector:
         except Exception as e:
             log.error(f"发送 ACK 失败: {e}")
     
+    def _extract_user_id(self, user) -> str:
+        """从 User proto 中提取用户 ID（优先 shortId → idStr → id，即抖音号优先）"""
+        if not user:
+            return ""
+        # 优先取抖音号（如 666888999）
+        try:
+            if hasattr(user, 'shortId') and user.shortId:
+                return str(user.shortId)
+        except Exception:
+            pass
+        # 回退到 idStr
+        if hasattr(user, 'id_str') and user.id_str:
+            return str(user.id_str)
+        # 再回退到数字 ID
+        try:
+            if hasattr(user, 'id') and user.id and user.id != 0:
+                return str(user.id)
+        except Exception:
+            pass
+        return ""
+
     async def _process_message(self, method: str, payload: bytes, room_id: str):
         """根据方法名处理消息"""
         from proto import dy_pb2
-        
+
         comment = None
-        
+
         try:
             if method == 'WebcastChatMessage':
                 # 弹幕消息
                 chat_msg = dy_pb2.ChatMessage()
                 chat_msg.ParseFromString(payload)
-                
+
                 user_name = getattr(chat_msg.user, 'nickName', '未知用户') if chat_msg.HasField('user') else "未知用户"
+                user_id = self._extract_user_id(chat_msg.user) if chat_msg.HasField('user') else ""
                 content = chat_msg.content
-                
+
                 comment = LiveComment(
                     content=content,
                     message_type=MessageType.CHAT,
                     room_id=room_id,
+                    user_id=user_id,
                     user_nickname=user_name,
                     monitor_name=self.monitor_name,
-                    raw_data=chat_msg.SerializeToString().hex()[:200],  # 转换为 hex 字符串
+                    raw_data=chat_msg.SerializeToString().hex()[:200],
                 )
                 self._stats["chat_count"] += 1
-                log.info(f"💬 [{user_name}]: {content}")
-                
+                log.info(f"💬 [{user_id}/{user_name}]: {content}")
+
             elif method == 'WebcastGiftMessage':
                 # 礼物消息
                 gift_msg = dy_pb2.GiftMessage()
                 gift_msg.ParseFromString(payload)
-                
+
                 user_name = getattr(gift_msg.user, 'nickName', '未知用户') if gift_msg.HasField('user') else "未知用户"
+                user_id = self._extract_user_id(gift_msg.user) if gift_msg.HasField('user') else ""
                 gift_name = "礼物"
-                
+
                 comment = LiveComment(
                     content=f"[礼物] {user_name} 送出 {gift_name}",
                     message_type=MessageType.GIFT,
                     room_id=room_id,
+                    user_id=user_id,
                     user_nickname=user_name,
                     monitor_name=self.monitor_name,
                     gift_name=gift_name,
                     raw_data=None,
                 )
                 self._stats["gift_count"] += 1
-                log.info(f"🎁 [{user_name}] 送出礼物")
-                
+                log.info(f"🎁 [{user_id}/{user_name}] 送出礼物")
+
             elif method == 'WebcastMemberMessage':
                 # 进场消息
                 member_msg = dy_pb2.MemberMessage()
                 member_msg.ParseFromString(payload)
-                
+
                 user_name = getattr(member_msg.user, 'nickName', '未知用户') if member_msg.HasField('user') else "未知用户"
-                
+                user_id = self._extract_user_id(member_msg.user) if member_msg.HasField('user') else ""
+
                 comment = LiveComment(
                     content=f"[进场] {user_name}",
                     message_type=MessageType.MEMBER,
                     room_id=room_id,
+                    user_id=user_id,
                     user_nickname=user_name,
                     monitor_name=self.monitor_name,
                     raw_data=None,
                 )
                 self._stats["member_count"] += 1
-                log.debug(f"🚪 [{user_name}] 进入直播间")
-                
+                log.debug(f"🚪 [{user_id}/{user_name}] 进入直播间")
+
             elif method == 'WebcastLikeMessage':
                 # 点赞消息
                 like_msg = dy_pb2.LikeMessage()
                 like_msg.ParseFromString(payload)
-                
+
                 user_name = getattr(like_msg.user, 'nickName', '未知用户') if like_msg.HasField('user') else "未知用户"
-                
+                user_id = self._extract_user_id(like_msg.user) if like_msg.HasField('user') else ""
+
                 comment = LiveComment(
                     content=f"[点赞] {user_name}",
                     message_type=MessageType.LIKE,
                     room_id=room_id,
+                    user_id=user_id,
                     user_nickname=user_name,
                     monitor_name=self.monitor_name,
                     raw_data=None,
                 )
-                log.debug(f"👍 [{user_name}] 点赞")
+                log.debug(f"👍 [{user_id}/{user_name}] 点赞")
                 
+            elif method == 'WebcastRoomStatsMessage':
+                # 在线人数更新
+                try:
+                    # 解析 WebcastRoomStatsMessage
+                    stats_msg = dy_pb2.RoomStatsMessage()
+                    stats_msg.ParseFromString(payload)
+                    
+                    # 提取在线人数（total 是真实在线人数，displayValue 是抖音展示的热度值/虚拟人数）
+                    count = None
+                    if hasattr(stats_msg, 'total') and stats_msg.total > 0:
+                        count = stats_msg.total
+                    elif hasattr(stats_msg, 'displayValue') and stats_msg.displayValue > 0:
+                        count = stats_msg.displayValue
+                    
+                    log.info(f"📱 收到在线人数消息，displayValue={stats_msg.displayValue}, total={stats_msg.total}, 选择={count}")
+                    
+                    if count is not None:
+                        log.info(f"✅ 在线人数更新: {count}")
+                        # 触发在线人数更新回调
+                        if self.on_viewer_count_update:
+                            try:
+                                import asyncio
+                                if asyncio.iscoroutinefunction(self.on_viewer_count_update):
+                                    asyncio.create_task(self.on_viewer_count_update(count, room_id))
+                                else:
+                                    self.on_viewer_count_update(count, room_id)
+                            except Exception as e:
+                                log.error(f"在线人数更新回调异常: {e}")
+                    else:
+                        log.warning(f"⚠️ 无法从RoomStatsMessage提取在线人数")
+                except Exception as e:
+                    log.error(f"处理在线人数消息异常: {e}")
+                    
             else:
                 # 其他消息类型
                 log.debug(f"收到消息: {method}")
@@ -1016,9 +1719,9 @@ class LiveCollector:
             log.error(f"处理消息失败 ({method}): {e}")
     
     async def _process_message_by_type(self, msg_type_code: int, payload: bytes, room_id: str):
-        """处理原始二进制消息"""
-        messages = _parse_push_frame(raw_data)
-        
+        """处理原始二进制消息（回退路径，无法提取 user_id）"""
+        messages = _parse_push_frame(payload)
+
         for msg_type_code, payload in messages:
             self._stats["messages_total"] += 1
             self._stats["last_message_time"] = datetime.now().isoformat()
@@ -1064,10 +1767,23 @@ class LiveCollector:
                 # 在线人数更新
                 try:
                     count = _extract_number_from_payload(payload)
+                    log.info(f"📱 收到在线人数消息，payload长度={len(payload)}, 提取结果={count}")
                     if count is not None:
-                        log.debug(f"在线人数更新: {count}")
-                except Exception:
-                    pass
+                        log.info(f"✅ 在线人数更新: {count}")
+                        # 触发在线人数更新回调
+                        if self.on_viewer_count_update:
+                            try:
+                                import asyncio
+                                if asyncio.iscoroutinefunction(self.on_viewer_count_update):
+                                    asyncio.create_task(self.on_viewer_count_update(count, room_id))
+                                else:
+                                    self.on_viewer_count_update(count, room_id)
+                            except Exception as e:
+                                log.error(f"在线人数更新回调异常: {e}")
+                    else:
+                        log.warning(f"⚠️ 无法从payload提取在线人数")
+                except Exception as e:
+                    log.error(f"处理在线人数消息异常: {e}")
                 continue
             
             else:
@@ -1097,13 +1813,44 @@ class LiveCollector:
                 self.on_status_change(connected, msg)
             except Exception:
                 pass
+        # 房间离线时：通知 app 停止采集（避免重复启动）
+        # 注意：on_stop_requested 可能是 async 函数，需要用 create_task
+        if not connected and "暂无直播内容" in msg:
+            if self.on_stop_requested:
+                try:
+                    cb = self.on_stop_requested
+                    if asyncio.iscoroutinefunction(cb):
+                        asyncio.create_task(cb())
+                    else:
+                        cb()
+                except Exception:
+                    pass
 
 
 def _extract_number_from_payload(data: bytes) -> Optional[int]:
     """尝试从 protobuf 载荷中提取数字（用于在线人数等）"""
-    # 简化实现：搜索连续数字字节
+    # 改进实现：搜索连续数字字节，优先返回较小的合理值
+    # 抖音在线人数通常在 1-100000 之间
+    candidates = []
     for i in range(len(data) - 3):
-        val = struct.unpack(">I", data[i:i+4])[0]
-        if 1 <= val <= 10000000:  # 合理的在线人数范围
-            return val
+        try:
+            val = struct.unpack(">I", data[i:i+4])[0]
+            if 1 <= val <= 100000:  # 合理的在线人数范围
+                candidates.append(val)
+        except:
+            continue
+    
+    # 如果找到多个候选值，选择最常见的一个（排除明显异常的大值）
+    if candidates:
+        from collections import Counter
+        # 过滤掉异常大的值（超过10万的可能是其他字段）
+        reasonable = [c for c in candidates if c <= 50000]
+        if reasonable:
+            counter = Counter(reasonable)
+            most_common = counter.most_common(1)[0][0]
+            log.debug(f"提取到在线人数候选: {candidates[:5]}, 选择: {most_common}")
+            return most_common
+        else:
+            return candidates[0]
+    
     return None

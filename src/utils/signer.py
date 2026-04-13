@@ -80,36 +80,47 @@ def generate_signature(url_or_params: str, js_file: Optional[str] = None) -> str
         return ""
 
 
-def generate_a_bogus(params: dict, js_file: Optional[str] = None) -> str:
+def generate_a_bogus(params: str, user_agent: str = "", js_file: Optional[str] = None) -> str:
     """
     生成 a_bogus 参数（抖音反爬签名）。
     
+    参考 MediaCrawler 项目实现：
+    https://github.com/NanmiCoder/MediaCrawler
+    
     Args:
-        params: 请求参数字典
-        js_file: a_bogus JS 文件路径（默认使用 proto/a_bogus.js）
+        params: URL 参数字符串（如 "aid=6383&device_platform=webapp"）
+        user_agent: User-Agent 字符串
+        js_file: a_bogus JS 文件路径（默认使用 proto/douyin.js）
         
     Returns:
         a_bogus 字符串
     """
-    ctx = _get_js_context()
-    js_path = Path(js_file) if js_file else A_BOGUS_JS_FILE
+    js_path = Path(js_file) if js_file else JS_DIR / "douyin.js"
     
     if not js_path.exists():
         log.warning(f"a_bogus JS 文件不存在: {js_path}")
         return ""
     
+    # 默认 User-Agent
+    if not user_agent:
+        user_agent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+    
     try:
-        code = js_path.read_text(encoding="utf-8")
-        if hasattr(ctx, 'execute'):
-            ctx.execute(code)
-            result = ctx.call('generate_a_bogus', params)
-        else:
-            ctx.execute(code)
-            result = ctx.generate_a_bogus(params)
+        import execjs
+        
+        # 读取并编译 JS 文件
+        code = js_path.read_text(encoding="utf-8-sig")
+        ctx = execjs.compile(code)
+        
+        # 调用签名函数（MediaCrawler 使用 sign_datail 函数）
+        result = ctx.call("sign_datail", params, user_agent)
         
         return str(result) if result else ""
+    except ImportError:
+        log.error("未安装 PyExecJS，请运行: pip install PyExecJS")
+        return ""
     except Exception as e:
-        log.error(f"a_bogus 生成失败: {e}")
+        log.error(f"a_bogus 生成失败: {e}", exc_info=True)
         return ""
 
 

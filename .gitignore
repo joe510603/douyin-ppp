@@ -1,3 +1,4 @@
+# Python
 __pycache__/
 *.py[cod]
 *$py.class
@@ -18,15 +19,18 @@ wheels/
 *.egg-info/
 .installed.cfg
 *.egg
-.git/
 .mypy_cache/
 .pytest_cache/
+
+# Env & Config
 .env
 .venv/
 venv/
 ENV/
-data/
-config.yaml
+config.yaml           # 实际配置（含 Cookie），不提交
+config.local.yaml     # 本地覆盖配置
+
+# IDE & Editor
 .codebuddy/
 .idea/
 .vscode/
@@ -34,3 +38,27 @@ config.yaml
 *.swo
 *~
 .DS_Store
+
+# 运行时数据
+data/
+logs/
+*.log
+exports/
+*.xlsx
+*.db
+*.db-shm
+*.db-wal
+
+# Node.js (签名服务)
+websdk/node_modules/
+websdk/package-lock.json
+
+# Browser profiles
+browser_data/
+xhs_browser_data/
+chromium_data/
+
+# 临时文件
+*.tmp
+*.temp
+.nicegui/

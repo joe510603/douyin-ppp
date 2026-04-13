@@ -7,6 +7,9 @@ douyin:
   cookie: ''  # 在 Web 界面配置页面自动获取，或手动填写抖音 Cookie
   cookie_expire_warning_hours: 24
   websocket_url_template: ''
+douyin_video:
+  cookie: ''  # 用于视频评论抓取的独立 Cookie，建议使用完整 Cookie（包含 sessionid 等）
+  cookie_expire_warning_hours: 24
 monitors:
 - name: 示例账号
   sec_user_id: ''  # 抖音用户 sec_user_id，在 Web 界面添加

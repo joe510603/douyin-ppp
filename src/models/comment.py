@@ -74,6 +74,11 @@ class VideoComment(BaseModel):
     
     id: Optional[int] = None
     
+    # 来源标识
+    source: str = Field(default="douyin", description="来源平台: douyin / xiaohongshu")
+    task_id: str = Field(default="", description="关联的抓取任务 ID")
+    monitor_name: str = Field(default="", description="监控账号名称")
+    
     # 视频信息
     video_id: str = Field(default="", description="视频 ID")
     video_url: str = Field(default="", description="视频链接")
@@ -88,13 +93,29 @@ class VideoComment(BaseModel):
     user_nickname: str = Field(default="", description="评论用户昵称")
     
     # 时间与互动
-    publish_time: datetime = Field(description="评论发布时间")
+    publish_time: str = Field(default="", description="评论发布时间")
     like_count: int = Field(default=0, description="评论点赞数")
     reply_count: int = Field(default=0, description="回复数")
     
-    # 来源
-    source_keyword: Optional[str] = Field(default=None, description="搜索关键词（关键词模式）")
-    collected_at: datetime = Field(default_factory=datetime.now)
+    # 搜索来源
+    source_keyword: str = Field(default="", description="搜索关键词（关键词模式）")
+    
+    # 采集时间
+    collected_at: str = Field(default="", description="采集入库时间")
+
+
+class ScrapeTask(BaseModel):
+    """抓取任务模型"""
+    
+    id: str = Field(..., description="任务 UUID")
+    source: str = Field(..., description="来源平台: douyin / xiaohongshu")
+    mode: str = Field(..., description="抓取模式: keyword / account / video")
+    params: str = Field(default="", description="JSON: 搜索关键词/账号ID/视频URL")
+    status: str = Field(default="pending", description="状态: pending/running/completed/failed/cancelled")
+    progress: str = Field(default="{}", description="JSON: {found, scraped, total}")
+    result_count: int = Field(default=0, description="抓取结果数量")
+    created_at: str = Field(default="", description="创建时间")
+    updated_at: str = Field(default="", description="更新时间")
 
 
 class LiveRoomInfo(BaseModel):
@@ -119,3 +140,18 @@ class MonitorAccount(BaseModel):
     status: str = Field(default="idle", description="运行状态: idle/detecting/live/error")
     last_check_time: Optional[datetime] = Field(default=None)
     error_message: Optional[str] = Field(default=None)
+
+
+class AnalysisResult(BaseModel):
+    """分析结果模型（LLM分析结果）"""
+    
+    id: Optional[int] = None
+    task_id: str = Field(default="", description="关联的任务 ID")
+    analysis_type: str = Field(..., description="分析类型: sentiment/intent/competitor/profile/cluster")
+    source_type: str = Field(default="", description="数据源: live/video")
+    source_filter: str = Field(default="", description="筛选条件 JSON")
+    result_data: str = Field(..., description="分析结果 JSON")
+    comment_count: int = Field(default=0, description="分析的评论数")
+    llm_provider: str = Field(default="", description="LLM 提供商")
+    llm_model: str = Field(default="", description="使用的模型")
+    created_at: str = Field(default="", description="创建时间")

@@ -10,7 +10,10 @@ aiohttp>=3.9.0
 protobuf>=5.27.0
 
 # JS Execution (备用,推荐使用 Node.js 签名服务)
-# pyexecjs>=1.5.1  # 已移除,改用 Node.js 服务
+# pyexecjs>=1.5.1  # 已移除,改用 xhshow 纯算法
+
+# 小红书签名（纯Python算法，无需外部服务）
+xhshow>=1.0.0
 
 # Data Processing
 pandas>=2.2.0
@@ -32,3 +35,8 @@ loguru>=0.7.0
 
 # Utilities
 python-dotenv>=1.0.0
+
+# Chinese NLP & WordCloud
+jieba>=0.42.1
+wordcloud>=1.9.0
+Pillow>=10.0.0
