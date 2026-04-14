@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.2] - 2026-04-14
+
+### Added
+- **跨平台启动脚本**：新增 `start.sh` / `stop.sh` / `restart.sh` / `status.sh`，一键启动签名服务 + 主程序，兼容 macOS / Linux（Ubuntu/CentOS/OpenCloudOS）
+- **环境检测脚本**：`env_check.sh` 一键检测 Node.js / Python / pip / Python 包 / 端口占用
+
+### Changed
+- **跨平台兼容**：`start.sh` / `status.sh` / `start_with_signer.sh` 支持 `lsof` / `ss` / `netstat` 三种端口检测方式
+- **启动脚本**：签名服务启动后验证端口监听，失败自动回滚
+- **README.md**：更新启动说明，区分 Linux/macOS 一键启动方式
+
+---
+
 ## [2.0.1] - 2026-04-14
 
 ### Fixed

@@ -1,6 +1,6 @@
 # Douyin PPP — 抖音数据采集工具
 
-[![Version](https://img.shields.io/badge/version-2.0.0-blue.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-2.0.2-blue.svg)](CHANGELOG.md)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
 > 直播弹幕实时采集 | 视频评论批量抓取 | 小红书笔记评论采集 | Web 可视化
@@ -54,6 +54,39 @@ cp config.example.yaml config.yaml
 ```
 
 ### 启动
+
+#### Linux / OpenCloudOS / CentOS / Ubuntu
+
+```bash
+# 一键启动（签名服务 + 主程序）
+./start.sh
+
+# 查看服务状态
+./status.sh
+
+# 停止服务
+./stop.sh
+
+# 重启服务
+./restart.sh
+
+# 环境检测（首次使用）
+./env_check.sh
+```
+
+#### macOS
+
+```bash
+# 一键启动（签名服务 + 主程序）
+./start.sh
+
+# 其他命令同 Linux
+./status.sh
+./stop.sh
+./restart.sh
+```
+
+#### 手动启动（各平台通用）
 
 ```bash
 # 终端 1：签名服务
