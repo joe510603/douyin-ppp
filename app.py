@@ -36,6 +36,7 @@ from src.web.log_page import create_log_page
 from src.web.video_scrape_page import create_video_scrape_page
 from src.web.wordcloud_page import create_wordcloud_page
 from src.web.layout import create_app_header
+from src.web.service_page import create_service_page
 from src.task import TaskManager, get_task_manager, close_task_manager
 from src.utils.signer_manager import ensure_signer_running
 
@@ -109,7 +110,7 @@ async def initialize():
     
     log.info("=" * 50)
     log.info("🚀 Douyin PPP 启动中...")
-    log.info(f"   版本: 1.0.0")
+    log.info(f"   版本: 2.0.1")
     log.info(f"   配置: {config.app.name}")
     log.info(f"   端口: {config.app.port}")
     
@@ -341,14 +342,18 @@ async def start_collection(room_id: str, sec_id: str, anchor_name: str):
     # 在线人数更新回调
     def on_viewer_count_update(count: int, room_id: str = None):
         log.info(f"📊 在线人数回调触发: {monitor_name} -> {count}")
-        # 更新当前 sec_id 的在线人数
-        state.monitor_states[sec_id]["viewer_count"] = count
-        log.info(f"✅ 已更新 state.monitor_states[{sec_id}]['viewer_count'] = {count}")
-        # 同时更新所有共用同一 collector room_id 的 sec_id
-        if room_id and room_id in state._collector_room_to_sec_ids:
-            for other_sid in state._collector_room_to_sec_ids[room_id]:
-                if other_sid != sec_id and other_sid in state.monitor_states:
-                    state.monitor_states[other_sid]["viewer_count"] = count
+        # 【关键修复】只取更大的值，避免 RoomStatsMessage 的小数值覆盖 RoomUserSeqMessage 的真实人数
+        current = state.monitor_states[sec_id].get("viewer_count", 0)
+        if count >= current:
+            state.monitor_states[sec_id]["viewer_count"] = count
+            log.info(f"✅ 已更新 state.monitor_states[{sec_id}]['viewer_count'] = {count}")
+            # 同时更新共用同一 collector room_id 的其他账号
+            if room_id and room_id in state._collector_room_to_sec_ids:
+                for other_sid in state._collector_room_to_sec_ids[room_id]:
+                    if other_sid != sec_id and other_sid in state.monitor_states:
+                        state.monitor_states[other_sid]["viewer_count"] = count
+        else:
+            log.debug(f"⏭️ 忽略较小的人数 {count}（当前 {current}）")
     
     collector = LiveCollector(
         on_comment=on_new_comment,
@@ -519,6 +524,13 @@ def logs_page():
     create_log_page()
 
 
+@ui.page("/service")
+def service_page():
+    """服务管理页面"""
+    create_app_header(active_page="service")
+    create_service_page()
+
+
 # ============================================================
 # 主入口
 # ============================================================
@@ -639,6 +651,19 @@ async def on_startup():
                                 state.monitor_states[sid]["error_message"] = None
                     # 检查下播：停止没有检测到的直播间
                     for rid in list(state.collectors.keys()):
+                        collector = state.collectors[rid]
+                        # 如果 collector 的任务已完成（可能中途失败退出），从状态中移除
+                        if collector._task is not None and collector._task.done():
+                            log.warning(f"[Detection-Listener] 采集任务 {rid} 已结束但未清理，主动移除")
+                            del state.collectors[rid]
+                            if rid in state._collector_room_to_sec_ids:
+                                for sid in state._collector_room_to_sec_ids[rid]:
+                                    if sid in state.monitor_states:
+                                        state.monitor_states[sid]["status"] = "idle"
+                                        state.monitor_states[sid]["viewer_count"] = 0
+                                        state.monitor_states[sid]["error_message"] = "采集中断"
+                            del state._collector_room_to_sec_ids[rid]
+                            continue
                         sids = state._collector_room_to_sec_ids.get(rid, [])
                         still_live = any(
                             data.get(sid) and data[sid].status and data[sid].room_id == rid

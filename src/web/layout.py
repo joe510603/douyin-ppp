@@ -15,6 +15,7 @@ NAV_ITEMS = [
     {"key": "video_scrape", "label": "评论抓取", "icon": "movie", "path": "/video_scrape"},
     {"key": "wordcloud", "label": "词云分析", "icon": "cloud", "path": "/wordcloud"},
     {"key": "data", "label": "数据导出", "icon": "analytics", "path": "/data"},
+    {"key": "service", "label": "服务管理", "icon": "settings_applications", "path": "/service"},
     {"key": "config", "label": "配置管理", "icon": "settings", "path": "/config"},
     {"key": "logs", "label": "日志", "icon": "article", "path": "/logs"},
 ]

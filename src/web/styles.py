@@ -820,6 +820,41 @@ body {{
 .transition-all {{
   transition: all var(--transition-normal);
 }}
+
+
+/* ============================================
+   服务管理页面
+   ============================================ */
+
+.service-card {{
+  background: var(--color-bg-base);
+  border: 1px solid var(--color-border-light);
+  border-radius: var(--radius-lg);
+  min-height: 200px;
+}}
+
+.body--dark .service-card {{
+  background: var(--color-dark-bg-surface);
+  border-color: var(--color-dark-border);
+}}
+
+.restart-btn {{
+  background: var(--gradient-blue) !important;
+  color: white !important;
+  border: none !important;
+}}
+
+.check-btn {{
+  background: var(--color-bg-elevated) !important;
+  color: var(--color-text-secondary) !important;
+  border: 1px solid var(--color-border-light) !important;
+}}
+
+.body--dark .check-btn {{
+  background: var(--color-dark-bg-elevated) !important;
+  color: var(--color-dark-text-secondary) !important;
+  border-color: var(--color-dark-border) !important;
+}}
 """
 
     return css

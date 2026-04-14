@@ -1096,7 +1096,28 @@ class LiveCollector:
                 return None
 
             response = dy_pb2.Response()
-            response.ParseFromString(raw_bytes)
+            try:
+                response.ParseFromString(raw_bytes)
+            except Exception:
+                # 抖音可能返回 (1) gzip 压缩的 protobuf (2) JSON 响应
+                try:
+                    decompressed = gzip.decompress(raw_bytes)
+                    response.ParseFromString(decompressed)
+                    log.debug(f"[webcast_detail] gzip 解压成功，直播间 {room_id}")
+                except Exception:
+                    # 尝试 JSON 格式（抖音某些版本返回 JSON 而非 protobuf）
+                    try:
+                        json_text = raw_bytes.decode('utf-8')
+                        if json_text.startswith('{'):
+                            json_data = json.loads(json_text)
+                            # JSON 响应通常是 {"data": [], "status_code": 0} 表示无数据
+                            # 这不是错误，只是直播间暂无推送数据
+                            log.debug(f"[webcast_detail] 服务器返回 JSON（非protobuf，直播间 {room_id} 可能无数据）: {json_text[:100]}")
+                            return None
+                    except Exception:
+                        pass
+                    log.debug(f"[webcast_detail] 原始响应前32字节 hex: {raw_bytes[:32].hex()}")
+                    raise
 
             log.info(f"[webcast_detail] cursor={response.cursor[:50] if response.cursor else 'N/A'}, internalExt_len={len(response.internalExt)}, heartbeatDuration={response.heartbeatDuration}, needAck={response.needAck}")
 
@@ -1666,24 +1687,63 @@ class LiveCollector:
                 log.debug(f"👍 [{user_id}/{user_name}] 点赞")
                 
             elif method == 'WebcastRoomStatsMessage':
-                # 在线人数更新
+                # 在线人数更新（RoomStatsMessage）
                 try:
-                    # 解析 WebcastRoomStatsMessage
                     stats_msg = dy_pb2.RoomStatsMessage()
                     stats_msg.ParseFromString(payload)
-                    
-                    # 提取在线人数（total 是真实在线人数，displayValue 是抖音展示的热度值/虚拟人数）
+
+                    # 提取在线人数：优先 numeric 字段，其次 string 字段
                     count = None
-                    if hasattr(stats_msg, 'total') and stats_msg.total > 0:
+                    if stats_msg.total > 0:
                         count = stats_msg.total
-                    elif hasattr(stats_msg, 'displayValue') and stats_msg.displayValue > 0:
+                    elif stats_msg.displayValue > 0:
                         count = stats_msg.displayValue
-                    
-                    log.info(f"📱 收到在线人数消息，displayValue={stats_msg.displayValue}, total={stats_msg.total}, 选择={count}")
-                    
-                    if count is not None:
-                        log.info(f"✅ 在线人数更新: {count}")
-                        # 触发在线人数更新回调
+                    elif stats_msg.displayLong:
+                        try:
+                            count = int(stats_msg.displayLong.replace(",", ""))
+                        except (ValueError, AttributeError):
+                            pass
+                    elif stats_msg.displayMiddle:
+                        try:
+                            count = int(stats_msg.displayMiddle.replace(",", ""))
+                        except (ValueError, AttributeError):
+                            pass
+
+                    if count is not None and count > 0:
+                        log.info(f"📱 [RoomStats] 人数={count} (displayValue={stats_msg.displayValue}, total={stats_msg.total})")
+                        if self.on_viewer_count_update:
+                            try:
+                                import asyncio
+                                if asyncio.iscoroutinefunction(self.on_viewer_count_update):
+                                    asyncio.create_task(self.on_viewer_count_update(count, room_id))
+                                else:
+                                    self.on_viewer_count_update(count, room_id)
+                            except Exception as e:
+                                log.error(f"在线人数更新回调异常: {e}")
+                except Exception as e:
+                    log.error(f"处理在线人数消息异常: {e}")
+
+            elif method == 'WebcastRoomUserSeqMessage':
+                # 在线人数更新（RoomUserSeqMessage — 抖音使用此消息传真实人数）
+                try:
+                    seq_msg = dy_pb2.RoomUserSeqMessage()
+                    seq_msg.ParseFromString(payload)
+
+                    count = None
+                    # 字段优先级：total(实时在线) > popularity(展示热度) > totalStr
+                    # 注意：totalUser 是累计入场人数，不反映当前在线，不要用
+                    if seq_msg.total > 0:
+                        count = seq_msg.total
+                    elif seq_msg.popularity > 0:
+                        count = seq_msg.popularity
+                    elif seq_msg.totalStr:
+                        try:
+                            count = int(seq_msg.totalStr.replace(",", ""))
+                        except (ValueError, AttributeError):
+                            pass
+
+                    if count is not None and count > 0:
+                        log.info(f"📊 [RoomUserSeq] 人数={count} (popularity={seq_msg.popularity}, total={seq_msg.total}, totalUser={seq_msg.totalUser}, totalStr={seq_msg.totalStr})")
                         if self.on_viewer_count_update:
                             try:
                                 import asyncio
@@ -1694,10 +1754,10 @@ class LiveCollector:
                             except Exception as e:
                                 log.error(f"在线人数更新回调异常: {e}")
                     else:
-                        log.warning(f"⚠️ 无法从RoomStatsMessage提取在线人数")
+                        log.debug(f"📊 [RoomUserSeq] 人数为0 (popularity={seq_msg.popularity}, total={seq_msg.total}, totalUser={seq_msg.totalUser})")
                 except Exception as e:
-                    log.error(f"处理在线人数消息异常: {e}")
-                    
+                    log.error(f"处理RoomUserSeq消息异常: {e}")
+
             else:
                 # 其他消息类型
                 log.debug(f"收到消息: {method}")

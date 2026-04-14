@@ -36,6 +36,18 @@ class DouyinConfig(BaseModel):
     websocket_url_template: str = ""
 
 
+class XhsConfig(BaseModel):
+    """小红书相关配置"""
+    cookie: str = ""
+    cookie_expire_warning_hours: int = 24
+
+
+class DouyinVideoConfig(BaseModel):
+    """抖音视频评论配置（独立于直播监控的 Cookie）"""
+    cookie: str = ""
+    cookie_expire_warning_hours: int = 24
+
+
 class MonitorItem(BaseModel):
     """监控账号项"""
     name: str
@@ -79,16 +91,47 @@ class LoggingConfig(BaseModel):
     retention: str = "7 days"
 
 
+class LLMFeaturesConfig(BaseModel):
+    """LLM 分析功能开关"""
+    sentiment: bool = True       # 情感分析
+    intent: bool = True          # 意图分类
+    competitor: bool = False     # 竞品识别
+    user_profile: bool = False   # 用户画像
+
+
+class LLMConfig(BaseModel):
+    """LLM 模型配置"""
+    enabled: bool = False
+    provider: str = "openai"     # openai / deepseek / local / custom
+    api_key: str = ""
+    base_url: str = ""           # 可选，用于代理或本地服务
+    model: str = "gpt-4o-mini"   # 模型名称
+    
+    # 成本控制
+    max_cost_per_batch: float = 0.5   # 每批最大成本（元）
+    daily_budget: float = 10.0         # 每日预算上限（元）
+    
+    # 分析功能开关
+    features: LLMFeaturesConfig = Field(default_factory=LLMFeaturesConfig)
+    
+    # 批处理配置
+    batch_size: int = 50         # 每批处理评论数
+    timeout: int = 60            # API 超时时间（秒）
+
+
 class Settings(BaseSettings):
     """全局配置（支持环境变量覆盖）"""
     
     app: AppConfig = Field(default_factory=AppConfig)
     douyin: DouyinConfig = Field(default_factory=DouyinConfig)
+    douyin_video: DouyinVideoConfig = Field(default_factory=DouyinVideoConfig)
+    xhs: XhsConfig = Field(default_factory=XhsConfig)
     monitors: list[MonitorItem] = Field(default_factory=list)
     live_detection: LiveDetectionConfig = Field(default_factory=LiveDetectionConfig)
     websocket: WebSocketConfig = Field(default_factory=WebSocketConfig)
     storage: StorageConfig = Field(default_factory=StorageConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
+    llm: LLMConfig = Field(default_factory=LLMConfig)
 
     class Config:
         env_prefix = "DOUYIN_PPP_"

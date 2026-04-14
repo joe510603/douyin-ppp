@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.1] - 2026-04-14
+
+### Fixed
+- **在线人数显示为0**：抖音服务端改用 `WebcastRoomUserSeqMessage` 推送人数，`RoomStatsMessage` 数值归零。新增 `RoomUserSeqMessage` 处理器，从 `total` 字段取实时在线人数
+- **在线人数异常大（如154人）**：`RoomUserSeqMessage.totalUser` 是累计入场人数（非当前在线），已修正为只用 `total` 字段
+- **ttwid 解析警告刷屏**：ttwid 格式从 `1|时间戳|签名` 变更为 base64，解析逻辑已兼容
+- **_fetch_webcast_detail Protobuf 解析失败**：接口在无数据时返回 JSON 而非 protobuf，已增加 gzip 解压 + JSON 降级处理
+- **collector 崩溃后未清理**：`collector._task.done()` 检测 + state.collectors 主动清理逻辑
+- **只取更大的人数值**：避免 `RoomStatsMessage` 的小值覆盖 `RoomUserSeqMessage` 的真实人数
+
+### Changed
+- 服务管理页面：新增 /service 页面，监控签名服务和主服务状态，支持一键重启
+- Dashboard 在线人数刷新策略：`≥ current` 策略，避免波动覆盖
+
+---
+
 ## [2.0.0] - 2026-04-13
 
 ### Added

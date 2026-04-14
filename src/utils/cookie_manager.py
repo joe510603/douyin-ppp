@@ -70,8 +70,8 @@ def get_cookie_status(cookie: str) -> str:
             else:
                 return "valid"
     except Exception as e:
-        log.warning(f"解析 ttwid 过期时间失败: {e}")
-        # 如果无法解析过期时间，但 ttwid 存在，则认为有效
+        # 新版 ttwid 使用 base64 格式，不再是 "1|时间戳|签名" 格式，
+        # 直接认为有效（不再打印 warning 以避免日志刷屏）
         return "valid"
 
 
