@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.3] - 2026-04-17
+
+### Fixed
+- **user_id 全为 111111**：抖音对部分直播间用户的 `shortId` 字段填充匿名占位符 `111111`，已修正为跳过该占位符并回退到 `idStr` / `id`
+- **视频评论抓取失败**：Playwright 拦截遇到验证码时直接失败，已增加 HTTP 降级请求 + Cookie 失效检测
+- **任务列表 async 警告**：`_initial_load` 协程未 await 导致 `RuntimeWarning`，已修复
+- **stop.sh 杀进程不彻底**：增加按端口兜底杀进程（兼容无 PID 文件场景）
+- **端口占用误判**：macOS `lsof` 会残留已关闭连接，改为优先 `ss` / `netstat` + `LISTEN` 过滤
+
+### Changed
+- `video_comment_collector`：增强 `x-whale-throughput-abort-data` 强制登录检测，提示用户刷新 Cookie
+- `status.sh`：无 PID 文件时支持按端口检测进程
+
+---
+
 ## [2.0.2] - 2026-04-14
 
 ### Added

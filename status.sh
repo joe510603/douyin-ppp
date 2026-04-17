@@ -8,14 +8,23 @@ cd "$(dirname "$0")"
 # 跨平台端口检测
 is_port_listening() {
     local port=$1
-    if command -v lsof >/dev/null 2>&1; then
-        lsof -i :$port >/dev/null 2>&1 && return 0
-    elif command -v ss >/dev/null 2>&1; then
-        ss -tlnp 2>/dev/null | grep -q ":$port " && return 0
+    if command -v ss >/dev/null 2>&1; then
+        ss -tlnp 2>/dev/null | grep -qE "(:$port|\.$port )" && return 0
     elif command -v netstat >/dev/null 2>&1; then
         netstat -tlnp 2>/dev/null | grep -q ":$port " && return 0
+    elif command -v lsof >/dev/null 2>&1; then
+        lsof -i :$port -sTCP:LISTEN 2>/dev/null | grep -q LISTEN && return 0
     fi
     return 1
+}
+
+get_port_pid() {
+    local port=$1
+    if command -v ss >/dev/null 2>&1; then
+        ss -tlnp 2>/dev/null | grep ":$port " | grep -oP 'pid=\K[0-9]+' | head -1
+    elif command -v lsof >/dev/null 2>&1; then
+        lsof -i :$port -sTCP:LISTEN -t 2>/dev/null | head -1
+    fi
 }
 
 check_service() {
@@ -40,6 +49,12 @@ check_service() {
             return 1
         fi
     else
+        # 无 PID 文件，按端口检测
+        if [ -n "$port" ] && is_port_listening $port; then
+            local real_pid=$(get_port_pid $port)
+            echo "✅ $name: 运行中 (端口检测, PID: $real_pid)"
+            return 0
+        fi
         echo "⚪  $name: 未运行"
         return 1
     fi

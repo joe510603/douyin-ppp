@@ -1,6 +1,6 @@
 # Douyin PPP — 抖音数据采集工具
 
-[![Version](https://img.shields.io/badge/version-2.0.2-blue.svg)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-2.0.3-blue.svg)](CHANGELOG.md)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
 > 直播弹幕实时采集 | 视频评论批量抓取 | 小红书笔记评论采集 | Web 可视化

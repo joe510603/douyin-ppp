@@ -10,15 +10,20 @@ command_exists() {
     command -v "$1" >/dev/null 2>&1
 }
 
-# 检查端口是否被占用（兼容 lsof / ss）
+# 检查端口是否被占用（优先用 ss/netstat，lsof 只作备选）
 is_port_listening() {
     local port=$1
-    if command_exists lsof; then
-        lsof -i :$port >/dev/null 2>&1 && return 0
-    elif command_exists ss; then
-        ss -tlnp 2>/dev/null | grep -q ":$port " && return 0
-    elif command_exists netstat; then
+    # 优先 ss（Linux/macOS 都支持）
+    if command_exists ss; then
+        ss -tlnp 2>/dev/null | grep -qE "(:$port|\.$port )" && return 0
+    fi
+    # 其次 netstat
+    if command_exists netstat; then
         netstat -tlnp 2>/dev/null | grep -q ":$port " && return 0
+    fi
+    # 最后 lsof（macOS 有时会返回已关闭连接的残留，需过滤 LISTEN）
+    if command_exists lsof; then
+        lsof -i :$port -sTCP:LISTEN 2>/dev/null | grep -q LISTEN && return 0
     fi
     return 1
 }
@@ -46,7 +51,7 @@ check_port() {
     local name=$2
     if is_port_listening $port; then
         echo "⚠️  端口 $port ($name) 已被占用"
-        echo "   查看占用: ss -tlnp | grep $port  (或 lsof -i :$port)"
+        echo "   查看占用: ss -tlnp | grep $port"
         return 1
     fi
     return 0
@@ -90,7 +95,7 @@ if ! kill -0 $SIGNER_PID 2>/dev/null; then
     exit 1
 fi
 
-# 检查签名服务端口（兼容 lsof/ss/netstat）
+# 检查签名服务端口
 sleep 1
 if ! is_port_listening 3010; then
     echo "❌ 签名服务未监听端口 3010，查看日志: tail -20 logs/signer.log"

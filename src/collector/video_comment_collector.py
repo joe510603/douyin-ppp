@@ -116,6 +116,21 @@ def _is_verify_blocked(data: Optional[dict]) -> bool:
     return False
 
 
+def _is_cookie_login_required(data: Optional[dict]) -> bool:
+    """检测是否因 Cookie 缺少登录态（sessionid）导致强制登录"""
+    if not data:
+        return False
+    # x-whale-throughput-abort-data header 解码后含 anonymous/name=强制登录 表明需要登录
+    # 或者响应为空的 403 特征
+    status_code = data.get("status_code", 0)
+    if status_code == 0 and data.get("comments") is None and data.get("aweme_list") is None:
+        # 检查 search_nil_info 中的匿名标识
+        nil_type = data.get("search_nil_info", {}).get("search_nil_type", "")
+        if nil_type in ("invalid_app", "anonymous", "params_check"):
+            return True
+    return False
+
+
 class DouyinVideoCollector:
     """抖音视频评论采集器"""
 
@@ -199,7 +214,34 @@ class DouyinVideoCollector:
 
             response = await client.get(url, params=full_params, headers=headers)
 
+            # 检查 x-whale-throughput-abort-data header（强制登录标识）
+            abort_header = response.headers.get("x-whale-throughput-abort-data", "")
+            if abort_header:
+                try:
+                    import base64
+                    abort_data = json.loads(base64.b64decode(abort_header).decode("utf-8"))
+                    name = abort_data.get("name", "")
+                    if "强制登录" in name or abort_data.get("content") == "anonymous":
+                        log.error(
+                            f"API 返回强制登录（Cookie 缺少登录态 sessionid）"
+                        )
+                        raise CookieExpiredError(
+                            "Cookie 缺少登录态（sessionid），请前往「配置管理→抖音视频评论」使用可见浏览器重新获取完整 Cookie。"
+                        )
+                except CookieExpiredError:
+                    raise
+                except Exception:
+                    pass
+
             if response.status_code == 200:
+                # 检查空响应（可能是重定向到登录页）
+                raw_text = response.text.strip()
+                if not raw_text:
+                    log.error(f"API 返回空响应，可能被重定向到登录页")
+                    raise CookieExpiredError(
+                        "API 返回空响应，Cookie 可能已失效，请在「配置管理→抖音视频评论」刷新 Cookie。"
+                    )
+
                 data = response.json()
                 # 检查业务状态码
                 status_code = data.get("status_code", 0)
@@ -290,80 +332,268 @@ class DouyinVideoCollector:
         if not hasattr(self, "_abogus_cache"):
             self._abogus_cache: dict[str, tuple] = {}
 
+        # 复用持久化上下文（避免每次新建浏览器 + 重新登录）
+        if not hasattr(self, "_browser_context") or self._browser_context is None:
+            self._browser_context = None
+            self._browser_page = None
+            self._context_cookie_str = ""
+
         user_data_dir = Path("data/browser_data")
         log.info(f"拦截视频搜索 '{keyword}' cursor={cursor} 的 a_bogus...")
 
         def _fetch_sync() -> tuple:
             from playwright.sync_api import sync_playwright
             signed_url = None
-            session_cookie = None
+            session_cookie = ""
+            context = None
 
-            with sync_playwright() as p:
-                try:
-                    # 尝试使用持久化上下文（有登录态）
-                    context = p.chromium.launch_persistent_context(
-                        user_data_dir=str(user_data_dir),
-                        headless=True,
-                        viewport={"width": 1400, "height": 900},
-                        user_agent=_DEFAULT_HEADERS["User-Agent"],
-                        args=["--no-sandbox", "--disable-setuid-sandbox",
-                              "--disable-dev-shm-usage", "--disable-blink-features=AutomationControlled"],
-                    )
-                except Exception:
-                    # 回退：使用临时上下文
-                    context = p.chromium.launch(
-                        headless=True,
-                        args=["--no-sandbox", "--disable-setuid-sandbox",
-                              "--disable-dev-shm-usage"],
-                    ).new_context(
-                        viewport={"width": 1400, "height": 900},
-                        user_agent=_DEFAULT_HEADERS["User-Agent"],
-                    )
-
-                def on_request(request):
-                    nonlocal signed_url, session_cookie
-                    if "/aweme/v1/web/search/item/" in request.url:
-                        signed_url = request.url
-                        session_cookie = request.headers.get("cookie", "")
-                        log.info(f"捕获视频搜索 a_bogus URL，长度: {len(request.url)}")
-
-                context.on("request", on_request)
-                page = context.pages[0] if context.pages else context.new_page()
-                try:
-                    kw_encoded = _quote(keyword)
-                    # 检测是否需要登录：先导航到搜索页，看是否跳转登录页
-                    page.goto(
-                        f"https://www.douyin.com/search/{kw_encoded}?type=video",
-                        wait_until="domcontentloaded", timeout=30000
-                    )
-                    page.wait_for_timeout(8000)
-
-                    # 检测是否被跳转到了登录页
-                    final_url = page.url
-                    if "login" in final_url.lower() or "verify" in final_url.lower() or "ai_search" in final_url:
-                        log.warning(
-                            f"浏览器未登录，页面跳转到了: {final_url[:80]}。"
-                            "请先在「配置管理→Cookie提取」中使用可见浏览器登录抖音，再进行视频搜索。"
-                        )
-                        # 截图保存供调试
+            try:
+                with sync_playwright() as p:
+                    # 复用已有 context（避免重新登录/验证）
+                    if self._browser_context is not None:
                         try:
-                            page.screenshot(path="/tmp/dy_login_needed.png")
+                            # 验证 context 是否仍然有效
+                            if self._browser_page and len(self._browser_page.context.pages) > 0:
+                                test_url = self._browser_page.url
+                                if "verify" not in test_url.lower() and "login" not in test_url.lower():
+                                    log.info(f"复用已有浏览器上下文")
+                                    context = self._browser_context
+                                    # 更新 session_cookie
+                                    try:
+                                        cookies = context.cookies(["https://www.douyin.com/"])
+                                        session_cookie = "; ".join(f"{c['name']}={c['value']}" for c in cookies)
+                                    except Exception:
+                                        session_cookie = ""
                         except Exception:
-                            pass
-                        return "", ""
-                except Exception as e:
-                    log.warning(f"拦截页面打开失败: {e}")
+                            self._browser_context = None
+                            self._browser_page = None
+
+                    if context is None:
+                        # 首次或 context 失效，尝试用持久化上下文（已有登录态）
+                        try:
+                            context = p.chromium.launch_persistent_context(
+                                user_data_dir=str(user_data_dir),
+                                headless=True,
+                                viewport={"width": 1400, "height": 900},
+                                user_agent=_DEFAULT_HEADERS["User-Agent"],
+                                args=["--no-sandbox", "--disable-setuid-sandbox",
+                                      "--disable-dev-shm-usage", "--disable-blink-features=AutomationControlled"],
+                            )
+                        except Exception as e:
+                            log.warning(f"持久化上下文加载失败: {e}")
+                            # 回退：使用临时上下文
+                            context = p.chromium.launch(
+                                headless=True,
+                                args=["--no-sandbox", "--disable-setuid-sandbox",
+                                      "--disable-dev-shm-usage"],
+                            ).new_context(
+                                viewport={"width": 1400, "height": 900},
+                                user_agent=_DEFAULT_HEADERS["User-Agent"],
+                            )
+                        self._browser_context = context
+
+                    def on_request(request):
+                        nonlocal signed_url, session_cookie
+                        if "/aweme/v1/web/search/item/" in request.url:
+                            signed_url = request.url
+                            session_cookie = request.headers.get("cookie", "") or session_cookie
+                            try:
+                                cookies = context.cookies(["https://www.douyin.com/"])
+                                session_cookie = "; ".join(f"{c['name']}={c['value']}" for c in cookies)
+                            except Exception:
+                                pass
+                            log.info(f"捕获视频搜索 a_bogus URL，长度: {len(request.url)}")
+
+                    context.on("request", on_request)
+                    page = context.pages[0] if context.pages else context.new_page()
+                    self._browser_page = page
+
+                    # 重试机制：验证码页面需要重试
+                    max_retries = 3
+                    for attempt in range(max_retries):
+                        try:
+                            kw_encoded = _quote(keyword)
+                            page.goto(
+                                f"https://www.douyin.com/search/{kw_encoded}?type=video",
+                                wait_until="domcontentloaded", timeout=30000
+                            )
+                            # 延长等待时间：验证码检测需要更长时间
+                            page.wait_for_timeout(10000)
+
+                            # 检测页面状态
+                            final_url = page.url
+                            if "login" in final_url.lower() or "ai_search" in final_url.lower():
+                                log.warning(
+                                    f"浏览器未登录，页面跳转到了: {final_url[:80]}。"
+                                    "请先在「配置管理→Cookie提取」中使用可见浏览器登录抖音，再进行视频搜索。"
+                                )
+                                try:
+                                    page.screenshot(path="/tmp/dy_login_needed.png")
+                                except Exception:
+                                    pass
+                                return "", ""
+                            elif "verify" in final_url.lower() or "验证码" in page.content():
+                                log.warning(f"第 {attempt+1} 次遇到验证码，等待重试...")
+                                page.wait_for_timeout(15000)  # 等验证码过期/刷新
+                                if attempt < max_retries - 1:
+                                    continue  # 重试
+                                else:
+                                    log.error("验证码持续出现，放弃本次拦截")
+                                    return "", ""
+                            else:
+                                # 正常页面，退出重试循环
+                                break
+                        except Exception as e:
+                            log.warning(f"拦截页面打开失败 (attempt {attempt+1}): {e}")
+                            if attempt < max_retries - 1:
+                                page.wait_for_timeout(5000)
+                                continue
+                            return "", ""
+
+                    # 更新 session_cookie
+                    try:
+                        cookies = context.cookies(["https://www.douyin.com/"])
+                        session_cookie = "; ".join(f"{c['name']}={c['value']}" for c in cookies)
+                    except Exception:
+                        pass
+
+            except Exception as e:
+                log.warning(f"Playwright 执行异常: {e}")
+                return "", ""
 
             return (signed_url or "", session_cookie or "")
 
         signed_url, session_cookie = await asyncio.to_thread(_fetch_sync)
 
         if not signed_url:
-            raise RuntimeError(f"无法为关键词 '{keyword}' cursor={cursor} 拦截到 a_bogus")
+            # 降级：如果 Playwright 拦截失败，尝试用本地的 a_bogus 生成
+            log.warning(f"Playwright 拦截失败，尝试使用本地 a_bogus 生成...")
+            return "", ""
 
         self._abogus_cache[cache_key] = (signed_url, session_cookie)
         log.info(f"关键词 '{keyword}' cursor={cursor} 拦截成功（cookie 长度: {len(session_cookie)}）")
         return signed_url, session_cookie
+
+    def reset_browser_context(self):
+        """重置浏览器上下文（Cookie 失效时调用）"""
+        if hasattr(self, "_browser_context") and self._browser_context:
+            try:
+                self._browser_context.close()
+            except Exception:
+                pass
+        self._browser_context = None
+        self._browser_page = None
+        if hasattr(self, "_abogus_cache"):
+            self._abogus_cache.clear()
+
+    # ============================================================
+    # 降级方案：纯 HTTP 请求（当 Playwright 拦截不可用时）
+    # ============================================================
+
+    async def _search_videos_http(self, keyword: str, max_count: int = 20) -> list[dict]:
+        """
+        降级方案：使用 httpx + 本地 a_bogus 生成进行视频搜索。
+        适用于 Playwright 被风控拦截、或无法启动浏览器的场景。
+        """
+        from ..utils.signer import generate_a_bogus
+
+        videos = []
+        seen_ids: set[str] = set()
+        cursor = 0
+        page_size = 20
+
+        while len(videos) < max_count:
+            params = {
+                "keyword": keyword,
+                "search_channel": "aweme_video_web",
+                "sort_type": "0",
+                "publish_time": "0",
+                "search_source": "tab_search",
+                "query_correct_type": "1",
+                "is_filter_search": "0",
+                "cursor": cursor,
+                "count": page_size,
+            }
+            full_params = self._build_params(params)
+            params_str = urlencode(full_params)
+
+            # 生成 a_bogus
+            ua = _DEFAULT_HEADERS["User-Agent"]
+            a_bogus = generate_a_bogus(params_str, ua)
+            if not a_bogus:
+                log.warning("a_bogus 生成失败，降级方案无法工作")
+                break
+
+            full_params["a_bogus"] = a_bogus
+
+            url = f"{_DOUYIN_BASE_URL}/aweme/v1/web/search/item/"
+            try:
+                async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+                    resp = await client.get(
+                        url,
+                        params=full_params,
+                        headers={
+                            **_DEFAULT_HEADERS,
+                            "Cookie": self.cookie,
+                            "Referer": f"https://www.douyin.com/search/{_quote(keyword)}?type=video",
+                        },
+                    )
+                    raw_text = resp.text
+
+                data = None
+                for line in raw_text.split("\n"):
+                    line = line.strip()
+                    if line and line.startswith("{"):
+                        data = json.loads(line)
+                        break
+
+                if not data:
+                    log.warning(f"cursor={cursor} 响应无法解析: {raw_text[:200]}")
+                    break
+
+                status_code = data.get("status_code", 0)
+                if status_code in (2483, 2484):
+                    raise CookieExpiredError(
+                        f"搜索失败（{status_code}）：Cookie 已过期，请前往「配置管理→抖音视频评论」刷新 Cookie。"
+                    )
+
+                raw_items = data.get("data", []) or data.get("aweme_list", [])
+                if isinstance(raw_items, list):
+                    items = [item.get("aweme_info") or item for item in raw_items if item.get("aweme_info") or item]
+                else:
+                    items = []
+
+                has_more = data.get("has_more", 0)
+                log.info(f"[HTTP降级] 搜索 '{keyword}' cursor={cursor}: {len(items)} 条, has_more={has_more}")
+
+                if not items:
+                    nil_type = data.get("search_nil_info", {}).get("search_nil_type", "")
+                    if nil_type == "verify_check":
+                        raise CookieExpiredError(
+                            f"搜索失败（verify_check）：Cookie 已过期，请前往「配置管理→抖音视频评论」刷新 Cookie。"
+                        )
+                    log.info(f"关键词 '{keyword}' 搜索结果为空")
+                    break
+
+                for item in items:
+                    aweme_id = item.get("aweme_id", "")
+                    if aweme_id and aweme_id not in seen_ids:
+                        seen_ids.add(aweme_id)
+                        videos.append(item)
+
+                if not has_more:
+                    break
+
+                cursor += page_size
+                await self._sleep()
+
+            except CookieExpiredError:
+                raise
+            except Exception as e:
+                log.warning(f"HTTP 降级搜索异常: {e}")
+                break
+
+        return videos[:max_count]
 
     async def _search_videos(self, keyword: str, max_count: int = 20) -> list[dict]:
         """搜索抖音视频 — 通过 Playwright 拦截带登录态的搜索请求，提取 session cookie"""
@@ -377,7 +607,10 @@ class DouyinVideoCollector:
                 # 通过浏览器拦截带登录态的请求（同时获取 a_bogus 和 session cookie）
                 signed_url, session_cookie = await self._intercept_search_item_abogus(keyword, cursor)
                 if not signed_url:
-                    log.warning(f"cursor={cursor} 拦截失败")
+                    log.warning(f"cursor={cursor} 浏览器拦截失败，尝试 HTTP 降级方案...")
+                    # 降级：使用纯 HTTP + 本地 a_bogus
+                    fallback_videos = await self._search_videos_http(keyword, max_count)
+                    videos.extend(fallback_videos)
                     break
 
                 # 解析 cursor 从 signed_url

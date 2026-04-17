@@ -1580,10 +1580,12 @@ class LiveCollector:
         """从 User proto 中提取用户 ID（优先 shortId → idStr → id，即抖音号优先）"""
         if not user:
             return ""
-        # 优先取抖音号（如 666888999）
+        # 优先取抖音号（如 666888999），但跳过平台匿名占位符 111111
         try:
             if hasattr(user, 'shortId') and user.shortId:
-                return str(user.shortId)
+                sid = str(user.shortId)
+                if sid not in ("111111",):
+                    return sid
         except Exception:
             pass
         # 回退到 idStr

@@ -352,7 +352,6 @@ def create_video_scrape_page(task_manager):
                     table.rows = rows
                     table.update()
 
-                ui.timer(3.0, _initial_load)
-                _initial_load()
+                ui.timer(3.0, lambda: asyncio.create_task(_initial_load()))
 
     task_list_ui()
