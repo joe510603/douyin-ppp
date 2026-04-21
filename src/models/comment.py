@@ -31,9 +31,10 @@ class LiveComment(BaseModel):
     content: str = Field(default="", description="评论/弹幕内容")
     
     # 用户信息
-    user_id: str = Field(default="", description="用户 ID")
+    user_id: str = Field(default="", description="用户 ID（displayId 或 idStr）")
     user_nickname: str = Field(default="", description="用户昵称")
     user_avatar: str = Field(default="", description="用户头像 URL")
+    user_short_id: str = Field(default="", description="抖音号（shortId，仅当用户设置了抖音号时才有效）")
     
     # 直播间信息
     room_id: str = Field(default="", description="直播间 room_id")

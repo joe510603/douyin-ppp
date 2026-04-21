@@ -360,7 +360,9 @@ async def start_collection(room_id: str, sec_id: str, anchor_name: str):
         on_status_change=lambda c, m: on_status_change(c, m),
         on_viewer_count_update=lambda c, rid=None: on_viewer_count_update(c, rid),
         on_stop_requested=lambda: stop_collection(room_id),
-        monitor_name=monitor_name
+        monitor_name=monitor_name,
+        anchor_name=anchor_name,
+        anchor_id=sec_id,
     )
 
     success = await collector.connect(room_id, _get_effective_cookie(), ws_url_override=ws_url)
@@ -371,6 +373,11 @@ async def start_collection(room_id: str, sec_id: str, anchor_name: str):
             state._collector_room_to_sec_ids[room_id] = []
         if sec_id not in state._collector_room_to_sec_ids[room_id]:
             state._collector_room_to_sec_ids[room_id].append(sec_id)
+        # 【修复】同步 room_id 到 monitor_states，否则首页表格不显示房间号
+        if sec_id in state.monitor_states:
+            state.monitor_states[sec_id]["room_id"] = room_id
+            state.monitor_states[sec_id]["status"] = "live"
+            state.monitor_states[sec_id]["error_message"] = None
         log.info(f"✅ 启动采集: 直播间 {room_id} ({anchor_name})")
 
 
@@ -635,20 +642,30 @@ async def on_startup():
                     for sid, info in data.items():
                         if info.status and info.room_id:
                             room_id = info.room_id
+                            web_rid = getattr(info, 'web_rid', '') or ''
                             if room_id not in state.collectors:
                                 await start_collection(room_id, sid, info.anchor_nickname)
                             else:
                                 if sid in state.monitor_states:
                                     state.monitor_states[sid]["room_id"] = room_id
+                                    state.monitor_states[sid]["web_rid"] = web_rid
                                     state.monitor_states[sid]["status"] = "live"
                                     state.monitor_states[sid]["error_message"] = None
                         else:
                             # 【修复】账号不在线时也要更新状态！否则 monitor_states 保留旧状态，UI 一直显示"直播中"
+                            # 但如果 collector 仍在运行（采集器证明直播间实际还在播），保留 room_id 和 live 状态
                             if sid in state.monitor_states:
-                                state.monitor_states[sid]["status"] = "idle"
-                                state.monitor_states[sid]["room_id"] = ""
-                                state.monitor_states[sid]["viewer_count"] = 0
-                                state.monitor_states[sid]["error_message"] = None
+                                old_room_id = state.monitor_states[sid].get("room_id", "")
+                                has_collector = old_room_id and old_room_id in state.collectors
+                                if has_collector:
+                                    # collector 还在跑，说明直播间实际还在播，保留 room_id 和 live 状态
+                                    state.monitor_states[sid]["viewer_count"] = 0
+                                else:
+                                    # 确实下播了，清空所有状态
+                                    state.monitor_states[sid]["status"] = "idle"
+                                    state.monitor_states[sid]["room_id"] = ""
+                                    state.monitor_states[sid]["viewer_count"] = 0
+                                    state.monitor_states[sid]["error_message"] = None
                     # 检查下播：停止没有检测到的直播间
                     for rid in list(state.collectors.keys()):
                         collector = state.collectors[rid]

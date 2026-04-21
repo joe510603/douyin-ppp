@@ -93,6 +93,7 @@ def create_dashboard(monitor_accounts_ref, global_stats_ref):
             for sec_id, info in monitor_accounts_ref.items():
                 status_val = info.get("status", "idle")
                 room_id = info.get("room_id", "")
+                web_rid = info.get("web_rid", "")
                 viewer_count = info.get("viewer_count", 0)
 
                 rows.append({
@@ -101,10 +102,26 @@ def create_dashboard(monitor_accounts_ref, global_stats_ref):
                     "status": _format_status(status_val),
                     "viewer_count": viewer_count if viewer_count > 0 else "-",
                     "room_id": room_id if room_id else "-",
+                    "web_rid": web_rid if web_rid else room_id,  # 优先用 web_rid
                     "error_message": info.get("error_message", "") or "",
                 })
 
-            ui.table(columns=columns, rows=rows, row_key="sec_user_id", pagination=10).classes("w-full app-table")
+            table = ui.table(columns=columns, rows=rows, row_key="sec_user_id", pagination=10).classes("w-full app-table")
+
+            # room_id 列渲染为可点击的直播间链接（使用 web_rid）
+            table.add_slot('body-cell-room_id', '''
+                <q-td :props="props" class="text-center">
+                    <a
+                        :href="'https://live.douyin.com/' + (props.row.web_rid || props.value)"
+                        target="_blank"
+                        class="text-primary hover:underline"
+                        v-if="props.value && props.value !== '-'"
+                    >
+                        {{ props.value }}
+                    </a>
+                    <span v-else>{{ props.value }}</span>
+                </q-td>
+            ''')
 
         table_ui()
 

@@ -154,7 +154,21 @@ class DBStorage:
             await self._db.commit()
         except aiosqlite.OperationalError:
             pass
-        
+
+        # 数据库迁移：添加 user_short_id 字段（抖音号）
+        try:
+            await self._db.execute("ALTER TABLE live_comments ADD COLUMN user_short_id TEXT DEFAULT ''")
+            await self._db.commit()
+        except aiosqlite.OperationalError:
+            pass  # 字段已存在
+
+        # 创建 user_short_id 索引（用于快速查找有抖音号的用户）
+        try:
+            await self._db.execute("CREATE INDEX IF NOT EXISTS idx_live_short_id ON live_comments(user_short_id)")
+            await self._db.commit()
+        except aiosqlite.OperationalError:
+            pass
+
         # 创建视频评论表
         await self._db.executescript(CREATE_TABLE_VIDEO_SQL)
         
@@ -222,8 +236,9 @@ class DBStorage:
             INSERT INTO live_comments (
                 message_type, content, user_id, user_nickname, user_avatar,
                 room_id, anchor_id, anchor_name, monitor_name, create_time,
-                gift_name, gift_count, like_count, raw_data, collected_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                gift_name, gift_count, like_count, raw_data, collected_at,
+                user_short_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             comment.message_type.value if hasattr(comment.message_type, 'value') else str(comment.message_type),
             comment.content,
@@ -240,6 +255,7 @@ class DBStorage:
             comment.like_count,
             comment.raw_data,
             comment.collected_at.isoformat(),
+            getattr(comment, 'user_short_id', ''),  # 抖音号
         ))
         await self._db.commit()
         return cursor.lastrowid
@@ -248,7 +264,7 @@ class DBStorage:
         """批量插入评论"""
         if not comments:
             return 0
-        
+
         rows = [
             (
                 c.message_type.value if hasattr(c.message_type, 'value') else str(c.message_type),
@@ -257,16 +273,18 @@ class DBStorage:
                 c.create_time.isoformat(),
                 c.gift_name, c.gift_count, c.like_count,
                 c.raw_data, c.collected_at.isoformat(),
+                getattr(c, 'user_short_id', ''),  # 抖音号
             )
             for c in comments
         ]
-        
+
         await self._db.executemany("""
             INSERT INTO live_comments (
                 message_type, content, user_id, user_nickname, user_avatar,
                 room_id, anchor_id, anchor_name, monitor_name, create_time,
-                gift_name, gift_count, like_count, raw_data, collected_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                gift_name, gift_count, like_count, raw_data, collected_at,
+                user_short_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, rows)
         await self._db.commit()
         return len(comments)

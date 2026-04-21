@@ -27,8 +27,10 @@ wheels/
 .venv/
 venv/
 ENV/
-config.yaml           # 实际配置（含 Cookie），不提交
-config.local.yaml     # 本地覆盖配置
+
+# Config files with secrets (must be in .gitignore, not commented out!)
+config.yaml
+config.local.yaml
 
 # IDE & Editor
 .codebuddy/

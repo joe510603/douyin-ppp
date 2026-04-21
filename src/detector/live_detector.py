@@ -23,6 +23,7 @@ log = get_logger("detector")
 class LiveRoomInfo:
     """直播间信息"""
     room_id: str = ""
+    web_rid: str = ""                 # 直播间短ID（用于直播间URL）
     status: bool = False              # 是否在播
     title: str = ""                   # 直播标题
     user_count: int = 0               # 在线人数
@@ -142,9 +143,13 @@ class LiveDetector:
             log.info(f"[{sec_user_id[:15]}...] {'API无昵称' if not api_has_nickname else 'API无room_id'}，强制浏览器检测")
             await self._try_browser_detection(sec_user_id, info)
 
-        # 如果上述都没拿到 room_id，最后手段：尝试从 cookie live_debug_info 提取
-        # 仅当 room_id 仍然为空时才使用（这是最不可靠的回退）
-        if info.status and not info.room_id:
+        # 如果浏览器检测已经确定在播（status=True）但没有 room_id，
+        # 不使用 Cookie-Fallback 的历史数据，因为那个房间可能已下播
+        # 只有当 browser 检测完全无法确定直播状态时，才用 Cookie-Fallback
+        # 【关键】browser 检测设置了 status=True，说明用户在播但拿不到 room_id
+        # Cookie 的历史 room_id 很可能已失效，采集会失败
+        browser_found_live = info.status and not info.room_id
+        if not browser_found_live and not info.room_id:
             import re
             import urllib.parse
             config = get_config()
@@ -197,6 +202,14 @@ class LiveDetector:
 
                         # 移动端直播状态检测
                         if user_data.get("is_living") == 1:
+                            # 【核心修复】移动端合播校验：owner_sec_uid 与查询账号不一致时跳过
+                            owner_sec_uid = user_data.get("owner_sec_uid", "")
+                            if owner_sec_uid and owner_sec_uid != sec_user_id:
+                                log.info(f"[移动端] 检测到团播 room_id={user_data.get('room_id')}, owner={owner_sec_uid[:15]}... != 查询账号，跳过")
+                                info.status = False
+                                info.room_id = ""
+                                return
+
                             info.status = True
                             info.room_id = str(user_data.get("room_id", ""))
                             info.title = user_data.get("live_title", "")
@@ -238,19 +251,27 @@ class LiveDetector:
                     if room_data_list and len(room_data_list) > 0:
                         room = room_data_list[0]
                         room_status = room.get("status", 0)
-                        
+
                         if room_status == 2:  # 2 = 直播中
+                            owner = room.get("owner", {})
+                            owner_sec_uid = owner.get("sec_uid", "") or room.get("owner_sec_uid", "")
+
+                            # 【核心修复】身份校验：合播/连屏时，多个账号的 API 可能返回同一个 room_id
+                            # 必须验证 room 的 owner 是否真的属于当前查询的账号
+                            if owner_sec_uid and owner_sec_uid != sec_user_id:
+                                log.info(f"[直播间API] 检测到团播 room_id={room.get('room_id')}，owner_sec_uid={owner_sec_uid[:15]}... != 查询账号，跳过")
+                                return  # 合播房间，不属于自己的直播，跳过
+
                             info.status = True
                             info.room_id = str(room.get("room_id", ""))
                             info.title = room.get("title", "")
                             info.user_count = room.get("user_count", 0)
                             info.total_user = room.get("total_user", 0)
                             info.raw_data = room
-                            
+
                             # 尝试获取主播昵称
-                            owner = room.get("owner", {})
                             info.anchor_nickname = owner.get("nickname", "")
-                            
+
                             log.info(f"[直播间API] 检测到开播 [{info.anchor_nickname}]: {info.title} (在线 {info.user_count} 人)")
                             return  # 成功获取，直接返回
             except Exception as e:
@@ -500,12 +521,15 @@ class LiveDetector:
                     # WebSocket 连接需要真实 room_id 才能正确接收弹幕
                     if room_id and len(room_id) >= 18:
                         info.room_id = room_id
+                        info.web_rid = web_rid or ""  # 保存 web_rid 用于直播间链接
                         info.status = True
                         log.info(f"[浏览器] 提取到真实 room_id={room_id}")
                     elif web_rid:
                         info.status = True
+                        info.web_rid = web_rid  # 先保存 web_rid
                         # web_rid 需要进一步获取真实 room_id
                         log.info(f"[浏览器] 提取到 web_rid={web_rid}，正在获取真实 room_id...")
+                        log.info(f"[浏览器] 已保存 info.web_rid={info.web_rid}")
                         real_room_id = None
                         
                         # 方式A: 使用 httpx 直接请求（快速，但可能被验证码拦截）
@@ -605,11 +629,14 @@ class LiveDetector:
                         
                         if real_room_id:
                             info.room_id = real_room_id
+                            log.info(f"[浏览器] 获取到 room_id={real_room_id}, info.web_rid={info.web_rid}")
                         else:
                             info.room_id = web_rid
+                            info.web_rid = web_rid
                             log.warning(f"[浏览器] 未能获取真实 room_id，使用 web_rid={web_rid}")
                     elif room_id:
                         info.room_id = room_id
+                        info.web_rid = web_rid or ""
                         info.status = True
                         log.info(f"[浏览器] 提取到 room_id={room_id}")
 
@@ -617,8 +644,42 @@ class LiveDetector:
                     if info.status and not info.room_id:
                         log.info(f"[浏览器] 检测到直播但无 room_id，尝试从直播链接获取...")
                         found_web_rid = None
-                        
-                        # 方式1: 从 a 标签获取
+
+                        # 方式0: 滚动页面后再查找直播链接（直播卡片可能需要滚动才显示）
+                        try:
+                            page.evaluate('window.scrollTo(0, 0)')
+                            page.wait_for_timeout(500)
+                            # 尝试点击任何可见的"直播中"或直播相关元素
+                            live_elements = page.locator('[class*="live"], [class*="直播"], [class*="Living"]').all()
+                            for elem in live_elements[:5]:  # 最多尝试5个
+                                try:
+                                    if elem.is_visible(timeout=1000):
+                                        # 尝试获取元素的 href 属性
+                                        href = elem.get_attribute('href')
+                                        if href and 'live.douyin.com' in href:
+                                            rid_match = re.search(r'live\.douyin\.com/(\d+)', href)
+                                            if rid_match:
+                                                found_web_rid = rid_match.group(1)
+                                                log.debug(f"[浏览器] 从滚动后的元素获取到 live_id={found_web_rid}")
+                                                break
+                                        # 尝试点击元素（可能打开弹窗或导航）
+                                        elem.click(timeout=2000)
+                                        page.wait_for_timeout(2000)
+                                        # 点击后检查 URL 是否变化
+                                        current_url = page.url
+                                        if 'live.douyin.com' in current_url:
+                                            rid_match = re.search(r'live\.douyin\.com/(\d+)', current_url)
+                                            if rid_match:
+                                                found_web_rid = rid_match.group(1)
+                                                log.debug(f"[浏览器] 点击后从URL获取到 live_id={found_web_rid}")
+                                                break
+                                except Exception as e:
+                                    log.debug(f"[浏览器] 尝试元素失败: {e}")
+                                    continue
+                        except Exception as e:
+                            log.debug(f"[浏览器] 滚动和点击尝试失败: {e}")
+
+                        # 方式1: 从 a 标签获取（重新查找，因为滚动后可能显示了）
                         try:
                             live_link_el = page.locator('a[href*="live.douyin.com"]').first
                             if live_link_el.is_visible(timeout=2000):
@@ -748,13 +809,15 @@ class LiveDetector:
                             
                             if real_room_id_2:
                                 info.room_id = real_room_id_2
+                                info.web_rid = found_web_rid  # 保存 web_rid
                             else:
                                 info.room_id = found_web_rid
+                                info.web_rid = found_web_rid
                                 log.warning(f"[浏览器] 未能获取真实room_id，使用原始ID={found_web_rid}")
                             log.info(f"[浏览器] 从直播链接提取 room_id={info.room_id}")
 
                     if info.status:
-                        log.info(f"[浏览器] 最终结果: status=True, room_id={info.room_id}, nickname={info.anchor_nickname}")
+                        log.info(f"[浏览器] 最终结果: status=True, room_id={info.room_id}, web_rid={info.web_rid}, nickname={info.anchor_nickname}")
                     else:
                         log.debug(f"[浏览器] 未检测到直播")
 
