@@ -352,6 +352,22 @@ def create_video_scrape_page(task_manager):
                     table.rows = rows
                     table.update()
 
-                ui.timer(3.0, lambda: asyncio.create_task(_initial_load()))
+                # 【修复内存泄漏】存储 timer 引用，并在 cleanup 时 cancel
+                # @ui.refreshable 每次刷新会调用 cleanup()，避免 timer 持续累积
+                _timer: Optional[ui.timer] = None
+
+                async def _start_timer():
+                    nonlocal _timer
+                    if _timer is None or not _timer.active:
+                        _timer = ui.timer(3.0, lambda: asyncio.create_task(_initial_load()))
+
+                def _stop_timer():
+                    nonlocal _timer
+                    if _timer is not None:
+                        _timer.stop()
+                        _timer = None
+
+                task_list_ui.cleanup = _stop_timer  # 覆盖 cleanup 以 cancel timer
+                _start_timer()
 
     task_list_ui()

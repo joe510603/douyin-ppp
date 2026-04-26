@@ -404,7 +404,7 @@ class LiveCollector:
                 from queue import Queue, Empty
                 from proto import dy_pb2
 
-                msg_queue: Queue = Queue()
+                msg_queue: Queue = Queue(maxsize=5000)  # 【修复】加 maxsize 防止无界增长
                 shutdown_event = threading.Event()
                 ws_thread_exception: Exception | None = None
 
@@ -422,7 +422,8 @@ class LiveCollector:
                     try:
                         msg_queue.put_nowait(raw_msg)
                     except Exception:
-                        pass  # 队列满时丢弃（极端情况）
+                        # 【修复】队列满时记录日志，不是静默丢弃
+                        log.warning(f"[WS-THREAD] msg_queue 已满，消息被丢弃 (room={room_id})")
 
                 def _on_ws_error(ws: WebSocketApp, error):
                     nonlocal ws_thread_exception
@@ -1751,7 +1752,7 @@ class LiveCollector:
                             try:
                                 import asyncio
                                 if asyncio.iscoroutinefunction(self.on_viewer_count_update):
-                                    asyncio.create_task(self.on_viewer_count_update(count, room_id))
+                                    self._viewer_task = asyncio.create_task(self.on_viewer_count_update(count, room_id))
                                 else:
                                     self.on_viewer_count_update(count, room_id)
                             except Exception as e:
@@ -1784,7 +1785,7 @@ class LiveCollector:
                             try:
                                 import asyncio
                                 if asyncio.iscoroutinefunction(self.on_viewer_count_update):
-                                    asyncio.create_task(self.on_viewer_count_update(count, room_id))
+                                    self._viewer_task = asyncio.create_task(self.on_viewer_count_update(count, room_id))
                                 else:
                                     self.on_viewer_count_update(count, room_id)
                             except Exception as e:

@@ -144,6 +144,9 @@ class DouyinVideoCollector:
 
     async def _get_client(self) -> httpx.AsyncClient:
         if self._client is None or self._client.is_closed:
+            # 关闭旧的 client 避免资源泄漏
+            if self._client is not None and not self._client.is_closed:
+                await self._client.aclose()
             kwargs = {
                 "timeout": 30.0,
                 "follow_redirects": True,
@@ -331,6 +334,14 @@ class DouyinVideoCollector:
 
         if not hasattr(self, "_abogus_cache"):
             self._abogus_cache: dict[str, tuple] = {}
+            self._abogus_cache_max_size = 100  # 限制缓存大小
+
+        # 缓存超过限制时清理旧条目
+        if len(self._abogus_cache) >= self._abogus_cache_max_size:
+            # 删除最早的 20 个条目
+            keys_to_remove = list(self._abogus_cache.keys())[:20]
+            for k in keys_to_remove:
+                del self._abogus_cache[k]
 
         # 复用持久化上下文（避免每次新建浏览器 + 重新登录）
         if not hasattr(self, "_browser_context") or self._browser_context is None:

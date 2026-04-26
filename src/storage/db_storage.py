@@ -119,14 +119,18 @@ CREATE_ANALYSIS_INDEXES_SQL = [
 
 class DBStorage:
     """异步 SQLite 数据库存储引擎"""
-    
+
+    # 最大缓冲区大小，防止内存溢出
+    MAX_BUFFER_SIZE = 10000
+
     def __init__(self, db_path: Optional[str] = None):
         config = get_config()
         self.db_path = db_path or config.storage.db_path
         self.db_path = Path(self.db_path).resolve()
         self._db: Optional[aiosqlite.Connection] = None
         self._pending_buffer: list[LiveComment] = []
-    
+        self._flush_tasks: list[asyncio.Task] = []  # 跟踪刷写任务，避免静默丢失
+
     async def init_db(self):
         """初始化数据库（建表+索引）"""
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -292,7 +296,31 @@ class DBStorage:
     def buffer_comment(self, comment: LiveComment):
         """将评论加入内存缓冲区（高频写入优化）"""
         self._pending_buffer.append(comment)
-    
+        # 防止缓冲区无限增长
+        if len(self._pending_buffer) > self.MAX_BUFFER_SIZE:
+            # 刷写一半的缓冲区，保留另一半
+            half = self.MAX_BUFFER_SIZE // 2
+            overflow = self._pending_buffer[:half]
+            self._pending_buffer = self._pending_buffer[half:]
+            # 异步刷写溢出的数据
+            import asyncio
+            try:
+                loop = asyncio.get_running_loop()
+                task = loop.create_task(self.batch_insert(overflow))
+                # 【修复】跟踪刷写任务，避免静默丢失
+                self._flush_tasks.append(task)
+                # 清理已完成的任务（避免任务列表无限增长）
+                self._flush_tasks = [t for t in self._flush_tasks if not t.done()]
+            except RuntimeError:
+                # 【修复】事件循环不存在时同步写入，避免数据丢失
+                log.warning("flush_buffer: 事件循环不存在，改用同步刷写")
+                try:
+                    import threading
+                    t = threading.Thread(target=lambda: asyncio.run(self.batch_insert(overflow)), daemon=True)
+                    t.start()
+                except Exception as e:
+                    log.error(f"flush_buffer: 同步刷写也失败了，数据丢失 {len(overflow)} 条: {e}")
+
     async def flush_buffer(self) -> int:
         """将缓冲区的数据刷写到数据库"""
         if not self._pending_buffer:
@@ -300,7 +328,7 @@ class DBStorage:
         count = await self.batch_insert(self._pending_buffer)
         self._pending_buffer.clear()
         return count
-    
+
     async def query_comments(
         self,
         room_id: Optional[str] = None,

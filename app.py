@@ -110,7 +110,7 @@ async def initialize():
     
     log.info("=" * 50)
     log.info("🚀 Douyin PPP 启动中...")
-    log.info(f"   版本: 2.0.1")
+    log.info(f"   版本: 2.0.4")
     log.info(f"   配置: {config.app.name}")
     log.info(f"   端口: {config.app.port}")
     
@@ -221,7 +221,7 @@ async def run_single_detection():
     if not accounts:
         return
     
-    results = await detector.batch_detect(accounts)
+    results = await detector.batch_detect(accounts, stagger_delay=config.live_detection.interval / max(len(accounts), 1))
     
     for acc in accounts:
         sid = acc.sec_user_id
@@ -604,7 +604,9 @@ async def on_startup():
                 accounts = [MonitorAccount(**acc.model_dump()) for acc in config.monitors if acc.enabled]
                 if not accounts:
                     return {}
-                return await detector.batch_detect(accounts)
+                # 【错峰修复】14账号 / 60s间隔 → 约4s/账号，平滑分散请求
+                stagger_delay = config.live_detection.interval / max(len(accounts), 1)
+                return await detector.batch_detect(accounts, stagger_delay=stagger_delay)
 
             while True:
                 try:

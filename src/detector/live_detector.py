@@ -48,6 +48,8 @@ class LiveDetector:
     USER_INFO_API_WEB = "https://www.douyin.com/aweme/v1/web/user/profile/other/"
     # 直播间状态 API（webcast.douyin.com 已废弃，改用 live.douyin.com）
     LIVE_ROOM_API = "https://live.douyin.com/webcast/room/web/enter/"
+    # 备用：用户主页 API（方案B，用于获取 room_id）
+    USER_PROFILE_API = "https://www.douyin.com/aweme/v1/web/user/profile/other/"
 
     # 移动端 User-Agent
     MOBILE_UA = "Mozilla/5.0 (Linux; Android 11; Pixel 5) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/90.0.4430.91 Mobile Safari/537.36"
@@ -74,6 +76,9 @@ class LiveDetector:
 
     async def _get_client(self, mobile: bool = False) -> httpx.AsyncClient:
         if self._client is None or self._client.is_closed:
+            # 关闭旧的 client 避免资源泄漏
+            if self._client is not None and not self._client.is_closed:
+                await self._client.aclose()
             cookie = self._get_effective_cookie()
             headers = {
                 "User-Agent": self.MOBILE_UA if mobile else self.WEB_UA,
@@ -92,8 +97,9 @@ class LiveDetector:
     
     async def close(self):
         """关闭 HTTP 客户端"""
-        if self._client and not self._client.is_closed:
+        if self._client:
             await self._client.aclose()
+            self._client = None
     
     async def detect_by_sec_user_id(self, sec_user_id: str) -> LiveRoomInfo:
         """
@@ -319,6 +325,42 @@ class LiveDetector:
                             log.info(f"[Web端] 检测到开播 [{info.anchor_nickname}]: {info.title}")
         except Exception as e:
             log.debug(f"Web API 检测失败: {e}")
+
+        # 【方案B备用】如果上述 API 都失败（无 room_id），尝试带 a_bogus 签名的用户主页 API
+        # 适用于：API 能获取到用户信息但获取不到 room_id 的情况
+        if not info.room_id and info.anchor_nickname:
+            try:
+                from ..utils.signer import generate_a_bogus
+
+                client = await self._get_client(mobile=False)
+                params = {
+                    "sec_user_id": sec_user_id,
+                    "device_platform": "webapp",
+                    "aid": "6383",
+                    "cookie_enabled": "true",
+                }
+
+                # 生成 a_bogus 签名
+                params_str = "&".join(f"{k}={v}" for k, v in params.items())
+                a_bogus = generate_a_bogus(params_str, self.WEB_UA)
+                if a_bogus:
+                    params["a_bogus"] = a_bogus
+
+                resp = await client.get(self.USER_PROFILE_API, params=params)
+                if resp.status_code == 200 and resp.text:
+                    data = resp.json()
+                    if data.get("status_code") == 0 and data.get("user"):
+                        user_data = data["user"]
+                        # 尝试从 user 字段获取 room_id
+                        room_data = user_data.get("room_data") or user_data.get("room")
+                        if room_data and isinstance(room_data, dict):
+                            if room_data.get("status") == 2:
+                                info.status = True
+                                info.room_id = str(room_data.get("id_str", room_data.get("room_id", "")))
+                                info.title = room_data.get("title", "")
+                                log.info(f"[方案B] a_bogus 签名获取到 room_id={info.room_id}")
+            except Exception as e:
+                log.debug(f"[方案B] a_bogus 签名备用 API 失败: {e}")
 
     async def _try_browser_detection(self, sec_user_id: str, info: LiveRoomInfo) -> None:
         """通过 Playwright 打开用户主页，提取直播状态和 room_id"""
@@ -580,50 +622,212 @@ class LiveDetector:
                             try:
                                 log.info(f"[浏览器] httpx 失败，使用 Playwright 访问直播页面获取 room_id...")
                                 live_url = f"https://live.douyin.com/{web_rid}"
-                                page.goto(live_url, wait_until='domcontentloaded', timeout=15000)
-                                page.wait_for_timeout(3000)  # 等待页面渲染
-                                
-                                # 从页面 JS 变量提取 room_id
-                                live_page_data = page.evaluate('''() => {
-                                    try {
-                                        // 从 RENDER_DATA 提取
-                                        const renderEl = document.getElementById('RENDER_DATA');
-                                        if (renderEl) {
-                                            const text = decodeURIComponent(renderEl.textContent);
-                                            const m = text.match(/"room_id"\\s*:\\s*"?(\d{18,})"?/);
-                                            if (m) return m[1];
-                                        }
-                                        // 从 __NEXT_DATA__ 提取
-                                        const nextEl = document.getElementById('__NEXT_DATA__');
-                                        if (nextEl) {
-                                            const data = JSON.parse(nextEl.textContent);
-                                            const rid = data?.props?.pageProps?.room?.room_id || 
-                                                       data?.props?.pageProps?.roomInfo?.room?.id_str;
-                                            if (rid) return String(rid);
-                                        }
-                                        // 从 window 变量提取
-                                        if (window.__RENDER_DATA__) {
-                                            const rd = window.__RENDER_DATA__;
-                                            const m2 = JSON.stringify(rd).match(/"room_id"\\s*:\\s*"?(\d{18,})"?/);
-                                            if (m2) return m2[1];
-                                        }
-                                    } catch(e) {}
-                                    return null;
-                                }''')
-                                if live_page_data and len(str(live_page_data)) >= 18:
-                                    real_room_id = str(live_page_data)
-                                    log.info(f"[浏览器] Playwright 从直播页面获取到真实 room_id={real_room_id}")
-                                else:
-                                    # 回退：从 HTML 内容提取
+
+                                # 【核心修复A】增强 Playwright 上下文：设置 Cookie 模拟真实用户
+                                config = get_config()
+                                douyin_cookie = config.douyin.cookie if config else ""
+
+                                # 构建 context 参数
+                                context_options = {
+                                    'viewport': {'width': 1680, 'height': 1050},
+                                    'user_agent': self.WEB_UA,
+                                    'ignore_https_errors': True,
+                                }
+
+                                # 如果有有效 Cookie，设置到 context（避免被识别为机器人）
+                                cookies_to_set = []
+                                if douyin_cookie and "ttwid" in douyin_cookie:
+                                    import urllib.parse
+                                    for part in douyin_cookie.split(";"):
+                                        part = part.strip()
+                                        if "=" in part:
+                                            k, v = part.split("=", 1)
+                                            k = k.strip()
+                                            if k == "ttwid":
+                                                cookies_to_set.append({
+                                                    'name': 'ttwid',
+                                                    'value': urllib.parse.unquote(v.strip()),
+                                                    'domain': '.douyin.com',
+                                                    'path': '/',
+                                                })
+                                                break
+
+                                # 尝试使用持久化 context（包含登录状态），失败则回退到临时 context
+                                browser = None
+                                context = None
+                                try:
+                                    from pathlib import Path
+                                    browser_data_dir = Path("data/browser_data")
+                                    browser_data_dir.mkdir(parents=True, exist_ok=True)
+                                    context = p.chromium.launch_persistent_context(
+                                        user_data_dir=str(browser_data_dir),
+                                        headless=True,
+                                        **context_options,
+                                    )
+                                    browser = None
+                                except Exception:
+                                    # 回退：使用临时 context
+                                    browser = p.chromium.launch(
+                                        headless=True,
+                                        args=['--no-sandbox', '--disable-setuid-sandbox',
+                                              '--disable-dev-shm-usage', '--disable-blink-features=AutomationControlled'],
+                                    )
+                                    context = browser.new_context(**context_options)
+                                    # 设置 cookies
+                                    if cookies_to_set:
+                                        try:
+                                            context.add_cookies(cookies_to_set)
+                                        except Exception as e:
+                                            log.debug(f"[浏览器] 设置 Cookie 失败: {e}")
+
+                                page = context.pages[0] if context.pages else context.new_page()
+
+                                # 【核心修复B】增加等待策略：等待网络空闲 + 关键元素出现
+                                page.goto(live_url, wait_until='domcontentloaded', timeout=20000)
+                                # 先等待关键元素出现（最多等 8 秒）
+                                try:
+                                    page.wait_for_selector('[class*="live"], [class*="Living"], [class*="直播"]',
+                                                           timeout=8000)
+                                except Exception:
+                                    pass  # 超时继续，让 JS 有更多时间渲染
+
+                                # 【核心修复C】额外等待让 React/Vue 完全渲染
+                                page.wait_for_timeout(5000)  # 从 3s 增加到 5s
+
+                                # 【核心修复D】多重提取策略：从多个数据源提取 room_id
+                                extracted_ids = []
+
+                                # 策略1: 从 RENDER_DATA 提取（decodeURIComponent 防止转义）
+                                try:
+                                    render_data = page.evaluate('''() => {
+                                        try {
+                                            const el = document.getElementById('RENDER_DATA');
+                                            if (el && el.textContent) {
+                                                const text = decodeURIComponent(el.textContent);
+                                                // 查找 room_id
+                                                const match = text.match(/"room_id"\\s*:\\s*"?(\\d{18,})"?/);
+                                                if (match) return {source: 'RENDER_DATA', id: match[1]};
+                                                // 查找 roomId（驼峰格式）
+                                                const match2 = text.match(/"roomId"\\s*:\\s*"?(\\d{18,})"?/);
+                                                if (match2) return {source: 'roomId', id: match2[1]};
+                                            }
+                                        } catch(e) {}
+                                        return null;
+                                    }''')
+                                    if render_data and render_data.get('id'):
+                                        extracted_ids.append(('RENDER_DATA', render_data['id']))
+                                except Exception as e:
+                                    log.debug(f"[浏览器] RENDER_DATA 提取失败: {e}")
+
+                                # 策略2: 从 __NEXT_DATA__ 提取
+                                try:
+                                    next_data = page.evaluate('''() => {
+                                        try {
+                                            const el = document.getElementById('__NEXT_DATA__');
+                                            if (el && el.textContent) {
+                                                const data = JSON.parse(el.textContent);
+                                                // 尝试多个可能的路径
+                                                const paths = [
+                                                    'props.pageProps.room.room_id',
+                                                    'props.pageProps.roomInfo.room.id_str',
+                                                    'props.pageProps.roomInfo.room.id',
+                                                    'props.pageProps.liveRoomInfo.roomId',
+                                                ];
+                                                for (const p of paths) {
+                                                    const val = p.split('.').reduce((o, k) => o && o[k], data);
+                                                    if (val) return {source: '__NEXT_DATA__', id: String(val)};
+                                                }
+                                            }
+                                        } catch(e) {}
+                                        return null;
+                                    }''')
+                                    if next_data and next_data.get('id'):
+                                        extracted_ids.append(('__NEXT_DATA__', next_data['id']))
+                                except Exception as e:
+                                    log.debug(f"[浏览器] __NEXT_DATA__ 提取失败: {e}")
+
+                                # 策略3: 从 window.__RENDER_DATA__ 提取
+                                try:
+                                    window_render = page.evaluate('''() => {
+                                        try {
+                                            if (window.__RENDER_DATA__) {
+                                                const text = JSON.stringify(window.__RENDER_DATA__);
+                                                const match = text.match(/"room_id"\\s*:\\s*"?(\\d{18,})"?/);
+                                                if (match) return {source: 'window.__RENDER_DATA__', id: match[1]};
+                                            }
+                                        } catch(e) {}
+                                        return null;
+                                    }''')
+                                    if window_render and window_render.get('id'):
+                                        extracted_ids.append(('window.__RENDER_DATA__', window_render['id']))
+                                except Exception as e:
+                                    log.debug(f"[浏览器] window.__RENDER_DATA__ 提取失败: {e}")
+
+                                # 策略4: 从 window.__INITIAL_STATE__ 提取
+                                try:
+                                    initial_state = page.evaluate('''() => {
+                                        try {
+                                            if (window.__INITIAL_STATE__) {
+                                                const text = JSON.stringify(window.__INITIAL_STATE__);
+                                                const match = text.match(/"room_id"\\s*:\\s*"?(\\d{18,})"?/);
+                                                if (match) return {source: '__INITIAL_STATE__', id: match[1]};
+                                            }
+                                        } catch(e) {}
+                                        return null;
+                                    }''')
+                                    if initial_state and initial_state.get('id'):
+                                        extracted_ids.append(('__INITIAL_STATE__', initial_state['id']))
+                                except Exception as e:
+                                    log.debug(f"[浏览器] __INITIAL_STATE__ 提取失败: {e}")
+
+                                # 策略5: 从 SSR_HYDRATED_DATA 提取
+                                try:
+                                    ssr_hydrated = page.evaluate('''() => {
+                                        try {
+                                            if (window._SSR_HYDRATED_DATA) {
+                                                const text = JSON.stringify(window._SSR_HYDRATED_DATA);
+                                                const match = text.match(/"room_id"\\s*:\\s*"?(\\d{18,})"?/);
+                                                if (match) return {source: '_SSR_HYDRATED_DATA', id: match[1]};
+                                            }
+                                        } catch(e) {}
+                                        return null;
+                                    }''')
+                                    if ssr_hydrated and ssr_hydrated.get('id'):
+                                        extracted_ids.append(('_SSR_HYDRATED_DATA', ssr_hydrated['id']))
+                                except Exception as e:
+                                    log.debug(f"[浏览器] _SSR_HYDRATED_DATA 提取失败: {e}")
+
+                                # 策略6: 回退到 HTML 内容提取
+                                if not extracted_ids:
                                     live_html = page.content()
                                     _all = re.findall(r'"room_id"\s*:\s*"(\d{18,})"', live_html)
-                                    if not _all:
-                                        _all = re.findall(r'roomId.*?(\d{18,20})', live_html)
                                     if _all:
-                                        real_room_id = _all[0]
-                                        log.info(f"[浏览器] Playwright 从直播页面HTML获取到 room_id={real_room_id}")
+                                        extracted_ids.append(('HTML-content', _all[0]))
                                     else:
-                                        log.warning(f"[浏览器] Playwright 也未能获取真实 room_id, html_len={len(live_html)}")
+                                        # 尝试 roomId 格式
+                                        _all2 = re.findall(r'roomId.*?(\d{18,20})', live_html)
+                                        if _all2:
+                                            extracted_ids.append(('HTML-roomId', _all2[0]))
+
+                                # 选择第一个有效的 ID
+                                for source, rid in extracted_ids:
+                                    if rid and len(rid) >= 18:
+                                        real_room_id = rid
+                                        log.info(f"[浏览器] Playwright 从 {source} 获取到真实 room_id={real_room_id}")
+                                        break
+
+                                # 如果还是没拿到，检查是否被验证码拦截
+                                if not real_room_id:
+                                    page_title = page.title() if page else ""
+                                    page_url = page.url if page else ""
+                                    log.warning(f"[浏览器] Playwright 未获取到 room_id，页面标题={page_title}，URL={page_url}")
+
+                                # 清理资源
+                                page.close()
+                                context.close()
+                                if browser:
+                                    browser.close()
+
                             except Exception as e:
                                 log.warning(f"[浏览器] Playwright 访问直播页面失败: {e}")
                         
@@ -845,29 +1049,33 @@ class LiveDetector:
         return await self.detect_by_sec_user_id(account.sec_user_id)
     
     async def batch_detect(
-        self, 
+        self,
         accounts: list[MonitorAccount],
+        stagger_delay: float = 4.0,
     ) -> dict[str, LiveRoomInfo]:
         """
-        批量检测多个账号。
-        
+        批量检测多个账号（支持错峰）。
+
         Args:
             accounts: 监控账号列表
-            
+            stagger_delay: 每个账号检测之间的延迟（秒）
+                           14账号/60s间隔 → 约4.3s/账号，避免瞬时并发
+
         Returns:
             {sec_user_id: LiveRoomInfo}
         """
-        tasks = [self.detect(acc) for acc in accounts]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        
         result_map = {}
-        for acc, res in zip(accounts, results):
-            if isinstance(res, Exception):
-                log.error(f"批量检测异常 [{acc.name}]: {res}")
+        for i, acc in enumerate(accounts):
+            try:
+                # 【错峰修复】每个账号检测前等待 stagger_delay，避免14个账号同时请求
+                if i > 0 and stagger_delay > 0:
+                    await asyncio.sleep(stagger_delay)
+                result = await self.detect(acc)
+                result_map[acc.sec_user_id] = result
+            except Exception as e:
+                log.error(f"批量检测异常 [{acc.name}]: {e}")
                 result_map[acc.sec_user_id] = LiveRoomInfo(status=False)
-            else:
-                result_map[acc.sec_user_id] = res
-        
+
         return result_map
 
 

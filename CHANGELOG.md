@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.4] - 2026-04-26
+
+### Fixed
+- **browser_data 目录膨胀**：Playwright 持久化上下文累积到 1.1GB，导致内存占用过高、电脑卡顿。新增自动清理机制或启动时检测大小（需手动清理 `data/browser_data/` 目录）
+- **msg_queue 无界增长**：`live_collector.py` 中 `Queue()` 未设置 maxsize，高吞吐时内存持续膨胀。已添加 `maxsize=5000` 限制，队列满时记录日志而非静默丢弃
+- **buffer_comment 刷写任务静默丢失**：数据库缓冲区溢出时 fire-and-forget 的 task 未被跟踪，异常时数据永久丢失。已添加 `_flush_tasks` 列表跟踪任务，失败时降级为同步 daemon 线程写入
+- **检测循环 14 个账号集中请求**：14 个账号每 60s 同时发起检测请求，造成瞬时网络/服务端压力。已实现错峰检测，每账号间隔 `interval/账号数` 秒依次检测
+- **在线人数回调协程丢失**：`on_viewer_count_update` 创建的 asyncio.Task 未被引用，协程可能被垃圾回收。已改为 `self._viewer_task` 引用保存
+
+### Changed
+- **检测错峰**：将 `stagger_delay` 参数加入 `batch_detect()` 方法，检测线程和应用主线程均支持错峰配置
+- **buffer_comment 超限写入降级**：事件循环不存在时，改用 daemon 线程异步写入，避免 RuntimeError 时数据丢失
+
+---
+
 ## [2.0.3] - 2026-04-17
 
 ### Fixed
