@@ -68,6 +68,7 @@ def create_lead_page():
     async def _do_query():
         db = get_db()
         if not db or not db._db:
+            log.warning("线索查询中止：数据库未就绪")
             ui.notify("数据库未就绪", type="negative")
             return
 
@@ -90,6 +91,8 @@ def create_lead_page():
             log.error(f"线索查询失败: {e}", exc_info=True)
             ui.notify(f"查询失败: {e}", type="negative")
             return
+
+        log.info(f"线索查询完成：命中 {total} 条（等级过滤 {levels}）")
 
         for r in rows:
             r["intent_level"] = LEVEL_LABELS.get(r.get("intent_level"), r.get("intent_level"))
