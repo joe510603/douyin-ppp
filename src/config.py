@@ -12,9 +12,12 @@ from pydantic_settings import BaseSettings
 
 # 项目根目录（app.py 所在目录）
 # 在Docker容器中工作目录是 /app，直接使用 cwd
+# fallback 用本文件路径推导：src/config.py -> src -> <项目根>
+# 修复：原实现多走了一层 .parent，会指向项目的上一级目录
 import os
 _cwd = Path(os.getcwd())
-PROJECT_ROOT = _cwd if (_cwd / "config.yaml").exists() else Path(__file__).parent.parent.parent.resolve()
+_PROJECT_ROOT_FALLBACK = Path(__file__).resolve().parent.parent
+PROJECT_ROOT = _cwd if (_cwd / "config.yaml").exists() else _PROJECT_ROOT_FALLBACK
 DEFAULT_CONFIG_PATH = PROJECT_ROOT / "config.yaml"
 
 
@@ -102,21 +105,97 @@ class LLMFeaturesConfig(BaseModel):
 class LLMConfig(BaseModel):
     """LLM 模型配置"""
     enabled: bool = False
-    provider: str = "openai"     # openai / deepseek / local / custom
+    provider: str = "openai"     # openai / deepseek / minimax / minimax_intl / local / custom
     api_key: str = ""
-    base_url: str = ""           # 可选，用于代理或本地服务
+    base_url: str = ""           # 可选，用于代理或本地服务；留空则按 provider 取默认值
     model: str = "gpt-4o-mini"   # 模型名称
-    
+
     # 成本控制
     max_cost_per_batch: float = 0.5   # 每批最大成本（元）
     daily_budget: float = 10.0         # 每日预算上限（元）
-    
+
     # 分析功能开关
     features: LLMFeaturesConfig = Field(default_factory=LLMFeaturesConfig)
-    
+
     # 批处理配置
     batch_size: int = 50         # 每批处理评论数
     timeout: int = 60            # API 超时时间（秒）
+    max_tokens: int = 4000       # 单次响应最大 token
+    temperature: float = 0.2     # 分类任务用低温，保证结构化输出稳定
+
+
+class LeadConfig(BaseModel):
+    """购车意向线索筛选配置"""
+    enabled: bool = False
+    # 实时判定：弹幕进来即打分（纯规则，不依赖 LLM）
+    realtime_enabled: bool = True
+    # 实时命中后是否立即推送飞书群
+    realtime_push: bool = True
+    # 同一用户两次推送的最小间隔（分钟），防刷屏
+    push_cooldown_minutes: int = 30
+    # 只有达到该意向等级的弹幕才进入线索池（high / medium / low）
+    min_intent_level: str = "low"
+    # 扫描回溯时间窗（小时）
+    lookback_hours: int = 24
+    # 后台自动扫描间隔（秒）
+    scan_interval: int = 300
+    # 每批送给 LLM 的用户数
+    batch_size: int = 20
+    # 每日 LLM 调用预算（次），超限自动暂停扫描
+    daily_call_limit: int = 200
+    # 是否把联系方式单独抽成高优先级线索
+    contact_priority: bool = True
+
+
+class NotifyConfig(BaseModel):
+    """飞书群机器人通知配置"""
+    enabled: bool = False
+    webhook_url: str = ""
+    # 加签密钥（群机器人「签名校验」开启时必填）
+    secret: str = ""
+    # 推送哪些意向等级
+    push_levels: list[str] = ["high", "medium"]
+    # 只推送带联系方式的线索
+    contact_only: bool = False
+    # 单条消息最多包含的线索数
+    max_per_message: int = 5
+    # 推送后是否把线索标记为「已推送」
+    mark_pushed: bool = True
+
+    # ---- 多维表格（线索表）----
+    bitable_enabled: bool = False
+    bitable_app_id: str = ""       # 企业自建应用 App ID
+    bitable_app_secret: str = ""   # 企业自建应用 App Secret
+    bitable_app_token: str = ""    # 多维表格 App Token
+    bitable_table_id: str = ""     # 数据表 ID（tbl...）
+    # 是否在推送群消息的同时写入多维表格
+    bitable_sync_with_push: bool = True
+    # 备选认证：用户 access token（与企业自建应用二选一）。
+    # 后台自跑程序推荐用 app_id/app_secret；user_token 适合临时排查，
+    # 但会过期，过期后需要重新授权。
+    bitable_user_token: str = ""
+
+
+class OutreachConfig(BaseModel):
+    """抖音触达（搜人 + 作品留言）配置"""
+    enabled: bool = False
+    # 全自动模式（关闭时需在页面上手动触发）
+    auto_mode: bool = False
+    # 每日留言上限（防风控）
+    daily_limit: int = 30
+    # 两次留言之间的随机延时区间（秒）
+    min_delay: float = 45.0
+    max_delay: float = 120.0
+    # 单次任务最多处理的线索数
+    max_per_run: int = 10
+    # 每个用户留言的作品数量
+    comments_per_user: int = 1
+    # 连续失败多少次自动停止本轮任务
+    fail_stop_threshold: int = 3
+    # 留言文案模板，{name} 昵称 {model} 车型 {nickname} 抖音号
+    message_template: str = "看到你在{live_room}聊到{model}，我们门店在售同款车型，方便留个联系方式细聊吗？"
+    # 浏览器操作超时（秒）
+    timeout: int = 30
 
 
 class Settings(BaseSettings):
@@ -132,6 +211,9 @@ class Settings(BaseSettings):
     storage: StorageConfig = Field(default_factory=StorageConfig)
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
     llm: LLMConfig = Field(default_factory=LLMConfig)
+    lead: LeadConfig = Field(default_factory=LeadConfig)
+    notify: NotifyConfig = Field(default_factory=NotifyConfig)
+    outreach: OutreachConfig = Field(default_factory=OutreachConfig)
 
     class Config:
         env_prefix = "DOUYIN_PPP_"

@@ -38,3 +38,55 @@ logging:
   file_path: data/logs/app.log
   rotation: 50 MB
   retention: 7 days
+llm:
+  enabled: false           # 总开关
+  provider: minimax        # openai / deepseek / minimax / minimax_intl / local
+  api_key: ''              # MiniMax Coding Plan 的 API Key
+  base_url: ''             # 留空则按 provider 自动填（minimax → https://api.minimaxi.com/v1）
+  model: MiniMax-M3
+  max_cost_per_batch: 0.5
+  daily_budget: 10.0
+  features:
+    sentiment: true
+    intent: true
+    competitor: false
+    user_profile: false
+  batch_size: 50
+  timeout: 60
+  max_tokens: 4000
+  temperature: 0.2
+lead:
+  enabled: false           # 购车意向筛选总开关
+  min_intent_level: medium # high / medium / low
+  lookback_hours: 24
+  scan_interval: 300
+  batch_size: 20
+  daily_call_limit: 200
+  contact_priority: true
+notify:
+  enabled: false           # 飞书群通知开关
+  webhook_url: ''          # https://open.feishu.cn/open-apis/bot/v2/hook/xxx
+  secret: ''               # 群机器人「签名校验」密钥（可选）
+  push_levels: [high, medium]
+  contact_only: false
+  max_per_message: 5
+  mark_pushed: true
+  # ---- 多维表格（线索表）----
+  bitable_enabled: false
+  bitable_app_id: ''       # 企业自建应用 App ID（推荐通道）
+  bitable_app_secret: ''   # 企业自建应用 App Secret
+  bitable_app_token: ''    # 多维表格 App Token（wiki 链接解析出的 obj_token）
+  bitable_table_id: ''     # 数据表 ID（tbl...）
+  bitable_sync_with_push: true
+  bitable_user_token: ''   # 备选：用户 access token（会过期，仅用于临时排查）
+outreach:
+  enabled: false           # 抖音触达（搜人 + 作品留言）开关
+  auto_mode: false
+  daily_limit: 30          # 每日留言上限，防风控
+  min_delay: 45.0          # 两次留言最小间隔（秒）
+  max_delay: 120.0         # 两次留言最大间隔（秒）
+  max_per_run: 10
+  comments_per_user: 1
+  fail_stop_threshold: 3   # 连续失败几次自动停止
+  message_template: '看到你在{live_room}聊到{model}，我们门店在售同款车型，方便留个联系方式细聊吗？'
+  timeout: 30

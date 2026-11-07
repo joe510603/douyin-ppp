@@ -96,15 +96,26 @@ class TestCommentProcessor:
 
 class TestConfig:
     def test_load_default_config(self):
+        """没有配置文件时应回落到内置默认值"""
         from src.config import load_config, Settings
-        
-        config = load_config()  # 应能加载默认值
+
+        # 指向一个不存在的路径 → 走默认值分支
+        config = load_config("/tmp/__douyin_ppp_no_such_config__.yaml")
         assert isinstance(config, Settings)
-        assert config.app.port == 8080
-    
+        assert config.app.port == 9527
+
+    def test_load_project_config(self):
+        """项目根目录的 config.yaml 能被正常加载"""
+        from src.config import load_config, Settings
+
+        config = load_config()
+        assert isinstance(config, Settings)
+        assert config.app.port > 0
+        assert config.storage.db_path
+
     def test_config_monitors(self):
         from src.config import load_config
-        
+
         config = load_config()
         assert isinstance(config.monitors, list)
 

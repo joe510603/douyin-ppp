@@ -9,10 +9,16 @@ from typing import Optional
 
 from ..config import get_config
 from ..models.comment import LiveComment, VideoComment, ScrapeTask, MessageType
+from ..models.lead import Lead, OutreachRecord, INTENT_LEVEL_ORDER
 from src.utils.logger import get_logger
 
 
 log = get_logger("db_storage")
+
+
+def _intent_rank(level: str) -> int:
+    """意向等级排序值，越大优先级越高"""
+    return INTENT_LEVEL_ORDER.get(level, 0)
 
 # SQL 语句常量
 CREATE_TABLE_LIVE_SQL = """
@@ -116,6 +122,69 @@ CREATE_ANALYSIS_INDEXES_SQL = [
     "CREATE INDEX IF NOT EXISTS idx_analysis_task ON analysis_results(task_id);",
 ]
 
+CREATE_TABLE_LEADS_SQL = """
+CREATE TABLE IF NOT EXISTS leads (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    lead_key TEXT NOT NULL DEFAULT '',
+    user_id TEXT DEFAULT '',
+    display_id TEXT DEFAULT '',
+    nickname TEXT DEFAULT '',
+    avatar TEXT DEFAULT '',
+    room_id TEXT DEFAULT '',
+    monitor_name TEXT DEFAULT '',
+    live_room TEXT DEFAULT '',
+    intent_level TEXT DEFAULT 'none',
+    intent_score INTEGER DEFAULT 0,
+    intent_reason TEXT DEFAULT '',
+    car_model TEXT DEFAULT '',
+    contact_type TEXT DEFAULT '',
+    contact_value TEXT DEFAULT '',
+    evidence TEXT DEFAULT '[]',
+    evidence_count INTEGER DEFAULT 0,
+    comment_count INTEGER DEFAULT 0,
+    status TEXT DEFAULT 'new',
+    pushed_at TEXT DEFAULT '',
+    outreach_status TEXT DEFAULT 'pending',
+    outreach_at TEXT DEFAULT '',
+    outreach_note TEXT DEFAULT '',
+    source TEXT DEFAULT 'rule',
+    bitable_record_id TEXT DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
+);
+"""
+
+CREATE_LEADS_INDEXES_SQL = [
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_leads_key ON leads(lead_key);",
+    "CREATE INDEX IF NOT EXISTS idx_leads_display ON leads(display_id);",
+    "CREATE INDEX IF NOT EXISTS idx_leads_intent ON leads(intent_level);",
+    "CREATE INDEX IF NOT EXISTS idx_leads_status ON leads(status);",
+    "CREATE INDEX IF NOT EXISTS idx_leads_outreach ON leads(outreach_status);",
+    "CREATE INDEX IF NOT EXISTS idx_leads_created ON leads(created_at);",
+    "CREATE INDEX IF NOT EXISTS idx_leads_score ON leads(intent_score);",
+]
+
+CREATE_TABLE_OUTREACH_SQL = """
+CREATE TABLE IF NOT EXISTS outreach_records (
+    id TEXT PRIMARY KEY,
+    lead_id INTEGER DEFAULT NULL,
+    display_id TEXT DEFAULT '',
+    nickname TEXT DEFAULT '',
+    target_url TEXT DEFAULT '',
+    message TEXT DEFAULT '',
+    status TEXT DEFAULT 'pending',
+    error TEXT DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
+);
+"""
+
+CREATE_OUTREACH_INDEXES_SQL = [
+    "CREATE INDEX IF NOT EXISTS idx_outreach_status ON outreach_records(status);",
+    "CREATE INDEX IF NOT EXISTS idx_outreach_lead ON outreach_records(lead_id);",
+    "CREATE INDEX IF NOT EXISTS idx_outreach_created ON outreach_records(created_at);",
+]
+
 
 class DBStorage:
     """异步 SQLite 数据库存储引擎"""
@@ -139,6 +208,8 @@ class DBStorage:
         self._db.row_factory = aiosqlite.Row
         await self._db.execute("PRAGMA journal_mode=WAL")
         await self._db.execute("PRAGMA foreign_keys=ON")
+        # 写锁最多等 5 秒再报 "database is locked"，避免无限期挂起
+        await self._db.execute("PRAGMA busy_timeout=5000")
         
         await self._db.executescript(CREATE_TABLE_LIVE_SQL)
         for sql in CREATE_INDEXES_SQL:
@@ -208,7 +279,10 @@ class DBStorage:
         
         # 创建分析结果表（LLM分析结果）
         await self._create_analysis_table()
-        
+
+        # 创建线索表（购车意向）与抖音触达记录表
+        await self._create_leads_tables()
+
         await self._db.commit()
         
         log.info(f"数据库初始化完成: {self.db_path}")
@@ -218,6 +292,30 @@ class DBStorage:
         await self._db.executescript(CREATE_TABLE_ANALYSIS_SQL)
         for sql in CREATE_ANALYSIS_INDEXES_SQL:
             await self._db.execute(sql)
+
+    async def _create_leads_tables(self):
+        """创建线索表与抖音触达记录表（幂等，可重复调用）"""
+        await self._db.executescript(CREATE_TABLE_LEADS_SQL)
+        for sql in CREATE_LEADS_INDEXES_SQL:
+            await self._db.execute(sql)
+        await self._db.executescript(CREATE_TABLE_OUTREACH_SQL)
+        for sql in CREATE_OUTREACH_INDEXES_SQL:
+            await self._db.execute(sql)
+        # 迁移：老库补 source 字段（rule=规则判定 / llm=AI 判定）
+        try:
+            await self._db.execute("ALTER TABLE leads ADD COLUMN source TEXT DEFAULT 'rule'")
+            await self._db.commit()
+        except aiosqlite.OperationalError:
+            pass
+
+        # 迁移：老库补 bitable_record_id 字段（飞书多维表格的记录 ID，用于去重更新）
+        try:
+            await self._db.execute(
+                "ALTER TABLE leads ADD COLUMN bitable_record_id TEXT DEFAULT ''"
+            )
+            await self._db.commit()
+        except aiosqlite.OperationalError:
+            pass
     
     async def save_analysis_result(
         self,
@@ -241,7 +339,391 @@ class DBStorage:
         )
         await self._db.commit()
         return cursor.lastrowid
-    
+
+    # ============================================================
+    # 线索（购车意向）
+    # ============================================================
+
+    async def upsert_lead(self, lead: Lead, commit: bool = True) -> int:
+        """
+        写入或更新一条线索（按 lead_key 幂等）。
+
+        同一条线索再次命中时，累积证据条数、保留更高的意向等级，
+        并用新出现的联系方式覆盖空值。
+
+        Returns:
+            lead 的数据库主键
+        """
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        existing = await self._db.execute(
+            "SELECT id, intent_level, intent_score, contact_type, contact_value, "
+            "evidence_count, comment_count FROM leads WHERE lead_key = ?",
+            [lead.lead_key],
+        )
+        row = await existing.fetchone()
+
+        if row is None:
+            cursor = await self._db.execute(
+                """INSERT INTO leads (
+                    lead_key, user_id, display_id, nickname, avatar,
+                    room_id, monitor_name, live_room,
+                    intent_level, intent_score, intent_reason, car_model,
+                    contact_type, contact_value,
+                    evidence, evidence_count, comment_count,
+                    status, pushed_at, outreach_status, outreach_at, outreach_note,
+                    source, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                [
+                    lead.lead_key, lead.user_id, lead.display_id, lead.nickname, lead.avatar,
+                    lead.room_id, lead.monitor_name, lead.live_room,
+                    lead.intent_level, lead.intent_score, lead.intent_reason, lead.car_model,
+                    lead.contact_type, lead.contact_value,
+                    lead.evidence, lead.evidence_count, lead.comment_count,
+                    lead.status, lead.pushed_at, lead.outreach_status, lead.outreach_at, lead.outreach_note,
+                    lead.source or "rule", now, now,
+                ],
+            )
+            if commit:
+                await self._db.commit()
+            return cursor.lastrowid
+
+        # 已存在 → 合并更新
+        old_level = row["intent_level"]
+        old_score = row["intent_score"]
+        old_contact_type = row["contact_type"]
+        old_contact_value = row["contact_value"]
+        old_evidence_count = row["evidence_count"] or 0
+        old_comment_count = row["comment_count"] or 0
+
+        # 意向等级取更高者，分数取更高者
+        if _intent_rank(lead.intent_level) >= _intent_rank(old_level):
+            new_level, new_score = lead.intent_level, lead.intent_score
+            new_reason, new_model = lead.intent_reason, lead.car_model
+        else:
+            new_level, new_score = old_level, old_score
+            new_reason = lead.intent_reason or row["intent_reason"]
+            new_model = lead.car_model or row["car_model"]
+
+        # 联系方式：有新的就覆盖，没有就保留旧的
+        if lead.contact_value:
+            new_contact_type, new_contact_value = lead.contact_type, lead.contact_value
+        else:
+            new_contact_type, new_contact_value = old_contact_type, old_contact_value
+
+        await self._db.execute(
+            """UPDATE leads SET
+                user_id = COALESCE(NULLIF(?, ''), user_id),
+                display_id = COALESCE(NULLIF(?, ''), display_id),
+                nickname = COALESCE(NULLIF(?, ''), nickname),
+                avatar = COALESCE(NULLIF(?, ''), avatar),
+                room_id = COALESCE(NULLIF(?, ''), room_id),
+                monitor_name = COALESCE(NULLIF(?, ''), monitor_name),
+                live_room = COALESCE(NULLIF(?, ''), live_room),
+                intent_level = ?, intent_score = ?, intent_reason = ?, car_model = ?,
+                contact_type = ?, contact_value = ?,
+                evidence = ?, evidence_count = ?, comment_count = ?,
+                updated_at = ?
+            WHERE lead_key = ?""",
+            [
+                lead.user_id, lead.display_id, lead.nickname, lead.avatar,
+                lead.room_id, lead.monitor_name, lead.live_room,
+                new_level, new_score, new_reason, new_model,
+                new_contact_type, new_contact_value,
+                lead.evidence, old_evidence_count + lead.evidence_count,
+                old_comment_count + lead.comment_count,
+                now, lead.lead_key,
+            ],
+        )
+        if commit:
+            await self._db.commit()
+        return row["id"]
+
+    async def upsert_leads_batch(self, leads: list[Lead]) -> int:
+        """
+        批量写入线索：整批只提交一次。
+
+        逐条 commit 会在有其他进程/连接持有写锁时长时间阻塞
+        （每条都要等 fsync + 锁竞争），整批单事务提交快一个数量级。
+
+        Args:
+            leads: 待写入的线索列表
+
+        Returns:
+            成功写入的条数
+        """
+        if not leads:
+            return 0
+        written = 0
+        try:
+            for lead in leads:
+                await self.upsert_lead(lead, commit=False)
+                written += 1
+            await self._db.commit()
+        except Exception:
+            await self._db.rollback()
+            raise
+        return written
+
+    async def query_leads(
+        self,
+        intent_levels: Optional[list[str]] = None,
+        status: Optional[str] = None,
+        outreach_status: Optional[str] = None,
+        has_contact: Optional[bool] = None,
+        keyword: Optional[str] = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> tuple[list[dict], int]:
+        """查询线索列表，返回 (结果, 总条数)。按意向分降序。"""
+        conditions = []
+        params: list = []
+
+        if intent_levels:
+            placeholders = ",".join("?" for _ in intent_levels)
+            conditions.append(f"intent_level IN ({placeholders})")
+            params.extend(intent_levels)
+        if status:
+            conditions.append("status = ?")
+            params.append(status)
+        if outreach_status:
+            conditions.append("outreach_status = ?")
+            params.append(outreach_status)
+        if has_contact is True:
+            conditions.append("contact_value != ''")
+        elif has_contact is False:
+            conditions.append("contact_value = ''")
+        if keyword:
+            conditions.append("(nickname LIKE ? OR display_id LIKE ? OR intent_reason LIKE ?)")
+            params.extend([f"%{keyword}%"] * 3)
+
+        where = " AND ".join(conditions) if conditions else "1=1"
+
+        count_row = await self._db.execute(f"SELECT COUNT(*) FROM leads WHERE {where}", params)
+        total = (await count_row.fetchone())[0]
+
+        cursor = await self._db.execute(
+            f"""SELECT * FROM leads WHERE {where}
+                ORDER BY intent_score DESC, id DESC LIMIT ? OFFSET ?""",
+            params + [limit, offset],
+        )
+        rows = await cursor.fetchall()
+        return [dict(r) for r in rows], total
+
+    async def get_lead(self, lead_id: int) -> Optional[dict]:
+        """按主键取单条线索"""
+        cursor = await self._db.execute("SELECT * FROM leads WHERE id = ?", [lead_id])
+        row = await cursor.fetchone()
+        return dict(row) if row else None
+
+    async def get_leads_by_ids(self, lead_ids: list[int]) -> list[dict]:
+        """批量取线索"""
+        if not lead_ids:
+            return []
+        placeholders = ",".join("?" for _ in lead_ids)
+        cursor = await self._db.execute(f"SELECT * FROM leads WHERE id IN ({placeholders})", lead_ids)
+        rows = await cursor.fetchall()
+        return [dict(r) for r in rows]
+
+    async def update_lead(self, lead_id: int, **fields) -> bool:
+        """更新线索字段（白名单内）。返回是否命中。"""
+        allowed = {
+            "intent_level", "intent_score", "intent_reason", "car_model",
+            "contact_type", "contact_value", "status", "pushed_at",
+            "outreach_status", "outreach_at", "outreach_note",
+            "nickname", "display_id", "live_room", "bitable_record_id",
+            "evidence", "evidence_count",
+        }
+        updates = {k: v for k, v in fields.items() if k in allowed}
+        if not updates:
+            return False
+        sets = ", ".join(f"{k} = ?" for k in updates)
+        values = list(updates.values())
+        values.append(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        values.append(lead_id)
+        cursor = await self._db.execute(f"UPDATE leads SET {sets}, updated_at = ? WHERE id = ?", values)
+        await self._db.commit()
+        return cursor.rowcount > 0
+
+    async def mark_leads_pushed(self, lead_ids: list[int]) -> int:
+        """把线索标记为已推送飞书"""
+        if not lead_ids:
+            return 0
+        placeholders = ",".join("?" for _ in lead_ids)
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        cursor = await self._db.execute(
+            f"UPDATE leads SET status = 'pushed', pushed_at = ?, updated_at = ? WHERE id IN ({placeholders})",
+            [now, now] + lead_ids,
+        )
+        await self._db.commit()
+        return cursor.rowcount
+
+    async def count_leads(self, intent_levels: Optional[list[str]] = None) -> int:
+        """统计线索数量"""
+        if intent_levels:
+            placeholders = ",".join("?" for _ in intent_levels)
+            cursor = await self._db.execute(
+                f"SELECT COUNT(*) FROM leads WHERE intent_level IN ({placeholders})", intent_levels
+            )
+        else:
+            cursor = await self._db.execute("SELECT COUNT(*) FROM leads")
+        return (await cursor.fetchone())[0]
+
+    async def delete_leads(self, lead_ids: list[int]) -> int:
+        """删除线索"""
+        if not lead_ids:
+            return 0
+        placeholders = ",".join("?" for _ in lead_ids)
+        cursor = await self._db.execute(f"DELETE FROM leads WHERE id IN ({placeholders})", lead_ids)
+        await self._db.commit()
+        return cursor.rowcount
+
+    # ============================================================
+    # 抖音触达记录
+    # ============================================================
+
+    async def insert_outreach_record(self, record: OutreachRecord) -> None:
+        """写入一条触达记录"""
+        await self._db.execute(
+            """INSERT INTO outreach_records (
+                id, lead_id, display_id, nickname, target_url, message, status, error,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            [
+                record.id, record.lead_id, record.display_id, record.nickname,
+                record.target_url, record.message, record.status, record.error,
+                record.created_at, record.updated_at,
+            ],
+        )
+        await self._db.commit()
+
+    async def update_outreach_record(self, record_id: str, **fields) -> bool:
+        """更新触达记录状态"""
+        allowed = {"status", "error", "target_url", "message", "lead_id"}
+        updates = {k: v for k, v in fields.items() if k in allowed}
+        if not updates:
+            return False
+        sets = ", ".join(f"{k} = ?" for k in updates)
+        values = list(updates.values())
+        values.append(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        values.append(record_id)
+        cursor = await self._db.execute(f"UPDATE outreach_records SET {sets}, updated_at = ? WHERE id = ?", values)
+        await self._db.commit()
+        return cursor.rowcount > 0
+
+    async def query_outreach_records(self, limit: int = 50, offset: int = 0) -> tuple[list[dict], int]:
+        """查询触达记录"""
+        count_row = await self._db.execute("SELECT COUNT(*) FROM outreach_records")
+        total = (await count_row.fetchone())[0]
+        cursor = await self._db.execute(
+            "SELECT * FROM outreach_records ORDER BY created_at DESC, rowid DESC LIMIT ? OFFSET ?",
+            [limit, offset],
+        )
+        rows = await cursor.fetchall()
+        return [dict(r) for r in rows], total
+
+    async def count_outreach_today(self) -> int:
+        """统计今日已执行的触达次数（用于每日上限控制）"""
+        cursor = await self._db.execute(
+            "SELECT COUNT(*) FROM outreach_records WHERE date(created_at) = date('now', 'localtime') "
+            "AND status IN ('searching', 'found', 'commented')"
+        )
+        return (await cursor.fetchone())[0]
+
+    async def get_existing_lead_keys(self, keys: list[str]) -> set[str]:
+        """查询哪些 lead_key 已经存在（用于跳过已分析用户）"""
+        if not keys:
+            return set()
+        found: set[str] = set()
+        # SQLite 参数数量上限约 999，分片查询
+        for i in range(0, len(keys), 500):
+            chunk = keys[i:i + 500]
+            placeholders = ",".join("?" for _ in chunk)
+            cursor = await self._db.execute(
+                f"SELECT lead_key FROM leads WHERE lead_key IN ({placeholders})", chunk
+            )
+            rows = await cursor.fetchall()
+            found.update(r["lead_key"] for r in rows)
+        return found
+
+    async def query_user_activity(
+        self,
+        since: datetime,
+        limit_users: int = 300,
+        min_messages: int = 1,
+        message_type: str = "WebcastChatMessage",
+    ) -> list[dict]:
+        """
+        按用户聚合指定时间窗内的弹幕。
+
+        时间比较说明：collected_at 由 Python 以 ISO8601（带 T）格式写入，
+        与 SQLite 的 datetime('now','localtime')（空格分隔）字符串比较会失真
+        （'T' > ' ' 导致历史数据全部命中），因此阈值必须由调用方用 Python
+        计算并以同样的 isoformat() 格式传入。
+
+        Args:
+            since: 起始时间（datetime），会用 isoformat() 转换
+            limit_users: 最多返回多少个用户
+            min_messages: 用户至少要有多少条弹幕才纳入
+            message_type: 消息类型
+
+        Returns:
+            [{"ukey","user_id","display_id","nickname","room_id","monitor_name",
+              "count","messages":[...]}]
+        """
+        cursor = await self._db.execute(
+            """SELECT
+                   COALESCE(NULLIF(user_display_id, ''), NULLIF(user_id, ''),
+                            room_id || ':' || user_nickname) AS ukey,
+                   MAX(user_id) AS user_id,
+                   MAX(user_display_id) AS display_id,
+                   MAX(user_nickname) AS nickname,
+                   MAX(user_avatar) AS avatar,
+                   MAX(room_id) AS room_id,
+                   MAX(monitor_name) AS monitor_name,
+                   COUNT(*) AS cnt,
+                   GROUP_CONCAT(content, '|||') AS msgs
+               FROM live_comments
+               WHERE message_type = ?
+                 AND collected_at >= ?
+                 AND content IS NOT NULL AND content != ''
+                 AND COALESCE(user_id, '') NOT IN ('111111', '0')
+               GROUP BY ukey
+               HAVING cnt >= ?
+               ORDER BY cnt DESC
+               LIMIT ?""",
+            [message_type, since.isoformat(), min_messages, limit_users],
+        )
+        rows = await cursor.fetchall()
+
+        results = []
+        for r in rows:
+            messages = [m for m in (r["msgs"] or "").split("|||") if m]
+            results.append({
+                "ukey": r["ukey"] or "",
+                "user_id": r["user_id"] or "",
+                "display_id": r["display_id"] or "",
+                "nickname": r["nickname"] or "",
+                "avatar": r["avatar"] or "",
+                "room_id": r["room_id"] or "",
+                "monitor_name": r["monitor_name"] or "",
+                "count": r["cnt"],
+                "messages": messages,
+            })
+        return results
+
+    async def get_lead_evidence(self, lead_key: str, limit: int = 5) -> list[str]:
+        """取某个用户最近的弹幕原文（用于线索详情展示）"""
+        cursor = await self._db.execute(
+            """SELECT content FROM live_comments
+               WHERE COALESCE(NULLIF(user_display_id, ''), user_id) = ?
+                 AND message_type = 'WebcastChatMessage'
+                 AND content != ''
+               ORDER BY id DESC LIMIT ?""",
+            [lead_key, limit],
+        )
+        rows = await cursor.fetchall()
+        return [r["content"] for r in rows]
+
     async def close(self):
         """关闭数据库连接"""
         if self._db:

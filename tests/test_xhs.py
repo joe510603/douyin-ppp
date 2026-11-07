@@ -10,7 +10,7 @@ from src.utils.xhs_cookie_manager import fetch_xhs_cookie_by_browser, save_xhs_c
 import sqlite3
 
 
-async def test():
+async def main():
     await init_database()
     config = get_config()
 
@@ -79,4 +79,4 @@ async def test():
 
 
 if __name__ == "__main__":
-    asyncio.run(test())
+    asyncio.run(main())

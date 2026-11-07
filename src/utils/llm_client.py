@@ -13,6 +13,19 @@ from .logger import get_logger
 
 log = get_logger("llm_client")
 
+# 各厂商的默认 OpenAI 兼容端点（用户显式配置 base_url 时优先用用户的）
+PROVIDER_BASE_URLS = {
+    "openai": "https://api.openai.com/v1",
+    "deepseek": "https://api.deepseek.com/v1",
+    # MiniMax Coding Plan — 国内站
+    "minimax": "https://api.minimaxi.com/v1",
+    # MiniMax Coding Plan — 国际站
+    "minimax_intl": "https://api.minimax.io/v1",
+    # 本地 Ollama / vLLM
+    "local": "http://localhost:11434/v1",
+    "ollama": "http://localhost:11434/v1",
+}
+
 
 class LLMClient:
     """LLM API 客户端"""
@@ -40,32 +53,37 @@ class LLMClient:
         if self.config.base_url:
             return self.config.base_url.rstrip("/")
         
-        # 默认 URL
-        if self.config.provider == "deepseek":
-            return "https://api.deepseek.com/v1"
-        return "https://api.openai.com/v1"
+        # 默认 URL（按 provider 取）
+        return PROVIDER_BASE_URLS.get(
+            self.config.provider, PROVIDER_BASE_URLS["openai"]
+        )
     
     async def chat(
         self,
         messages: list[dict],
-        temperature: float = 0.7,
-        max_tokens: int = 1000,
+        temperature: Optional[float] = None,
+        max_tokens: Optional[int] = None,
     ) -> Optional[str]:
         """
         发送聊天请求
-        
+
         Args:
             messages: 消息列表 [{"role": "user", "content": "..."}]
-            temperature: 温度参数
-            max_tokens: 最大返回 token 数
-            
+            temperature: 温度参数，默认取配置值
+            max_tokens: 最大返回 token 数，默认取配置值
+
         Returns:
             助手回复文本，失败返回 None
         """
         if not self.is_enabled:
             log.warning("LLM 未启用或未配置 API Key")
             return None
-        
+
+        if temperature is None:
+            temperature = self.config.temperature
+        if max_tokens is None:
+            max_tokens = self.config.max_tokens
+
         url = f"{self.base_url}/chat/completions"
         headers = {
             "Authorization": f"Bearer {self.config.api_key}",

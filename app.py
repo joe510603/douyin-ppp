@@ -31,6 +31,7 @@ from src.web.dashboard import create_dashboard
 from src.web.monitor_page import create_monitor_page
 from src.web.danmaku_page import create_danmaku_page, push_danmaku
 from src.web.data_page import create_data_page
+from src.web.lead_page import create_lead_page
 from src.web.config_page import create_config_page
 from src.web.log_page import create_log_page
 from src.web.video_scrape_page import create_video_scrape_page
@@ -73,6 +74,8 @@ class AppState:
         self.processor: CommentProcessor | None = None
         self.detector: LiveDetector | None = None
         self.task_manager: TaskManager | None = None
+        # 实时购车意向线索服务（规则打分 + 异步落库 + 飞书推送）
+        self.lead_service = None
         
         # 调度任务
         self._scheduler_task: asyncio.Task | None = None
@@ -148,7 +151,17 @@ async def initialize():
     
     # 初始化检测器
     state.detector = LiveDetector()
-    
+
+    # 初始化实时购车意向线索服务（规则打分 + 异步落库 + 飞书推送）
+    from src.intelligence.lead_service import get_lead_service
+    state.lead_service = get_lead_service()
+    await state.lead_service.start()
+    if config.lead.realtime_enabled:
+        log.info(
+            f"🎯 实时意向筛查已开启（规则模式，最低等级 "
+            f"{config.lead.min_intent_level}，实时推送飞书：{'开' if config.lead.realtime_push else '关'}）"
+        )
+
     # 加载监控账号到运行时状态
     _sync_monitor_states()
     
@@ -194,6 +207,13 @@ async def on_new_comment(comment: LiveComment):
         # 更新统计
         state.stats["total_comments"] += 1
         state.stats["today_total"] += 1
+
+        # 实时购车意向判定（纯规则，命中则入队，落库与推送在旁路 worker）
+        # 打分极轻（几十微秒），不拖慢采集；落库/飞书推送都是异步的
+        try:
+            state.lead_service.submit(processed)
+        except Exception as e:
+            log.warning(f"实时线索打分异常: {e}")
 
 
 async def on_connection_status(room_id: str, connected: bool, msg: str):
@@ -523,6 +543,14 @@ def data_page():
     create_data_page(on_export)
 
 
+@ui.page("/leads")
+def leads_page():
+    """线索中心 — 购车意向线索池 + 抖音触达队列"""
+    create_app_header(active_page="leads")
+
+    create_lead_page()
+
+
 @ui.page("/config")
 def config_page():
     """配置管理页面"""
@@ -738,6 +766,11 @@ async def on_shutdown():
 
     # 关闭 TaskManager
     await close_task_manager()
+
+    # 停止实时线索服务
+    if state.lead_service:
+        await state.lead_service.stop()
+        log.info(f"📊 实时筛查统计: {state.lead_service.stats}")
 
     # 关闭资源
     await close_database()

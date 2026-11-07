@@ -8,7 +8,7 @@ from src.collector.video_comment_collector import DouyinVideoCollector
 from src.storage.db_storage import get_db, init_database
 import sqlite3
 
-async def test():
+async def main():
     await init_database()
     config = get_config()
     cookie = config.douyin_video.cookie or config.douyin.cookie
@@ -76,4 +76,4 @@ async def test():
         print(f"   ✅ 无重复记录")
 
 if __name__ == "__main__":
-    asyncio.run(test())
+    asyncio.run(main())
