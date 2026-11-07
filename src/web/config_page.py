@@ -503,6 +503,12 @@ def create_config_page():
                     min=0, max=1440, step=1,
                 ).props("dense outlined").classes("col-12 col-sm-3 app-input")
 
+                bitable_pull_interval = ui.number(
+                    "状态回拉间隔（分钟）",
+                    value=config.notify.bitable_pull_interval_minutes,
+                    min=1, max=1440, step=1,
+                ).props("dense outlined").classes("col-12 col-sm-3 app-input")
+
             with ui.row().classes("w-full items-end q-col-gutter-sm"):
                 bitable_app_id = ui.input(
                     "App ID", value=config.notify.bitable_app_id, placeholder="cli_xxxxxxxx"
@@ -548,6 +554,9 @@ def create_config_page():
                 config.notify.bitable_backend = (bitable_backend.value or "auto").strip()
                 config.notify.bitable_levels = list(bitable_levels.value or [])
                 config.notify.bitable_cooldown_minutes = int(bitable_cooldown.value or 0)
+                config.notify.bitable_pull_interval_minutes = int(
+                    bitable_pull_interval.value or 5
+                )
                 config.notify.bitable_app_id = (bitable_app_id.value or "").strip()
                 config.notify.bitable_app_secret = (bitable_app_secret.value or "").strip()
                 config.notify.bitable_app_token = (bitable_app_token.value or "").strip()

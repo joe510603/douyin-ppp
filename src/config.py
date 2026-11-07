@@ -187,6 +187,9 @@ class NotifyConfig(BaseModel):
     bitable_levels: list[str] = ["high", "medium", "low"]
     # 同一用户两次写表的最小间隔（分钟），避免频繁更新
     bitable_cooldown_minutes: int = 5
+    # 多久把飞书表里销售改过的状态拉回本地（分钟）。
+    # 「处理状态」「触达状态」是双向字段：销售在飞书改，本地也要跟着变。
+    bitable_pull_interval_minutes: int = 5
 
 
 class OutreachConfig(BaseModel):

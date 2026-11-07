@@ -200,14 +200,15 @@ def test_build_fields_maps_outreach_states():
 # 字段规格
 # ============================================================
 
-def test_field_spec_covers_twelve_fields():
+def test_field_spec_covers_thirteen_fields():
     names = [f["name"] for f in LEAD_TABLE_FIELDS]
-    assert len(names) == 12
+    assert len(names) == 13
     # 发现时间必须是第一个：飞书主字段恒在最左列，API 又不允许改主字段，
     # 只能建表时就把它放在第一位
     assert names == [
         "发现时间", "抖音号", "昵称", "意向等级", "意向分", "车型",
-        "弹幕原文", "判定依据", "来源直播间", "联系方式", "处理状态", "触达状态",
+        "弹幕原文", "判定依据", "来源直播间", "门店", "联系方式",
+        "处理状态", "触达状态",
     ]
 
 

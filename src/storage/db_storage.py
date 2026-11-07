@@ -316,7 +316,47 @@ class DBStorage:
             await self._db.commit()
         except aiosqlite.OperationalError:
             pass
-    
+
+        # 迁移：老库补 bitable_synced_status 字段
+        # 记录「上次写入飞书时表里的处理状态」，用于判断本地状态是否真的变了。
+        # 销售在飞书表里手动改的状态是权威值，不能被本地同步覆盖回去。
+        try:
+            await self._db.execute(
+                "ALTER TABLE leads ADD COLUMN bitable_synced_status TEXT DEFAULT ''"
+            )
+            await self._db.commit()
+        except aiosqlite.OperationalError:
+            pass
+
+        # 迁移：老库补 store 字段（归一化后的门店短名）
+        # 配置里同一个门店有多种写法（｜/丨/|/空格），归一化后才能按门店筛选。
+        try:
+            await self._db.execute("ALTER TABLE leads ADD COLUMN store TEXT DEFAULT ''")
+            await self._db.commit()
+        except aiosqlite.OperationalError:
+            pass
+
+        # 回填 store（老数据是空的）
+        try:
+            from ..notify.bitable import normalize_store
+
+            cursor = await self._db.execute(
+                "SELECT id, monitor_name FROM leads WHERE (store IS NULL OR store = '')"
+                " AND monitor_name != ''"
+            )
+            rows = await cursor.fetchall()
+            for row in rows:
+                name = normalize_store(row["monitor_name"] or "")
+                if name:
+                    await self._db.execute(
+                        "UPDATE leads SET store = ? WHERE id = ?", [name, row["id"]]
+                    )
+            if rows:
+                await self._db.commit()
+                log.info(f"回填门店字段：{len(rows)} 条")
+        except Exception as e:
+            log.warning(f"回填门店字段失败: {e}")
+
     async def save_analysis_result(
         self,
         analysis_type: str,
@@ -362,20 +402,26 @@ class DBStorage:
         )
         row = await existing.fetchone()
 
+        # 门店归一化：配置里同一个门店有多种写法，统一成短名
+        store = ""
+        if lead.monitor_name:
+            from ..notify.bitable import normalize_store
+            store = normalize_store(lead.monitor_name)
+
         if row is None:
             cursor = await self._db.execute(
                 """INSERT INTO leads (
                     lead_key, user_id, display_id, nickname, avatar,
-                    room_id, monitor_name, live_room,
+                    room_id, monitor_name, live_room, store,
                     intent_level, intent_score, intent_reason, car_model,
                     contact_type, contact_value,
                     evidence, evidence_count, comment_count,
                     status, pushed_at, outreach_status, outreach_at, outreach_note,
                     source, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 [
                     lead.lead_key, lead.user_id, lead.display_id, lead.nickname, lead.avatar,
-                    lead.room_id, lead.monitor_name, lead.live_room,
+                    lead.room_id, lead.monitor_name, lead.live_room, store,
                     lead.intent_level, lead.intent_score, lead.intent_reason, lead.car_model,
                     lead.contact_type, lead.contact_value,
                     lead.evidence, lead.evidence_count, lead.comment_count,
@@ -418,6 +464,7 @@ class DBStorage:
                 avatar = COALESCE(NULLIF(?, ''), avatar),
                 room_id = COALESCE(NULLIF(?, ''), room_id),
                 monitor_name = COALESCE(NULLIF(?, ''), monitor_name),
+                store = COALESCE(NULLIF(?, ''), store),
                 live_room = COALESCE(NULLIF(?, ''), live_room),
                 intent_level = ?, intent_score = ?, intent_reason = ?, car_model = ?,
                 contact_type = ?, contact_value = ?,
@@ -426,7 +473,7 @@ class DBStorage:
             WHERE lead_key = ?""",
             [
                 lead.user_id, lead.display_id, lead.nickname, lead.avatar,
-                lead.room_id, lead.monitor_name, lead.live_room,
+                lead.room_id, lead.monitor_name, store, lead.live_room,
                 new_level, new_score, new_reason, new_model,
                 new_contact_type, new_contact_value,
                 lead.evidence, old_evidence_count + lead.evidence_count,
@@ -456,7 +503,9 @@ class DBStorage:
         written = 0
         try:
             for lead in leads:
-                await self.upsert_lead(lead, commit=False)
+                lead_id = await self.upsert_lead(lead, commit=False)
+                # 回填主键，调用方（如规则回扫）要靠它回写 record_id 等字段
+                lead.id = lead_id
                 written += 1
             await self._db.commit()
         except Exception:
@@ -471,6 +520,7 @@ class DBStorage:
         outreach_status: Optional[str] = None,
         has_contact: Optional[bool] = None,
         keyword: Optional[str] = None,
+        store: Optional[str] = None,
         limit: int = 50,
         offset: int = 0,
     ) -> tuple[list[dict], int]:
@@ -492,6 +542,9 @@ class DBStorage:
             conditions.append("contact_value != ''")
         elif has_contact is False:
             conditions.append("contact_value = ''")
+        if store:
+            conditions.append("store = ?")
+            params.append(store)
         if keyword:
             conditions.append("(nickname LIKE ? OR display_id LIKE ? OR intent_reason LIKE ?)")
             params.extend([f"%{keyword}%"] * 3)
@@ -524,6 +577,28 @@ class DBStorage:
         rows = await cursor.fetchall()
         return [dict(r) for r in rows]
 
+    async def get_leads_by_keys(self, lead_keys: list[str]) -> list[dict]:
+        """按 lead_key 批量取线索
+
+        用于同步飞书多维表格前取回真实状态（record_id / 上次同步标记）。
+        """
+        if not lead_keys:
+            return []
+        keys = [k for k in lead_keys if k]
+        if not keys:
+            return []
+        out: list[dict] = []
+        # SQLite 的变量上限是 999，分批查
+        for i in range(0, len(keys), 500):
+            chunk = keys[i:i + 500]
+            placeholders = ",".join("?" for _ in chunk)
+            cursor = await self._db.execute(
+                f"SELECT * FROM leads WHERE lead_key IN ({placeholders})", chunk
+            )
+            rows = await cursor.fetchall()
+            out.extend(dict(r) for r in rows)
+        return out
+
     async def update_lead(self, lead_id: int, **fields) -> bool:
         """更新线索字段（白名单内）。返回是否命中。"""
         allowed = {
@@ -531,6 +606,7 @@ class DBStorage:
             "contact_type", "contact_value", "status", "pushed_at",
             "outreach_status", "outreach_at", "outreach_note",
             "nickname", "display_id", "live_room", "bitable_record_id",
+            "bitable_synced_status",
             "evidence", "evidence_count",
         }
         updates = {k: v for k, v in fields.items() if k in allowed}

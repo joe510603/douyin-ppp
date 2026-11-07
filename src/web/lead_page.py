@@ -53,6 +53,23 @@ OUTREACH_LABELS = {
 }
 
 
+def _store_options() -> dict:
+    """门店下拉选项
+
+    从 config 的 monitors 里取，归一化成短名（去「小米汽车」前缀和分隔符），
+    这样同一个门店的不同写法会收敛成一项。
+    """
+    from ..notify.bitable import normalize_store
+
+    cfg = get_config()
+    seen: dict[str, str] = {}
+    for m in cfg.monitors:
+        name = normalize_store(getattr(m, "name", "") or "")
+        if name and name not in seen:
+            seen[name] = name
+    return {"": "全部门店", **seen}
+
+
 def create_lead_page():
     """创建线索中心页面"""
 
@@ -85,6 +102,7 @@ def create_lead_page():
                 status=status_filter.value or None,
                 has_contact=has_contact,
                 keyword=keyword_input.value.strip() or None,
+                store=store_filter.value or None,
                 limit=500,
             )
         except Exception as e:
@@ -213,14 +231,13 @@ def create_lead_page():
             ui.notify(f"飞书推送失败: {err}", type="negative")
 
     async def _do_sync_bitable():
-        """把线索同步到飞书多维表格"""
-        db = get_db()
-        from ..notify.bitable import get_bitable_writer
+        """把线索同步到飞书多维表格
 
-        writer = get_bitable_writer(config)
-        if not writer.is_configured:
-            ui.notify("请先在「配置管理 → 飞书群通知」里配置多维表格参数", type="warning")
-            return
+        复用 lead_service.sync_leads_to_bitable —— 它带状态守卫，
+        不会把销售在飞书表里改过的「处理状态」覆盖回默认值。
+        """
+        db = get_db()
+        from ..intelligence.lead_service import sync_leads_to_bitable
 
         selected = lead_table.selected or []
         levels = [level_filter.value] if level_filter.value else None
@@ -237,15 +254,20 @@ def create_lead_page():
             return
 
         ui.notify(f"正在同步 {len(rows)} 条线索到多维表格...")
-        payloads = []
+
+        # 转成 Lead 对象，走统一的同步路径（带状态守卫 + record_id 回写）
+        from ..models.lead import Lead
+
+        leads = []
         for r in rows:
             r = dict(r)
-            r["_bitable_record_id"] = r.get("bitable_record_id") or ""
-            r["_found_ts"] = int(datetime.now().timestamp() * 1000)
-            payloads.append(r)
+            try:
+                leads.append(Lead(**{k: v for k, v in r.items() if k in Lead.model_fields}))
+            except Exception as e:
+                log.warning(f"线索 {r.get('id')} 转换失败，跳过: {e}")
 
         try:
-            result = await writer.sync_leads(payloads)
+            result = await sync_leads_to_bitable(leads, db=db, config=config)
         except Exception as e:
             log.error(f"多维表格同步失败: {e}", exc_info=True)
             ui.notify(f"同步失败: {e}", type="negative")
@@ -255,18 +277,31 @@ def create_lead_page():
             ui.notify(f"同步失败: {result['error']}", type="negative")
             return
 
-        # 回写 record_id，便于下次增量更新
-        for key, rid in (result.get("record_ids") or {}).items():
-            for r in rows:
-                if (r.get("lead_key") or r.get("display_id")) == key and rid:
-                    await db.update_lead(r["id"], bitable_record_id=rid)
-                    break
-
         msg = (
             f"同步完成：新建 {result.get('created', 0)} 条，"
             f"更新 {result.get('updated', 0)} 条，失败 {result.get('failed', 0)} 条"
         )
         ui.notify(msg, type="positive" if not result.get("failed") else "warning")
+        await _do_query()
+
+    async def _do_pull_status():
+        """把飞书表里销售改过的状态拉回本地"""
+        db = get_db()
+        from ..intelligence.lead_service import pull_bitable_status
+
+        ui.notify("正在从飞书表拉取状态...")
+        try:
+            result = await pull_bitable_status(db=db, config=config)
+        except Exception as e:
+            log.error(f"拉取飞书状态失败: {e}", exc_info=True)
+            ui.notify(f"拉取失败: {e}", type="negative")
+            return
+
+        if result.get("error"):
+            ui.notify(f"拉取失败: {result['error']}", type="warning")
+            return
+        msg = f"已同步 {result.get('updated', 0)} 条状态变更"
+        ui.notify(msg, type="positive")
         await _do_query()
 
     async def _bulk_status(new_status: str):
@@ -420,6 +455,12 @@ def create_lead_page():
                 label="联系方式",
             ).props("dense outlined").classes("col-6 col-sm-2 app-input")
 
+            store_filter = ui.select(
+                options=_store_options(),
+                value="",
+                label="门店",
+            ).props("dense outlined clearable").classes("col-6 col-sm-2 app-input")
+
             keyword_input = ui.input("搜索昵称/抖音号").props(
                 "dense outlined clearable"
             ).classes("col-6 col-sm-3 app-input")
@@ -436,6 +477,7 @@ def create_lead_page():
                 {"name": "display_id", "label": "抖音号", "field": "display_id", "align": "left"},
                 {"name": "intent_level", "label": "意向", "field": "intent_level", "align": "center"},
                 {"name": "intent_score", "label": "分数", "field": "intent_score", "align": "center", "sortable": True},
+                {"name": "store", "label": "门店", "field": "store", "align": "left"},
                 {"name": "car_model", "label": "车型", "field": "car_model", "align": "left"},
                 {"name": "contact_value", "label": "联系方式", "field": "contact_value", "align": "left"},
                 {"name": "intent_reason", "label": "判定依据", "field": "intent_reason", "align": "left"},
@@ -459,6 +501,9 @@ def create_lead_page():
             )
             ui.button("同步到多维表格", on_click=_do_sync_bitable).props(
                 "flat dense icon=table_chart"
+            )
+            ui.button("拉取飞书状态", on_click=_do_pull_status).props(
+                "flat dense icon=cloud_download"
             )
             ui.button("刷新", on_click=_do_query).props("flat dense icon=refresh")
 

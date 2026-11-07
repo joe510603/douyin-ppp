@@ -185,13 +185,17 @@ class LeadService:
             log.error(f"线索落库失败 {lead_key}: {e}")
             return
 
-        # 取回已存的 record_id，避免每次写表都全表扫描一遍
+        # 取回已存的 record_id 和同步状态标记，避免每次写表都全表扫描一遍。
+        # bitable_synced_status 必须取回真实值——它是判断
+        # 「本地状态是否真的变了」的唯一依据，
+        # 用默认值会误判成「本地没改过」而漏写状态。
         if lead_id:
             lead.id = lead_id
             try:
                 row = await db.get_lead(lead_id)
                 if row:
                     lead.bitable_record_id = row.get("bitable_record_id") or ""
+                    lead.bitable_synced_status = row.get("bitable_synced_status") or ""
             except Exception:
                 pass
 
@@ -320,7 +324,36 @@ async def sync_leads_to_bitable(
 
     now = datetime.now()
     payloads = []
+
+    # 统一从 DB 回填真实状态（record_id + 上次同步标记）。
+    # 调用方构造的 Lead 对象里这两个字段可能还是默认值，
+    # 而它们正是判断「本地状态是否真的变了」的唯一依据。
+    db_rows: dict[str, dict] = {}
+    if db is not None:
+        keys = [lead.lead_key for lead in leads if lead.lead_key]
+        if keys:
+            try:
+                rows = await db.get_leads_by_keys(keys)
+                db_rows = {r.get("lead_key") or "": r for r in rows}
+            except Exception:
+                db_rows = {}
+
     for lead in leads:
+        row = db_rows.get(lead.lead_key) or {}
+        synced_status = (
+            row.get("bitable_synced_status")
+            or getattr(lead, "bitable_synced_status", "")
+            or ""
+        )
+        record_id = (
+            row.get("bitable_record_id")
+            or getattr(lead, "bitable_record_id", "")
+            or ""
+        )
+        # 状态也以 DB 为准（DB 才是运营改状态的落点）
+        status = row.get("status") or lead.status
+        outreach_status = row.get("outreach_status") or lead.outreach_status
+
         payloads.append({
             "lead_key": lead.lead_key,
             "display_id": lead.display_id,
@@ -333,9 +366,12 @@ async def sync_leads_to_bitable(
             "monitor_name": lead.monitor_name,
             "live_room": lead.live_room,
             "evidence": lead.evidence,
-            "status": lead.status,
-            "outreach_status": lead.outreach_status,
-            "_bitable_record_id": lead.bitable_record_id,
+            "status": status,
+            "outreach_status": outreach_status,
+            # 上次同步进飞书时的状态，用来判断本地状态是否真的变了。
+            # 销售在飞书表里改过的状态是权威值，不能被本地默认值覆盖回去。
+            "bitable_synced_status": synced_status,
+            "_bitable_record_id": record_id,
             "_found_ts": int(now.timestamp() * 1000),        # http 后端用毫秒时间戳
             "_found_at": now.strftime("%Y-%m-%d %H:%M:%S"),  # lark_cli 后端用字符串
         })
@@ -350,21 +386,167 @@ async def sync_leads_to_bitable(
         log.error(f"[多维表格] 写入失败: {result['error']}")
         return result
 
-    # 回写 record_id
+    # 回写 record_id + 同步状态标记
     record_ids = result.get("record_ids") or {}
     if db is not None and record_ids:
-        for lead in leads:
-            rid = record_ids.get(lead.lead_key)
-            if rid and lead.id:
-                try:
-                    await db.update_lead(lead.id, bitable_record_id=rid)
-                except Exception:
-                    pass
+        from ..notify.bitable import build_synced_status, status_changed
+
+        # 按 lead_key 找 payload——payload 里才是回填后的真实状态
+        payload_by_key = {p.get("lead_key"): p for p in payloads}
+        lead_by_key = {lead.lead_key: lead for lead in leads}
+
+        for key, rid in record_ids.items():
+            lead = lead_by_key.get(key)
+            payload = payload_by_key.get(key)
+            if not rid or not lead or not lead.id or not payload:
+                continue
+            updates: dict = {"bitable_record_id": rid}
+            # 只有状态真被写进飞书了，才更新同步标记。
+            # 被守卫跳过时标记保持原样，下次同步仍会认为「本地没改过」，
+            # 于是继续保留销售在飞书表里改过的值。
+            if status_changed(payload):
+                updates["bitable_synced_status"] = build_synced_status(payload)
+            try:
+                await db.update_lead(lead.id, **updates)
+            except Exception:
+                pass
 
     log.info(
         f"[多维表格] {result.get('created', 0)} 新建 / {result.get('updated', 0)} 更新 "
         f"— {len(payloads)} 条线索"
     )
+    return result
+
+
+# ============================================================
+# 反向同步：把飞书表里销售改过的状态拉回本地
+# ============================================================
+
+# 飞书表里的状态文案 → 本地 status / outreach_status
+_FEISHU_STATUS_TO_LOCAL = {
+    "待处理": "new",
+    "已跟进": "contacted",
+    "已忽略": "ignored",
+}
+_FEISHU_OUTREACH_TO_LOCAL = {
+    "待触达": "pending",
+    "搜索中": "searching",
+    "已定位": "found",
+    "已留言": "commented",
+    "失败": "failed",
+    "已跳过": "skipped",
+}
+
+
+async def pull_bitable_status(db=None, config=None) -> dict:
+    """把飞书表里销售手动改过的状态回流到本地
+
+    「处理状态」「触达状态」是双向字段：销售在飞书表里改，本地网页也能改。
+    本程序只负责往飞书写线索，**不能**把销售改过的值覆盖回去——
+    但本地的线索中心也应该反映销售的处理进度，所以要定期拉回来。
+
+    只在「本地状态相对上次同步没变过」时才采纳飞书的值，
+    避免本地运营刚改完就被飞书端的旧值冲掉。
+
+    Returns:
+        {"pulled": n, "updated": n, "skipped": n, "error": str}
+    """
+    result = {"pulled": 0, "updated": 0, "skipped": 0, "error": ""}
+
+    if config is None:
+        config = get_config()
+    if db is None:
+        db = get_db()
+    if not db or not getattr(db, "_db", None):
+        result["error"] = "数据库未就绪"
+        return result
+    if not config.notify.bitable_enabled:
+        result["error"] = "未启用多维表格"
+        return result
+
+    from ..notify.bitable import get_bitable_writer
+
+    writer = get_bitable_writer(config)
+    if not writer.is_configured:
+        result["error"] = "未配置"
+        return result
+
+    try:
+        status_map = await writer.fetch_status_map()
+    except Exception as e:
+        result["error"] = str(e)
+        return result
+
+    if not status_map:
+        result["error"] = "读到 0 条记录"
+        return result
+
+    result["pulled"] = len(status_map)
+
+    # 取本地有 record_id 的线索（只有这些才对得上飞书的记录）
+    cursor = await db._db.execute(
+        "SELECT id, display_id, status, outreach_status, bitable_synced_status "
+        "FROM leads WHERE display_id != ''"
+    )
+    rows = await cursor.fetchall()
+
+    from ..notify.bitable import STATUS_LABELS, OUTREACH_LABELS
+
+    updated = 0
+    skipped = 0
+    for row in rows:
+        r = dict(row)
+        remote = status_map.get(r.get("display_id") or "")
+        if not remote:
+            continue
+
+        remote_st = remote.get("处理状态") or ""
+        remote_os = remote.get("触达状态") or ""
+        if not remote_st and not remote_os:
+            continue
+
+        local_st = STATUS_LABELS.get(r.get("status") or "", "待处理")
+        local_os = OUTREACH_LABELS.get(r.get("outreach_status") or "", "待触达")
+
+        # 本地状态和上次同步进飞书的值一致 → 说明本地这次没动过，
+        # 可以安全采纳飞书的值（销售改的）
+        synced = (r.get("bitable_synced_status") or "").strip()
+        if synced:
+            s_st, _, s_os = synced.partition("|")
+            local_unchanged = (local_st == (s_st or "").strip())
+            local_unchanged = local_unchanged and (local_os == (s_os or "").strip())
+        else:
+            # 从没同步过 → 本地状态是默认的，采纳飞书的
+            local_unchanged = local_st == "待处理" and local_os == "待触达"
+
+        if not local_unchanged:
+            skipped += 1
+            continue
+
+        updates: dict = {}
+        new_status = _FEISHU_STATUS_TO_LOCAL.get(remote_st)
+        if new_status and new_status != r.get("status"):
+            updates["status"] = new_status
+        new_outreach = _FEISHU_OUTREACH_TO_LOCAL.get(remote_os)
+        if new_outreach and new_outreach != r.get("outreach_status"):
+            updates["outreach_status"] = new_outreach
+
+        if not updates:
+            skipped += 1
+            continue
+
+        # 同步标记也跟着更新成飞书端的值，避免下一轮又认为「本地没改过」
+        updates["bitable_synced_status"] = f"{remote_st or local_st}|{remote_os or local_os}"
+        try:
+            await db.update_lead(r["id"], **updates)
+            updated += 1
+        except Exception:
+            pass
+
+    result["updated"] = updated
+    result["skipped"] = skipped
+    if updated:
+        log.info(f"[多维表格] 回拉状态：{updated} 条已更新，{skipped} 条跳过")
     return result
 
 

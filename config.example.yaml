@@ -88,6 +88,7 @@ notify:
   bitable_lark_cli_path: ''         # 留空自动探测；launchd 的 PATH 很短，建议显式指定
   bitable_levels: [high, medium, low]  # 哪些等级自动写入表格
   bitable_cooldown_minutes: 5       # 同一用户两次写表最小间隔
+  bitable_pull_interval_minutes: 5  # 多久把飞书表里销售改过的状态拉回本地
 outreach:
   enabled: false           # 抖音触达（搜人 + 作品留言）开关
   auto_mode: false

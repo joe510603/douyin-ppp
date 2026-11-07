@@ -71,6 +71,9 @@ class Lead(BaseModel):
     monitor_name: str = Field(default="", description="监控账号名称")
     live_room: str = Field(default="", description="直播间标题")
 
+    # 归一化后的门店短名（monitor_name 去掉「小米汽车」前缀和各种分隔符）
+    store: str = Field(default="", description="归一化后的门店名")
+
     # AI 判定结果
     intent_level: str = Field(default=IntentLevel.NONE.value, description="意向等级 high/medium/low/none")
     intent_score: int = Field(default=0, description="意向分 0-100")
@@ -95,6 +98,10 @@ class Lead(BaseModel):
 
     # 飞书多维表格的记录 ID（用于后续更新而不是重复创建）
     bitable_record_id: str = Field(default="", description="飞书多维表格 record_id")
+
+    # 上次同步进飞书时的状态标记（格式 "处理状态|触达状态"）
+    # 用来判断本地状态是否真的变了——没变就不能覆盖销售在飞书里改过的值
+    bitable_synced_status: str = Field(default="", description="上次同步进飞书的状态标记")
 
     # 第二步：抖音触达状态
     outreach_status: str = Field(default=OutreachStatus.PENDING.value, description="触达执行状态")

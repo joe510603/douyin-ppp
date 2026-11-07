@@ -5,6 +5,46 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.10] - 2026-11-07
+
+### Fixed
+- **销售在飞书表里改的状态被后台同步覆盖**（真 bug）：`处理状态` / `触达状态` 是双向字段——销售在飞书表里标「已跟进」「已忽略」，本地运营在网页线索中心也能改。但每次同步都无条件把本地默认值写回飞书，导致销售刚标完「已跟进」，后台下一轮同步就抹回「待处理」。现在改成两条防线：
+  - **推送守卫**：新增 `leads.bitable_synced_status` 记录「上次同步进飞书时的状态」，本地状态相对它没变过就不写状态字段
+  - **定时回拉**：新增 `pull_bitable_status()`，每 5 分钟（`notify.bitable_pull_interval_minutes`）把飞书端销售改过的状态拉回本地；只在本地状态相对上次同步没变过时才采纳，不会覆盖本地刚做的修改
+- **网页「同步到多维表格」绕过状态守卫**：`_do_sync_bitable` 直接调 `writer.sync_leads()`，绕过了统一同步路径。改为复用 `sync_leads_to_bitable()`，与实时链路行为一致
+- **配置里德阳万达体验店重复 2 条**：14 个 monitor 实为 13 个唯一门店（`sec_user_id` 完全相同），会重复起采集任务。已删除重复项
+
+### Added
+- **飞书表新增「门店」列**：14 个门店的线索混在一张表里，销售没法按门店筛选、也没法把线索分给对应门店的人。门店名做归一化处理——配置里同一个门店有多种写法（`小米汽车｜世茂广场店` / `小米汽车 | 成都龙湖滨江体验店` / `小米汽车 ｜ 机场路店`，混用全角竖线、半角竖线、顿号还夹空格），统一收敛成短名（「世茂广场店」「成都龙湖滨江体验店」）
+- **本地 `leads` 表新增 `store` 字段**：落库时自动归一化，线索中心支持按门店筛选
+- **`scripts/backfill_store_field.py`**：回填飞书表门店列 + 初始化本地同步状态标记（幂等）
+- **线索中心新增**：门店列、门店筛选器、「拉取飞书状态」按钮
+- **配置项**：`notify.bitable_pull_interval_minutes`（状态回拉间隔，默认 5 分钟）
+
+### Changed
+- 多维表格字段从 12 个增加到 13 个（新增「门店」）
+- 测试从 154 个增加到 171 个（新增 `test_bitable_status_sync.py`、`test_bitable_pull.py`、`test_lead_store.py`）
+
+---
+
+## [2.0.9] - 2026-11-07
+
+### Changed
+- **飞书表列顺序调整**：发现日期作为主字段排第一列，只显示日期（yyyy/MM/dd，不要时分秒）。飞书主字段恒在最左列且 API 不允许改主字段，只能重建表迁移
+
+---
+
+## [2.0.8] - 2026-11-07
+
+### Added
+- **意向弹幕自动上飞书多维表格**：实时筛查命中即自动写入，不再依赖群推送是否开启
+- **`LarkCliBitableWriter`**：认证与 token 续期全交给 lark-cli，适合 24h 后台自跑
+
+### Fixed
+- **测试污染真实飞书表**：生产配置里 `bitable_enabled=true` 时，pytest 造的假线索真写进了销售的飞书表。新增 `tests/conftest.py` 全局隔离
+
+---
+
 ## [2.0.4] - 2026-04-26
 
 ### Fixed

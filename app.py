@@ -80,6 +80,7 @@ class AppState:
         # 调度任务
         self._scheduler_task: asyncio.Task | None = None
         self._flush_task: asyncio.Task | None = None
+        self._bitable_pull_task: asyncio.Task | None = None
 
 
 state = AppState()
@@ -318,6 +319,42 @@ async def flush_loop():
         except Exception as e:
             log.error(f"刷写循环异常: {e}")
             await asyncio.sleep(5)
+
+
+async def bitable_pull_loop():
+    """定期把飞书表里销售改过的状态拉回本地
+
+    「处理状态」「触达状态」是双向字段：销售在飞书表里改状态，
+    本地网页线索中心也要能看到，否则两边会打架。
+
+    拉取是「软」的——只在本地状态相对上次同步没变过时才采纳飞书的值，
+    不会覆盖本地运营刚做的修改。
+    """
+    config = get_config()
+    # 启动后先等一会儿，别跟启动期的采集抢资源
+    await asyncio.sleep(60)
+    interval = max(60, getattr(config.notify, "bitable_pull_interval_minutes", 5) * 60)
+
+    while True:
+        try:
+            from src.intelligence.lead_service import pull_bitable_status
+
+            result = await pull_bitable_status(db=state.db, config=get_config())
+            if result.get("error"):
+                log.debug(f"[多维表格] 回拉状态跳过: {result['error']}")
+            else:
+                log.info(
+                    f"[多维表格] 状态回拉：{result.get('updated', 0)} 条更新，"
+                    f"{result.get('skipped', 0)} 条跳过"
+                )
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            log.error(f"[多维表格] 回拉状态异常: {e}")
+        try:
+            await asyncio.sleep(interval)
+        except asyncio.CancelledError:
+            break
 
 
 async def start_collection(room_id: str, sec_id: str, anchor_name: str):
@@ -610,6 +647,15 @@ async def on_startup():
     loop = asyncio.get_event_loop()
     state._flush_task = loop.create_task(flush_loop(), name="flush-loop")
 
+    # 回拉飞书表里销售改过的状态（双向字段的另一条腿）
+    if get_config().notify.bitable_enabled:
+        state._bitable_pull_task = loop.create_task(
+            bitable_pull_loop(), name="bitable-pull-loop"
+        )
+        log.info("飞书表状态回拉任务已启动")
+    else:
+        log.info("飞书表状态回拉任务未启动（多维表格未启用）")
+
     # 【核心修复】检测循环在独立线程中运行
     # 避免 Playwright 的 sync_playwright() 阻塞 uvicorn 事件循环导致 NiceGUI WebSocket 断连
     import threading
@@ -751,6 +797,9 @@ async def on_shutdown():
 
     if state._flush_task and not state._flush_task.done():
         state._flush_task.cancel()
+
+    if state._bitable_pull_task and not state._bitable_pull_task.done():
+        state._bitable_pull_task.cancel()
 
     # 停止检测线程（daemon 线程，主进程退出时自动终止）
     if hasattr(state, '_detection_thread') and state._detection_thread:

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import shutil
 import tempfile
 from pathlib import Path
@@ -62,6 +63,7 @@ LEAD_TABLE_FIELDS: list[dict] = [
     {"name": "弹幕原文", "type": TYPE_TEXT, "description": "触发这条线索的弹幕"},
     {"name": "判定依据", "type": TYPE_TEXT, "description": "命中的购车信号"},
     {"name": "来源直播间", "type": TYPE_TEXT},
+    {"name": "门店", "type": TYPE_TEXT, "description": "归一化后的门店名，用于按门店筛选和分配销售"},
     {"name": "联系方式", "type": TYPE_TEXT, "description": "电话/微信/QQ，从弹幕提取"},
     {"name": "处理状态", "type": TYPE_SELECT, "options": [
         {"name": "待处理", "color_index": 4},
@@ -96,8 +98,71 @@ OUTREACH_LABELS = {
     "commented": "已留言", "failed": "失败", "skipped": "已跳过",
 }
 
+# 门店名归一化：配置里同一个门店有多种写法
+#   '小米汽车｜世茂广场店' / '小米汽车 | 成都龙湖滨江体验店' / '小米汽车 ｜ 机场路店'
+# 分隔符混用了全角竖线、半角竖线、顿号，还夹着空格。
+# 归一化成「成都龙湖滨江体验店」这种干净的短名，
+# 这样飞书表里的「门店」列才能按同一套名字筛选、分给对应销售。
+_STORE_SEP_RE = re.compile(r"[\s|｜丨、/／·・\-—]+")
+_STORE_BRAND_RE = re.compile(r"^小米\s*汽车")
 
-def _lead_to_fields(lead: dict, found_at: Any) -> dict:
+
+def normalize_store(monitor_name: str) -> str:
+    """把监控项名称归一化成门店短名
+
+    >>> normalize_store('小米汽车｜世茂广场店')
+    '世茂广场店'
+    >>> normalize_store('小米汽车 | 成都龙湖滨江体验店')
+    '成都龙湖滨江体验店'
+    >>> normalize_store('小米汽车 ｜ 机场路店')
+    '机场路店'
+    """
+    if not monitor_name:
+        return ""
+    name = _STORE_SEP_RE.sub("", (monitor_name or "").strip())
+    name = _STORE_BRAND_RE.sub("", name).strip()
+    return name or (monitor_name or "").strip()
+
+
+def status_changed(lead: dict) -> bool:
+    """本地状态相对上次同步是否真的变了
+
+    「处理状态」和「触达状态」是**双向**字段：
+    - 销售在飞书表里手动改（标「已跟进」/「已忽略」/「已跳过」）
+    - 本地运营在网页线索中心里改
+
+    谁后改的谁说了算。如果本地状态和上次同步进飞书的值一样，
+    说明本地这次没动过，就**不能**把飞书端的值覆盖回默认值——
+    否则销售刚标完「已跟进」，下一次后台同步就把它抹回「待处理」。
+
+    Args:
+        lead: 线索字典，需带 bitable_synced_status 和 status / outreach_status
+
+    Returns:
+        True 表示本地状态有实质变化，应该写进飞书
+    """
+    synced = (lead.get("bitable_synced_status") or "").strip()
+    if not synced:
+        # 从没同步过（新建记录）→ 状态由本地决定
+        return True
+
+    cur = STATUS_LABELS.get(lead.get("status") or "", "待处理")
+    synced_status, _, synced_outreach = synced.partition("|")
+    if cur != (synced_status or "").strip():
+        return True
+
+    cur_out = OUTREACH_LABELS.get(lead.get("outreach_status") or "", "待触达")
+    return cur_out != (synced_outreach or "").strip()
+
+
+def build_synced_status(lead: dict) -> str:
+    """生成「上次同步进飞书的状态」标记，写回本地用于下次比对"""
+    cur = STATUS_LABELS.get(lead.get("status") or "", "待处理")
+    cur_out = OUTREACH_LABELS.get(lead.get("outreach_status") or "", "待触达")
+    return f"{cur}|{cur_out}"
+
+
+def _lead_to_fields(lead: dict, found_at: Any, skip_status: bool = False) -> dict:
     """
     把一条线索映射成多维表格的 fields 字典。
 
@@ -105,6 +170,11 @@ def _lead_to_fields(lead: dict, found_at: Any) -> dict:
         lead: 线索字典
         found_at: 发现时间的值。HTTP 后端（v1 API）用毫秒时间戳，
                   lark-cli 后端（v3 API）用 "YYYY-MM-DD HH:mm:ss" 字符串
+        skip_status: True 时不写「处理状态」「触达状态」两个字段。
+
+            这两个字段是**双向**的：销售在飞书表里手动改它们（比如标「已跟进」，
+            或把「触达状态」改成「已跳过」），本地不该再拿默认值覆盖回去。
+            调用方在确认本地状态相对上次同步确实变了时，才传 False。
     """
     import json as _json
 
@@ -125,9 +195,17 @@ def _lead_to_fields(lead: dict, found_at: Any) -> dict:
         "判定依据": (lead.get("intent_reason") or "")[:200],
         "来源直播间": lead.get("monitor_name") or lead.get("live_room") or "",
         "弹幕原文": (evidence or "")[:500],
-        "处理状态": STATUS_LABELS.get(lead.get("status") or "", "待处理"),
-        "触达状态": OUTREACH_LABELS.get(lead.get("outreach_status") or "", "待触达"),
     }
+    # 门店：把门店名归一化（去掉「小米汽车」前缀和各种分隔符），
+    # 让 14 个门店能按同一套名字筛选、分配给销售。
+    store = normalize_store(lead.get("monitor_name") or "")
+    if store:
+        fields["门店"] = store
+
+    if not skip_status:
+        fields["处理状态"] = STATUS_LABELS.get(lead.get("status") or "", "待处理")
+        fields["触达状态"] = OUTREACH_LABELS.get(lead.get("outreach_status") or "", "待触达")
+
     # 联系方式只在真有值时写，空值会让开放平台报错
     contact = lead.get("contact_value") or ""
     if contact:
@@ -297,8 +375,15 @@ class BitableWriter:
     # ============================================================
 
     def _build_fields(self, lead: dict) -> dict:
-        """把一条线索映射成多维表格的 fields 字典"""
-        return _lead_to_fields(lead, lead.get("_found_ts") or 0)
+        """把一条线索映射成多维表格的 fields 字典
+
+        状态字段只在本地确实变了的时候才写，避免覆盖销售在飞书表里改的值。
+        """
+        return _lead_to_fields(
+            lead,
+            lead.get("_found_ts") or 0,
+            skip_status=not status_changed(lead),
+        )
 
     async def create_records(self, leads: list[dict]) -> tuple[list[str], str]:
         """
@@ -388,6 +473,42 @@ class BitableWriter:
             if value and str(value) == douyin_id:
                 return item.get("record_id")
         return None
+
+    async def fetch_status_map(self) -> dict[str, dict]:
+        """拉取全表的「抖音号 → 状态」映射
+
+        用来把销售在飞书表里手动改的状态回流到本地。
+        """
+        out: dict[str, dict] = {}
+        if not self.is_configured:
+            return out
+
+        url = (f"{_API_BASE}/bitable/v1/apps/{self.app_token}"
+               f"/tables/{self.table_id}/records")
+        try:
+            async with httpx.AsyncClient(timeout=self.timeout) as client:
+                resp = await client.get(
+                    url,
+                    headers=await self._headers(),
+                    params={"page_size": 500},
+                )
+                data = resp.json()
+        except Exception:
+            return out
+
+        if data.get("code") != 0:
+            return out
+
+        for item in (data.get("data") or {}).get("items") or []:
+            fields = item.get("fields") or {}
+            dy = _cell_text(fields.get("抖音号"))
+            if not dy:
+                continue
+            out[dy] = {
+                "处理状态": _cell_text(fields.get("处理状态")),
+                "触达状态": _cell_text(fields.get("触达状态")),
+            }
+        return out
 
     # ============================================================
     # 对外入口
@@ -482,6 +603,8 @@ LEAD_TABLE_FIELDS_V3: list[dict] = [
      "description": "触发这条线索的原始弹幕"},
     {"name": "判定依据", "type": "text", "style": {"type": "plain"}, "description": "命中的购车信号"},
     {"name": "来源直播间", "type": "text", "style": {"type": "plain"}},
+    {"name": "门店", "type": "text", "style": {"type": "plain"},
+     "description": "归一化后的门店名，用于按门店筛选和分配销售"},
     {"name": "联系方式", "type": "text", "style": {"type": "plain"},
      "description": "电话/微信/QQ，从弹幕提取"},
     {"name": "处理状态", "type": "select", "multiple": False, "options": [
@@ -653,9 +776,16 @@ class LarkCliBitableWriter:
     # ============================================================
 
     def _build_fields(self, lead: dict) -> dict:
-        """v3 API 的日期字段接受 "YYYY-MM-DD HH:mm:ss" 字符串"""
+        """v3 API 的日期字段接受 "YYYY-MM-DD HH:mm:ss" 字符串
+
+        状态字段只在本地确实变了的时候才写，避免覆盖销售在飞书表里改的值。
+        """
         found_at = lead.get("_found_at") or lead.get("created_at") or ""
-        return _lead_to_fields(lead, found_at)
+        return _lead_to_fields(
+            lead,
+            found_at,
+            skip_status=not status_changed(lead),
+        )
 
     async def create_records(self, leads: list[dict]) -> tuple[list[str], str]:
         if not leads:
@@ -731,6 +861,52 @@ class LarkCliBitableWriter:
         if not douyin_id:
             return None
         return (await self._fetch_douyin_map()).get(douyin_id)
+
+    async def fetch_status_map(self) -> dict[str, dict]:
+        """拉取全表的「抖音号 → 状态」映射
+
+        用来把销售在飞书表里手动改的状态回流到本地。
+        只读 3 个字段（抖音号 / 处理状态 / 触达状态），减少传输量。
+
+        Returns:
+            {抖音号: {"处理状态": "已跟进", "触达状态": "已留言"}}
+        """
+        out: dict[str, dict] = {}
+        try:
+            data = await self._run([
+                "base", "+record-list",
+                "--base-token", self.app_token,
+                "--table-id", self.table_id,
+                "--field-id", "抖音号",
+                "--field-id", "处理状态",
+                "--field-id", "触达状态",
+                "--limit", "200",
+            ])
+        except Exception as e:
+            log.warning(f"[多维表格] 读取状态失败: {e}")
+            return out
+
+        d = data.get("data") or {}
+        names = d.get("fields") or []
+        rows = d.get("data") or []
+        try:
+            i_dy = names.index("抖音号")
+        except ValueError:
+            return out
+        i_st = names.index("处理状态") if "处理状态" in names else -1
+        i_os = names.index("触达状态") if "触达状态" in names else -1
+
+        for row in rows:
+            if i_dy >= len(row):
+                continue
+            dy = _cell_text(row[i_dy])
+            if not dy:
+                continue
+            out[dy] = {
+                "处理状态": _cell_text(row[i_st]) if 0 <= i_st < len(row) else "",
+                "触达状态": _cell_text(row[i_os]) if 0 <= i_os < len(row) else "",
+            }
+        return out
 
     # ============================================================
     # 对外入口
