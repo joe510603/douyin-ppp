@@ -173,3 +173,33 @@ def test_推送冷却期内不重复推():
         svc.config.lead.push_cooldown_minutes = 0
         assert svc._in_cooldown("dy_e2e_004") is False
     _run_with_db(t)
+
+
+def test_占位用户不进线索池():
+    """平台占位用户 id（111111 / 0）不是真人
+
+    历史扫描路径（query_user_activity）本来就排除了这两个 id，
+    实时路径必须对齐，否则占位账号会混进线索池和飞书表。
+    """
+    async def t(db, ls_mod):
+        svc = ls_mod.LeadService()
+        svc.config.lead.realtime_push = False
+        await svc.start()
+        try:
+            for placeholder in ("111111", "0"):
+                c = _comment("落地多少钱？什么时候提车", display_id=f"ph_{placeholder}")
+                c.user_id = placeholder
+                assert svc.submit(c) is None, f"占位用户 {placeholder} 不应命中"
+
+            await svc._queue.join()
+            _rows, total = await db.query_leads()
+            assert total == 0, "占位用户不应进线索池"
+
+            # 正常用户仍然要能进
+            svc.submit(_comment("落地多少钱？什么时候提车", display_id="dy_real_001"))
+            await svc._queue.join()
+            _rows2, total2 = await db.query_leads()
+            assert total2 == 1
+        finally:
+            await svc.stop()
+    _run_with_db(t)

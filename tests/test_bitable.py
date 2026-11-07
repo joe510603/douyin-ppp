@@ -203,9 +203,11 @@ def test_build_fields_maps_outreach_states():
 def test_field_spec_covers_twelve_fields():
     names = [f["name"] for f in LEAD_TABLE_FIELDS]
     assert len(names) == 12
+    # 发现时间必须是第一个：飞书主字段恒在最左列，API 又不允许改主字段，
+    # 只能建表时就把它放在第一位
     assert names == [
-        "抖音号", "昵称", "意向等级", "意向分", "车型", "联系方式",
-        "判定依据", "来源直播间", "弹幕原文", "处理状态", "触达状态", "发现时间",
+        "发现时间", "抖音号", "昵称", "意向等级", "意向分", "车型",
+        "弹幕原文", "判定依据", "来源直播间", "联系方式", "处理状态", "触达状态",
     ]
 
 
@@ -386,6 +388,9 @@ def test_cli_writer_batch_update_uses_per_record_values():
 def test_v3_field_spec_matches_runtime_spec():
     """bootstrap 脚本和运行时必须用同一份字段定义"""
     assert [f["name"] for f in LEAD_TABLE_FIELDS_V3] == [f["name"] for f in LEAD_TABLE_FIELDS]
+    # 发现时间只要日期，不要时分秒
+    v3_time = next(f for f in LEAD_TABLE_FIELDS_V3 if f["name"] == "发现时间")
+    assert v3_time["style"]["format"] == "yyyy/MM/dd"
 
 
 def test_get_bitable_writer_dispatch():

@@ -47,14 +47,9 @@ ENV_TABLE_ID = "DOUYIN_PPP_BITABLE_TABLE_ID"
 
 FIELD_NAMES = [f["name"] for f in FIELDS]
 
-# 飞书默认表 → 目标表：复用默认字段而不是删了重建
-RENAME_MAP = {
-    "文本": "抖音号",
-    "单选": "意向等级",
-    "日期": "发现时间",
-}
-# 这些默认字段目标表用不到
-DROP_FIELDS = {"附件"}
+# 说明：不再复用飞书默认表的「文本/单选/日期」字段。
+# 飞书的主字段恒在最左列且 API 不允许改主字段，要让「发现时间」排第一，
+# 必须在建表时就把发现时间作为第一个字段——见 scripts/migrate_bitable_layout.py。
 
 LEVEL_MAP = {"high": "高意向", "medium": "中意向", "low": "低意向"}
 STATUS_MAP = {"new": "待处理", "pushed": "待处理", "contacted": "已跟进", "ignored": "已忽略"}
@@ -104,54 +99,23 @@ def cli_write_json_file(args: list[str], payload: dict) -> dict:
 # ============================================================
 
 def reconcile_fields(base: str, table: str, dry_run: bool) -> dict:
-    """把表结构改造成目标字段集。返回 {created, renamed, dropped}"""
+    """把表结构对齐到目标字段集，并固定视图里的字段顺序。
+
+    注意：**飞书的主字段恒在最左列，且 API 不允许改「哪个字段是主字段」**
+    （`+field-update` 传 primary 会被拒）。所以「发现时间」要排第一，
+    只能建表时就把它放在第一个字段位——见 scripts/migrate_bitable_layout.py。
+
+    这里只负责：
+    1. 补建缺失的字段
+    2. 用视图的 visible_fields 固定显示顺序（主字段会被后端强制顶到第一位）
+    """
     data = cli(["base", "+field-list", "--base-token", base, "--table-id", table])
     existing = {f["name"]: f for f in (data.get("data") or {}).get("fields") or []}
     print(f"当前字段：{list(existing)}")
 
-    created, renamed, dropped = [], [], []
-    # 飞书对部分字段的 update 有限制（如改单选字段的选项会报
-    # "OpenAPIUpdateField limited"），改名失败时旧字段会留下，
-    # 记下来等新字段建好后一并删除
-    stale: list[tuple[str, str]] = []
+    created: list[str] = []
 
-    # 1a. 复用默认字段：改名 + 补类型属性
-    for old_name, new_name in RENAME_MAP.items():
-        if old_name not in existing:
-            continue
-        spec = next(f for f in FIELDS if f["name"] == new_name)
-        if dry_run:
-            print(f"  [dry-run] 重命名 {old_name} → {new_name}")
-            renamed.append(f"{old_name}→{new_name}")
-            # 同步模拟改名后的字段集合，避免 dry-run 与真实执行结果不一致
-            existing[new_name] = existing.pop(old_name)
-            continue
-        try:
-            cli(["base", "+field-update", "--base-token", base, "--table-id", table,
-                 "--field-id", existing[old_name]["id"], "--json", json.dumps(spec, ensure_ascii=False),
-                 "--yes"])
-            print(f"  ✅ {old_name} → {new_name}")
-            renamed.append(f"{old_name}→{new_name}")
-            existing[new_name] = existing.pop(old_name)
-        except RuntimeError as e:
-            print(f"  ⚠️  重命名 {old_name} 失败（{e}），改为新建 {new_name}")
-            stale.append((old_name, existing[old_name]["id"]))
-            existing.pop(old_name, None)
-
-    # 1b. 删除用不到的默认字段
-    for name in list(DROP_FIELDS):
-        if name not in existing:
-            continue
-        if dry_run:
-            print(f"  [dry-run] 删除字段 {name}")
-        else:
-            cli(["base", "+field-delete", "--base-token", base, "--table-id", table,
-                 "--field-id", existing[name]["id"], "--yes"])
-            print(f"  ✅ 删除字段 {name}")
-        dropped.append(name)
-        existing.pop(name, None)
-
-    # 1c. 补建缺失字段
+    # 1. 补建缺失字段
     for spec in FIELDS:
         if spec["name"] in existing:
             continue
@@ -166,25 +130,29 @@ def reconcile_fields(base: str, table: str, dry_run: bool) -> dict:
         print(f"  ✅ 新建字段 {spec['name']}")
         created.append(spec["name"])
 
-    # 1d. 清掉改名失败留下的旧字段（此时新字段已就位，删旧字段是安全的）
-    for old_name, field_id in stale:
-        if dry_run:
-            print(f"  [dry-run] 清理残留字段 {old_name}")
+    # 2. 固定视图字段顺序
+    order = [f["name"] for f in FIELDS]
+    views = cli(["base", "+view-list", "--base-token", base, "--table-id", table])
+    for view in (views.get("data") or {}).get("views") or []:
+        vid = view.get("id")
+        if not vid:
             continue
-        try:
-            cli(["base", "+field-delete", "--base-token", base, "--table-id", table,
-                 "--field-id", field_id, "--yes"])
-            print(f"  ✅ 清理残留字段 {old_name}")
-            dropped.append(old_name)
-        except RuntimeError as e:
-            print(f"  ⚠️  清理残留字段 {old_name} 失败: {e}")
+        if dry_run:
+            print(f"  [dry-run] 视图「{view.get('name')}」字段顺序 → {order}")
+            continue
+        cli_write_json_file(
+            ["base", "+view-set-visible-fields", "--base-token", base,
+             "--table-id", table, "--view-id", vid],
+            {"visible_fields": order},
+        )
+        print(f"  ✅ 视图「{view.get('name')}」字段顺序已固定")
 
     if not dry_run:
         data = cli(["base", "+field-list", "--base-token", base, "--table-id", table])
         now = [f["name"] for f in (data.get("data") or {}).get("fields") or []]
         print(f"字段就绪：{now}")
 
-    return {"created": created, "renamed": renamed, "dropped": dropped}
+    return {"created": created, "renamed": [], "dropped": []}
 
 
 # ============================================================
@@ -216,20 +184,21 @@ def build_row(lead: dict) -> list:
         v = (v or "").strip()
         return v if v else None
 
-    return [
-        txt(lead.get("display_id")) or txt(lead.get("lead_key")),   # 抖音号（主字段，不能空）
-        txt(lead.get("nickname")),
-        LEVEL_MAP.get(lead.get("intent_level") or ""),
-        int(lead.get("intent_score") or 0),
-        txt(lead.get("car_model")),
-        txt(lead.get("contact_value")),
-        txt(lead.get("intent_reason")),
-        txt(lead.get("monitor_name")) or txt(lead.get("live_room")),
-        txt(evidence),
-        STATUS_MAP.get(lead.get("status") or "", "待处理"),
-        OUTREACH_MAP.get(lead.get("outreach_status") or "", "待触达"),
-        lead.get("created_at") or None,
-    ]
+    # 按**字段名**返回字典（不是位置数组）——字段顺序一变位置数组就会静默写错列
+    return {
+        "发现时间": lead.get("created_at") or None,
+        "抖音号": txt(lead.get("display_id")) or txt(lead.get("lead_key")),
+        "昵称": txt(lead.get("nickname")),
+        "意向等级": LEVEL_MAP.get(lead.get("intent_level") or ""),
+        "意向分": int(lead.get("intent_score") or 0),
+        "车型": txt(lead.get("car_model")),
+        "弹幕原文": txt(evidence),
+        "判定依据": txt(lead.get("intent_reason")),
+        "来源直播间": txt(lead.get("monitor_name")) or txt(lead.get("live_room")),
+        "联系方式": txt(lead.get("contact_value")),
+        "处理状态": STATUS_MAP.get(lead.get("status") or "", "待处理"),
+        "触达状态": OUTREACH_MAP.get(lead.get("outreach_status") or "", "待触达"),
+    }
 
 
 # ============================================================
@@ -269,17 +238,17 @@ def list_records(base: str, table: str) -> tuple[list[str], dict, list[str]]:
 def upsert_leads(base: str, table: str, leads: list[dict], by_dy: dict[str, str]) -> tuple[int, int, int]:
     """写入线索。已存在走 update，新的走 batch_create。返回 (新建, 更新, 失败)"""
     created = updated = failed = 0
-    todo: list[list] = []
+    todo: list[dict] = []
 
     for lead in leads:
         row = build_row(lead)
-        dy = row[0]
+        dy = row.get("抖音号")
         if not dy:
             failed += 1
             continue
         rid = by_dy.get(dy)
         if rid:
-            payload = {name: row[i] for i, name in enumerate(FIELD_NAMES) if row[i] is not None}
+            payload = {k: v for k, v in row.items() if v is not None}
             try:
                 cli_write_json_file(
                     ["base", "+record-upsert", "--base-token", base, "--table-id", table,
@@ -298,10 +267,7 @@ def upsert_leads(base: str, table: str, leads: list[dict], by_dy: dict[str, str]
     # 不是旧文档里的 {"fields":[...], "rows":[[...]]}
     for i in range(0, len(todo), 200):
         chunk = todo[i:i + 200]
-        records = [
-            {name: row[j] for j, name in enumerate(FIELD_NAMES) if row[j] is not None}
-            for row in chunk
-        ]
+        records = [{k: v for k, v in row.items() if v is not None} for row in chunk]
         try:
             cli_write_json_file(
                 ["base", "+record-batch-create", "--base-token", base, "--table-id", table],

@@ -31,6 +31,11 @@ log = get_logger("lead_service")
 # 队列最大长度，超了丢弃最旧的（背压保护）
 _MAX_QUEUE = 2000
 
+# 平台占位用户 id：弹幕流里会出现 user_id='111111' / '0' 的系统消息，
+# 它们不是真人。历史扫描路径（query_user_activity）本来就排除了这两个，
+# 实时路径必须对齐，否则占位账号会混进线索池。
+_PLACEHOLDER_USER_IDS = {"111111", "0"}
+
 
 class LeadService:
     """实时购车意向线索服务"""
@@ -108,6 +113,9 @@ class LeadService:
         if not self.config.lead.realtime_enabled:
             return None
         if comment.message_type != "WebcastChatMessage":
+            return None
+        # 平台占位用户不是真人
+        if str(comment.user_id or "") in _PLACEHOLDER_USER_IDS:
             return None
 
         try:

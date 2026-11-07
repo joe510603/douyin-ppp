@@ -48,6 +48,8 @@ TYPE_HYPERLINK = 15  # 超链接
 # ============================================================
 
 LEAD_TABLE_FIELDS: list[dict] = [
+    # 与 LEAD_TABLE_FIELDS_V3 同序：发现时间在第一位（飞书主字段恒在最左列）
+    {"name": "发现时间", "type": TYPE_DATE, "description": "线索发现日期"},
     {"name": "抖音号", "type": TYPE_TEXT, "description": "抖音平台分配的不变 ID（displayId）"},
     {"name": "昵称", "type": TYPE_TEXT},
     {"name": "意向等级", "type": TYPE_SELECT, "options": [
@@ -57,10 +59,10 @@ LEAD_TABLE_FIELDS: list[dict] = [
     ]},
     {"name": "意向分", "type": TYPE_NUMBER, "description": "0-100，规则引擎打分"},
     {"name": "车型", "type": TYPE_TEXT, "description": "客户关注的车型"},
-    {"name": "联系方式", "type": TYPE_TEXT, "description": "电话/微信/QQ，从弹幕提取"},
+    {"name": "弹幕原文", "type": TYPE_TEXT, "description": "触发这条线索的弹幕"},
     {"name": "判定依据", "type": TYPE_TEXT, "description": "命中的购车信号"},
     {"name": "来源直播间", "type": TYPE_TEXT},
-    {"name": "弹幕原文", "type": TYPE_TEXT, "description": "触发这条线索的弹幕"},
+    {"name": "联系方式", "type": TYPE_TEXT, "description": "电话/微信/QQ，从弹幕提取"},
     {"name": "处理状态", "type": TYPE_SELECT, "options": [
         {"name": "待处理", "color_index": 4},
         {"name": "已跟进", "color_index": 0},
@@ -73,7 +75,6 @@ LEAD_TABLE_FIELDS: list[dict] = [
         {"name": "已留言", "color_index": 2},
         {"name": "失败", "color_index": 3},
     ]},
-    {"name": "发现时间", "type": TYPE_DATE},
 ]
 
 
@@ -461,6 +462,10 @@ class BitableWriter:
 # ============================================================
 
 LEAD_TABLE_FIELDS_V3: list[dict] = [
+    # 发现时间放第一列：飞书的主字段恒在最左列，而 API 不允许改「哪个字段是主字段」，
+    # 所以建表时第一个字段就是主字段（见 scripts/migrate_bitable_layout.py）。
+    # 显示格式 yyyy/MM/dd——只要日期，不要时分秒。
+    {"name": "发现时间", "type": "datetime", "style": {"format": "yyyy/MM/dd"}},
     {"name": "抖音号", "type": "text", "style": {"type": "plain"},
      "description": "抖音平台分配的不变 ID（displayId），本表的去重键"},
     {"name": "昵称", "type": "text", "style": {"type": "plain"}},
@@ -473,12 +478,12 @@ LEAD_TABLE_FIELDS_V3: list[dict] = [
      "style": {"type": "plain", "precision": 0, "percentage": False, "thousands_separator": False},
      "description": "0-100，规则引擎打分"},
     {"name": "车型", "type": "text", "style": {"type": "plain"}, "description": "客户关注的车型"},
-    {"name": "联系方式", "type": "text", "style": {"type": "plain"},
-     "description": "电话/微信/QQ，从弹幕提取"},
-    {"name": "判定依据", "type": "text", "style": {"type": "plain"}, "description": "命中的购车信号"},
-    {"name": "来源直播间", "type": "text", "style": {"type": "plain"}},
     {"name": "弹幕原文", "type": "text", "style": {"type": "plain"},
      "description": "触发这条线索的原始弹幕"},
+    {"name": "判定依据", "type": "text", "style": {"type": "plain"}, "description": "命中的购车信号"},
+    {"name": "来源直播间", "type": "text", "style": {"type": "plain"}},
+    {"name": "联系方式", "type": "text", "style": {"type": "plain"},
+     "description": "电话/微信/QQ，从弹幕提取"},
     {"name": "处理状态", "type": "select", "multiple": False, "options": [
         {"name": "待处理", "hue": "Gray", "lightness": "Lighter"},
         {"name": "已跟进", "hue": "Green", "lightness": "Light"},
@@ -492,7 +497,6 @@ LEAD_TABLE_FIELDS_V3: list[dict] = [
         {"name": "失败", "hue": "Red", "lightness": "Lighter"},
         {"name": "已跳过", "hue": "Gray", "lightness": "Lighter"},
     ]},
-    {"name": "发现时间", "type": "datetime", "style": {"format": "yyyy/MM/dd HH:mm"}},
 ]
 
 
@@ -799,6 +803,11 @@ class LarkCliBitableWriter:
                     key = lead.get("lead_key") or lead.get("display_id")
                     if idx < len(ids):
                         result["record_ids"][key] = ids[idx]
+                        # 立刻把新建的映射回灌：同一批里若有两个线索同抖音号，
+                        # 后一个不能再建一条
+                        dy = lead.get("display_id") or ""
+                        if dy:
+                            by_dy[dy] = ids[idx]
             except Exception as e:
                 log.error(f"[多维表格] 批量新建失败: {e}")
                 result["failed"] += len(chunk)
