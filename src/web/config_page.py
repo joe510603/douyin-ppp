@@ -469,16 +469,39 @@ def create_config_page():
         with ui.expansion("多维表格（线索清单）", value=False).props("dense").classes("w-full q-mt-md"):
             ui.label(
                 "把筛出的线索沉淀成一张多维表格，销售在飞书里直接跟进、分配、标记状态。"
-                "需要一个**企业自建应用**（App ID + App Secret）并开通多维表格读写权限；"
                 "表格的 App Token 和数据表 ID 从表格链接里取。"
             ).style("font-size: 12px; color: var(--color-text-tertiary); margin-bottom: 12px; line-height: 1.6;")
 
             bitable_enabled_switch = ui.switch(
                 "启用多维表格同步", value=config.notify.bitable_enabled
             ).classes("q-mb-md")
-            bitable_sync_push = ui.switch(
-                "推送群消息时同时写入表格", value=config.notify.bitable_sync_with_push
-            ).classes("q-mb-md")
+
+            with ui.row().classes("w-full items-end q-col-gutter-sm q-mb-md"):
+                bitable_backend = ui.select(
+                    options={
+                        "auto": "自动（有 App 凭据走直连，否则走 lark-cli）",
+                        "http": "直连开放平台（App 凭据 / 用户 Token）",
+                        "lark_cli": "lark-cli（认证与续期由 lark-cli 负责）",
+                    },
+                    value=config.notify.bitable_backend or "auto",
+                    label="写入后端",
+                ).props("dense outlined").classes("col-12 col-sm-5 app-input")
+
+                bitable_levels = ui.select(
+                    options={
+                        "high": "高意向",
+                        "medium": "中意向",
+                        "low": "低意向",
+                    },
+                    value=config.notify.bitable_levels or ["high", "medium", "low"],
+                    label="自动写入的意向等级",
+                    multiple=True,
+                ).props("dense outlined").classes("col-12 col-sm-4 app-input")
+
+                bitable_cooldown = ui.number(
+                    "写表冷却（分钟）", value=config.notify.bitable_cooldown_minutes,
+                    min=0, max=1440, step=1,
+                ).props("dense outlined").classes("col-12 col-sm-3 app-input")
 
             with ui.row().classes("w-full items-end q-col-gutter-sm"):
                 bitable_app_id = ui.input(
@@ -496,25 +519,44 @@ def create_config_page():
             with ui.row().classes("w-full items-end q-col-gutter-sm q-mt-sm"):
                 bitable_table_id = ui.input(
                     "数据表 ID", value=config.notify.bitable_table_id, placeholder="tblXXXX"
-                ).props("dense outlined").classes("col-12 col-sm-6 app-input")
+                ).props("dense outlined").classes("col-12 col-sm-4 app-input")
 
                 bitable_user_token = ui.input(
                     "用户 Token（备选）", value=config.notify.bitable_user_token,
                     placeholder="留空则用上面的 App ID/Secret"
-                ).props("dense outlined").classes("col-12 col-sm-6 app-input")
+                ).props("dense outlined").classes("col-12 col-sm-4 app-input")
+
+                bitable_lark_cli_identity = ui.select(
+                    options={"user": "用户身份", "bot": "绑定应用"},
+                    value=config.notify.bitable_lark_cli_identity or "user",
+                    label="lark-cli 身份",
+                ).props("dense outlined").classes("col-12 col-sm-4 app-input")
+
+            with ui.row().classes("w-full items-end q-col-gutter-sm q-mt-sm"):
+                bitable_lark_cli_path = ui.input(
+                    "lark-cli 路径", value=config.notify.bitable_lark_cli_path,
+                    placeholder="留空自动探测；launchd 环境建议显式填写绝对路径"
+                ).props("dense outlined").classes("col-12 col-sm-12 app-input")
 
             ui.label(
-                "后台自跑推荐用「App ID + App Secret」；用户 Token 会过期，过期后需重新授权。"
+                "「直连」需要企业自建应用并开通多维表格读写权限；"
+                "「lark-cli」复用已授权的飞书身份，token 过期由 lark-cli 自己续期，适合后台自跑。"
             ).classes("text-caption text-grey-7 q-mb-md")
 
             def save_bitable_config():
                 config.notify.bitable_enabled = bitable_enabled_switch.value
-                config.notify.bitable_sync_with_push = bitable_sync_push.value
+                config.notify.bitable_backend = (bitable_backend.value or "auto").strip()
+                config.notify.bitable_levels = list(bitable_levels.value or [])
+                config.notify.bitable_cooldown_minutes = int(bitable_cooldown.value or 0)
                 config.notify.bitable_app_id = (bitable_app_id.value or "").strip()
                 config.notify.bitable_app_secret = (bitable_app_secret.value or "").strip()
                 config.notify.bitable_app_token = (bitable_app_token.value or "").strip()
                 config.notify.bitable_table_id = (bitable_table_id.value or "").strip()
                 config.notify.bitable_user_token = (bitable_user_token.value or "").strip()
+                config.notify.bitable_lark_cli_identity = (
+                    bitable_lark_cli_identity.value or "user"
+                ).strip()
+                config.notify.bitable_lark_cli_path = (bitable_lark_cli_path.value or "").strip()
                 try:
                     save_config(config)
                     reload_config()

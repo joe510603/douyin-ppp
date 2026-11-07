@@ -43,12 +43,15 @@ class LeadService:
         self._self_names = _build_self_names(self.config)
         # 最近推送过的用户 → 上次推送时间（去重冷却）
         self._pushed_at: dict[str, datetime] = {}
+        # 最近写入多维表格的用户 → 上次写入时间（写表冷却）
+        self._bitable_at: dict[str, datetime] = {}
         # 运行期统计
         self.stats = {
             "scanned": 0,
             "hits": 0,
             "excluded": 0,
             "pushed": 0,
+            "tabled": 0,
             "dropped": 0,
         }
 
@@ -169,10 +172,23 @@ class LeadService:
         )
 
         try:
-            await db.upsert_lead(lead)
+            lead_id = await db.upsert_lead(lead)
         except Exception as e:
             log.error(f"线索落库失败 {lead_key}: {e}")
             return
+
+        # 取回已存的 record_id，避免每次写表都全表扫描一遍
+        if lead_id:
+            lead.id = lead_id
+            try:
+                row = await db.get_lead(lead_id)
+                if row:
+                    lead.bitable_record_id = row.get("bitable_record_id") or ""
+            except Exception:
+                pass
+
+        # ---- 写入多维表格（与群推送解耦：群推送关掉也不影响上表）----
+        await self._maybe_sync_bitable(db, lead, result.level)
 
         # 是否需要推飞书
         if not self.config.lead.realtime_push:
@@ -186,16 +202,6 @@ class LeadService:
             return
 
         await self._push(lead, db)
-
-    def _in_cooldown(self, lead_key: str) -> bool:
-        """同一用户是否处于推送冷却期"""
-        cooldown = self.config.lead.push_cooldown_minutes
-        if cooldown <= 0:
-            return False
-        last = self._pushed_at.get(lead_key)
-        if last and datetime.now() - last < timedelta(minutes=cooldown):
-            return True
-        return False
 
     async def _push(self, lead: Lead, db):
         """推送到飞书群"""
@@ -232,23 +238,82 @@ class LeadService:
                 f"[实时线索] 已推送飞书: {lead.nickname} "
                 f"({lead.intent_level} {lead.intent_score}分) {lead.intent_reason}"
             )
-
-            # 同时写入多维表格（沉淀线索清单）
-            if self.config.notify.bitable_enabled and self.config.notify.bitable_sync_with_push:
-                await self._sync_bitable(db, lead)
         else:
             log.warning(f"[实时线索] 飞书推送失败: {err}")
 
-    async def _sync_bitable(self, db, lead: Lead):
-        """把线索同步到飞书多维表格"""
-        from ..notify.bitable import get_bitable_writer
+    def _in_cooldown(self, lead_key: str) -> bool:
+        """同一用户是否处于推送冷却期"""
+        cooldown = self.config.lead.push_cooldown_minutes
+        if cooldown <= 0:
+            return False
+        last = self._pushed_at.get(lead_key)
+        if last and datetime.now() - last < timedelta(minutes=cooldown):
+            return True
+        return False
 
-        writer = get_bitable_writer(self.config)
-        if not writer.is_configured:
-            log.warning("[多维表格] 未配置 app_id/app_secret/app_token/table_id，跳过写入")
+    def _in_bitable_cooldown(self, lead_key: str) -> bool:
+        """同一用户距离上次写表的间隔"""
+        cooldown = self.config.notify.bitable_cooldown_minutes
+        if cooldown <= 0:
+            return False
+        last = self._bitable_at.get(lead_key)
+        if last and datetime.now() - last < timedelta(minutes=cooldown):
+            return True
+        return False
+
+    async def _maybe_sync_bitable(self, db, lead: Lead, level: str):
+        """把线索写入飞书多维表格
+
+        **与群推送解耦**：群机器人关掉（webhook 没配）时，上表照常进行——
+        线索表才是长期沉淀的地方，群推送只是即时提醒。
+
+        同一用户短时间内重复命中只更新不新建，避免把表刷爆。
+        """
+        cfg = self.config.notify
+        if not cfg.bitable_enabled:
             return
 
-        payload = {
+        levels = cfg.bitable_levels or ["high", "medium", "low"]
+        if level not in levels:
+            return
+        if self._in_bitable_cooldown(lead.lead_key):
+            return
+
+        result = await sync_leads_to_bitable([lead], db=db, config=self.config)
+        self._bitable_at[lead.lead_key] = datetime.now()
+        if not result.get("error"):
+            self.stats["tabled"] = self.stats.get("tabled", 0) + 1
+
+
+async def sync_leads_to_bitable(
+    leads: list[Lead],
+    db=None,
+    config=None,
+) -> dict:
+    """把一批线索写入飞书多维表格（按抖音号去重，命中已有则更新）
+
+    实时筛查和历史回扫共用这条路径。
+    """
+    from ..notify.bitable import get_bitable_writer
+
+    if config is None:
+        from ..config import get_config
+        config = get_config()
+
+    if not config.notify.bitable_enabled:
+        return {"created": 0, "updated": 0, "failed": 0, "error": "", "record_ids": {}}
+    if not leads:
+        return {"created": 0, "updated": 0, "failed": 0, "error": "", "record_ids": {}}
+
+    writer = get_bitable_writer(config)
+    if not writer.is_configured:
+        log.warning("[多维表格] 未配置完整或找不到 lark-cli，跳过写入")
+        return {"created": 0, "updated": 0, "failed": 0, "error": "未配置", "record_ids": {}}
+
+    now = datetime.now()
+    payloads = []
+    for lead in leads:
+        payloads.append({
             "lead_key": lead.lead_key,
             "display_id": lead.display_id,
             "nickname": lead.nickname,
@@ -263,29 +328,36 @@ class LeadService:
             "status": lead.status,
             "outreach_status": lead.outreach_status,
             "_bitable_record_id": lead.bitable_record_id,
-            "_found_ts": int(datetime.now().timestamp() * 1000),
-        }
+            "_found_ts": int(now.timestamp() * 1000),        # http 后端用毫秒时间戳
+            "_found_at": now.strftime("%Y-%m-%d %H:%M:%S"),  # lark_cli 后端用字符串
+        })
 
-        try:
-            result = await writer.sync_leads([payload])
-        except Exception as e:
-            log.error(f"[多维表格] 写入失败: {e}")
-            return
+    try:
+        result = await writer.sync_leads(payloads)
+    except Exception as e:
+        log.error(f"[多维表格] 写入失败: {e}")
+        return {"created": 0, "updated": 0, "failed": len(payloads), "error": str(e), "record_ids": {}}
 
-        if result.get("error"):
-            log.error(f"[多维表格] 写入失败: {result['error']}")
-            return
+    if result.get("error"):
+        log.error(f"[多维表格] 写入失败: {result['error']}")
+        return result
 
-        record_id = (result.get("record_ids") or {}).get(lead.lead_key)
-        if record_id and lead.id:
-            try:
-                await db.update_lead(lead.id, bitable_record_id=record_id)
-            except Exception:
-                pass
-        log.info(
-            f"[多维表格] 已写入 {result.get('created', 0)} 新建 / "
-            f"{result.get('updated', 0)} 更新"
-        )
+    # 回写 record_id
+    record_ids = result.get("record_ids") or {}
+    if db is not None and record_ids:
+        for lead in leads:
+            rid = record_ids.get(lead.lead_key)
+            if rid and lead.id:
+                try:
+                    await db.update_lead(lead.id, bitable_record_id=rid)
+                except Exception:
+                    pass
+
+    log.info(
+        f"[多维表格] {result.get('created', 0)} 新建 / {result.get('updated', 0)} 更新 "
+        f"— {len(payloads)} 条线索"
+    )
+    return result
 
 
 _service: Optional[LeadService] = None

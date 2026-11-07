@@ -79,6 +79,15 @@ notify:
   bitable_table_id: ''     # 数据表 ID（tbl...）
   bitable_sync_with_push: true
   bitable_user_token: ''   # 备选：用户 access token（会过期，仅用于临时排查）
+  # 写入后端：auto / http / lark_cli
+  #   http     —— 直连开放平台（app 凭据或 user_token）
+  #   lark_cli —— 交给 lark-cli 写，认证与 token 续期由 lark-cli 负责
+  #   auto     —— 有 app 凭据走 http，否则走 lark_cli
+  bitable_backend: auto
+  bitable_lark_cli_identity: user   # user = 当前授权用户，bot = 绑定应用
+  bitable_lark_cli_path: ''         # 留空自动探测；launchd 的 PATH 很短，建议显式指定
+  bitable_levels: [high, medium, low]  # 哪些等级自动写入表格
+  bitable_cooldown_minutes: 5       # 同一用户两次写表最小间隔
 outreach:
   enabled: false           # 抖音触达（搜人 + 作品留言）开关
   auto_mode: false

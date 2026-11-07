@@ -6,9 +6,13 @@ import pytest
 
 from src.notify.bitable import (
     LEAD_TABLE_FIELDS,
+    LEAD_TABLE_FIELDS_V3,
     TYPE_SELECT,
     TYPE_TEXT,
     BitableWriter,
+    LarkCliBitableWriter,
+    _cell_text,
+    _lead_to_fields,
 )
 
 
@@ -216,3 +220,188 @@ def test_select_fields_declare_options():
         spec = next(f for f in LEAD_TABLE_FIELDS if f["name"] == name)
         assert spec["type"] == TYPE_SELECT
         assert spec.get("options"), f"{name} 应声明选项"
+
+
+# ============================================================
+# lark-cli 后端
+# ============================================================
+
+def _cli_writer(**kwargs) -> LarkCliBitableWriter:
+    base = dict(
+        app_token="basXXX",
+        table_id="tblXXX",
+        identity="user",
+        cli_path="/bin/echo",   # 存在的假路径，只为通过 is_configured
+    )
+    base.update(kwargs)
+    return LarkCliBitableWriter(**base)
+
+
+def test_cli_writer_requires_table_and_binary():
+    w = _cli_writer(app_token="", table_id="")
+    assert w.is_configured is False
+    w2 = _cli_writer(table_id="")
+    assert w2.is_configured is False
+
+
+def test_cli_writer_falls_back_to_auto_probe():
+    """显式路径不存在时回退到 PATH 探测（本机有 lark-cli 时仍可用）"""
+    w = _cli_writer(cli_path="/definitely/not/here")
+    resolved = w.cli_path
+    assert resolved
+    assert w.is_configured is True
+
+
+def test_cli_writer_builds_fields_with_string_date():
+    """v3 API 的日期字段用字符串，不是毫秒时间戳"""
+    w = _cli_writer()
+    f = w._build_fields(_lead(_found_at="2026-11-07 15:56:06"))
+    assert f["发现时间"] == "2026-11-07 15:56:06"
+    assert f["抖音号"] == "dy001"
+    assert f["意向等级"] == "高意向"
+
+
+def test_cell_text_handles_all_shapes():
+    assert _cell_text(None) == ""
+    assert _cell_text("abc") == "abc"
+    assert _cell_text(["高意向"]) == "高意向"
+    assert _cell_text([{"text": "高意向"}]) == "高意向"
+    assert _cell_text({"text": "x"}) == "x"
+    assert _cell_text(90) == "90"
+
+
+def test_lead_to_fields_drops_none_select():
+    fields = _lead_to_fields(_lead(intent_level="none"), 0)
+    assert "意向等级" not in fields
+    assert fields["意向分"] == 88
+
+
+def test_cli_writer_parses_record_list():
+    """record-list 返回二维数组 + record_id_list，要按列名找抖音号"""
+    w = _cli_writer()
+
+    async def fake_run(args, payload=None):
+        assert args[1] == "+record-list"
+        return {
+            "data": {
+                "fields": ["抖音号", "昵称"],
+                "record_id_list": ["rec1", "rec2"],
+                "data": [["dy001", "张三"], ["dy002", "李四"]],
+            }
+        }
+
+    w._run = fake_run
+    rid = asyncio.run(w.search_by_douyin_id("dy002"))
+    assert rid == "rec2"
+    assert asyncio.run(w.search_by_douyin_id("nope")) is None
+
+
+def test_cli_writer_sync_updates_existing():
+    """已存在的抖音号走批量 update，不新建"""
+    w = _cli_writer()
+    calls = []
+
+    async def fake_run(args, payload=None):
+        calls.append((args[1], payload))
+        if args[1] == "+field-list":
+            return {"data": {"fields": [{"name": f["name"]} for f in LEAD_TABLE_FIELDS_V3]}}
+        if args[1] == "+record-list":
+            return {"data": {"fields": ["抖音号"], "record_id_list": ["recX"], "data": [["dy001"]]}}
+        if args[1] == "+record-batch-update":
+            return {"data": {}}
+        return {"data": {"record_id_list": []}}
+
+    w._run = fake_run
+    res = asyncio.run(w.sync_leads([_lead()]))
+    assert res["updated"] == 1
+    assert res["created"] == 0
+    assert res["record_ids"]["dy001"] == "recX"
+    assert any(c[0] == "+record-batch-update" for c in calls)
+    assert not any(c[0] == "+record-batch-create" for c in calls)
+
+
+def test_cli_writer_sync_skips_table_scan_when_record_id_known():
+    """已有 record_id 时不该再全表扫描一次"""
+    w = _cli_writer()
+    calls = []
+
+    async def fake_run(args, payload=None):
+        calls.append(args[1])
+        if args[1] == "+field-list":
+            return {"data": {"fields": [{"name": f["name"]} for f in LEAD_TABLE_FIELDS_V3]}}
+        if args[1] == "+record-batch-update":
+            return {"data": {}}
+        return {"data": {}}
+
+    w._run = fake_run
+    res = asyncio.run(w.sync_leads([_lead(_bitable_record_id="recKnown")]))
+    assert res["updated"] == 1
+    assert "+record-list" not in calls
+    assert res["record_ids"]["dy001"] == "recKnown"
+
+
+def test_cli_writer_sync_creates_when_missing():
+    w = _cli_writer()
+
+    async def fake_run(args, payload=None):
+        if args[1] == "+field-list":
+            return {"data": {"fields": [{"name": f["name"]} for f in LEAD_TABLE_FIELDS_V3]}}
+        if args[1] == "+record-list":
+            return {"data": {"fields": ["抖音号"], "record_id_list": [], "data": []}}
+        if args[1] == "+record-batch-create":
+            return {"data": {"record_id_list": ["recNew"]}}
+        return {"data": {}}
+
+    w._run = fake_run
+    res = asyncio.run(w.sync_leads([_lead()]))
+    assert res["created"] == 1
+    assert res["record_ids"]["dy001"] == "recNew"
+
+
+def test_cli_writer_batch_update_uses_per_record_values():
+    """批量更新是「每条记录一份字段值」，不能同值套用"""
+    w = _cli_writer()
+    seen = {}
+
+    async def fake_run(args, payload=None):
+        if args[1] == "+field-list":
+            return {"data": {"fields": [{"name": f["name"]} for f in LEAD_TABLE_FIELDS_V3]}}
+        if args[1] == "+record-list":
+            return {"data": {"fields": ["抖音号"], "record_id_list": ["r1", "r2"], "data": [["a"], ["b"]]}}
+        if args[1] == "+record-batch-update":
+            seen.update(payload)
+            return {"data": {}}
+        return {"data": {}}
+
+    w._run = fake_run
+    asyncio.run(w.sync_leads([
+        _lead(display_id="a", intent_score=90),
+        _lead(display_id="b", intent_score=50),
+    ]))
+    assert set(seen["update_records"].keys()) == {"r1", "r2"}
+    assert seen["update_records"]["r1"]["意向分"] == 90
+    assert seen["update_records"]["r2"]["意向分"] == 50
+
+
+def test_v3_field_spec_matches_runtime_spec():
+    """bootstrap 脚本和运行时必须用同一份字段定义"""
+    assert [f["name"] for f in LEAD_TABLE_FIELDS_V3] == [f["name"] for f in LEAD_TABLE_FIELDS]
+
+
+def test_get_bitable_writer_dispatch():
+    """auto：没有 app 凭据时走 lark_cli，有凭据时走 http"""
+    from src.config import Settings
+    from src.notify.bitable import get_bitable_writer
+
+    cfg = Settings()
+    cfg.notify.bitable_app_token = "basXXX"
+    cfg.notify.bitable_table_id = "tblXXX"
+    cfg.notify.bitable_backend = "auto"
+    assert isinstance(get_bitable_writer(cfg), LarkCliBitableWriter)
+
+    cfg.notify.bitable_app_id = "cli_x"
+    cfg.notify.bitable_app_secret = "s"
+    assert isinstance(get_bitable_writer(cfg), BitableWriter)
+
+    cfg.notify.bitable_backend = "lark_cli"
+    assert isinstance(get_bitable_writer(cfg), LarkCliBitableWriter)

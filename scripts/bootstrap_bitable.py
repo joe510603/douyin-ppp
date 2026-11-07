@@ -35,6 +35,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
+from src.notify.bitable import LEAD_TABLE_FIELDS_V3 as FIELDS  # noqa: E402
+
 DEFAULT_DB = ROOT / "data" / "db" / "douyin_ppp.db"
 
 # 多维表格标识（app_token / table_id）**不进版本库**：
@@ -42,45 +44,6 @@ DEFAULT_DB = ROOT / "data" / "db" / "douyin_ppp.db"
 # 读取优先级：命令行参数 > 环境变量 > 本地 config.yaml
 ENV_APP_TOKEN = "DOUYIN_PPP_BITABLE_APP_TOKEN"
 ENV_TABLE_ID = "DOUYIN_PPP_BITABLE_TABLE_ID"
-
-# ============================================================
-# 字段结构（飞书 v3 shortcut JSON 规范）
-# ============================================================
-
-FIELDS: list[dict] = [
-    {"name": "抖音号", "type": "text", "style": {"type": "plain"},
-     "description": "抖音平台分配的不变 ID（displayId），本表的去重键"},
-    {"name": "昵称", "type": "text", "style": {"type": "plain"}},
-    {"name": "意向等级", "type": "select", "multiple": False, "options": [
-        {"name": "高意向", "hue": "Red", "lightness": "Light"},
-        {"name": "中意向", "hue": "Orange", "lightness": "Light"},
-        {"name": "低意向", "hue": "Blue", "lightness": "Light"},
-    ]},
-    {"name": "意向分", "type": "number",
-     "style": {"type": "plain", "precision": 0, "percentage": False, "thousands_separator": False},
-     "description": "0-100，规则引擎打分"},
-    {"name": "车型", "type": "text", "style": {"type": "plain"}, "description": "客户关注的车型"},
-    {"name": "联系方式", "type": "text", "style": {"type": "plain"},
-     "description": "电话/微信/QQ，从弹幕提取"},
-    {"name": "判定依据", "type": "text", "style": {"type": "plain"}, "description": "命中的购车信号"},
-    {"name": "来源直播间", "type": "text", "style": {"type": "plain"}},
-    {"name": "弹幕原文", "type": "text", "style": {"type": "plain"},
-     "description": "触发这条线索的原始弹幕"},
-    {"name": "处理状态", "type": "select", "multiple": False, "options": [
-        {"name": "待处理", "hue": "Gray", "lightness": "Lighter"},
-        {"name": "已跟进", "hue": "Green", "lightness": "Light"},
-        {"name": "已忽略", "hue": "Red", "lightness": "Lighter"},
-    ]},
-    {"name": "触达状态", "type": "select", "multiple": False, "options": [
-        {"name": "待触达", "hue": "Gray", "lightness": "Lighter"},
-        {"name": "搜索中", "hue": "Orange", "lightness": "Light"},
-        {"name": "已定位", "hue": "Wathet", "lightness": "Light"},
-        {"name": "已留言", "hue": "Green", "lightness": "Light"},
-        {"name": "失败", "hue": "Red", "lightness": "Lighter"},
-        {"name": "已跳过", "hue": "Gray", "lightness": "Lighter"},
-    ]},
-    {"name": "发现时间", "type": "datetime", "style": {"format": "yyyy/MM/dd HH:mm"}},
-]
 
 FIELD_NAMES = [f["name"] for f in FIELDS]
 

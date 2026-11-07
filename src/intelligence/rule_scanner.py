@@ -123,6 +123,15 @@ async def scan_by_rules(
     except Exception as e:
         log.error(f"线索批量写入失败: {e}")
 
+    # 写入飞书多维表格（与实时路径共用同一套逻辑，按抖音号去重）
+    if leads:
+        try:
+            from .lead_service import sync_leads_to_bitable
+
+            await sync_leads_to_bitable(leads, db=db, config=config)
+        except Exception as e:
+            log.error(f"线索同步多维表格失败: {e}")
+
     log.info(
         f"规则回扫完成：扫描 {scanned} 用户 → 命中 {hits} → 入池 {len(leads)} 条 "
         f"（{level_counts}），车型热度 {models}"

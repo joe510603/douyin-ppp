@@ -14,6 +14,10 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import shutil
+import tempfile
+from pathlib import Path
 from typing import Any, Optional
 
 import httpx
@@ -78,6 +82,59 @@ def _mask(text: str) -> str:
     if not text:
         return "(空)"
     return f"***{text[-4:]}"
+
+
+# ============================================================
+# 线索 → 字段映射（HTTP / lark-cli 两种后端共用）
+# ============================================================
+
+LEVEL_LABELS = {"high": "高意向", "medium": "中意向", "low": "低意向"}
+STATUS_LABELS = {"new": "待处理", "pushed": "待处理", "contacted": "已跟进", "ignored": "已忽略"}
+OUTREACH_LABELS = {
+    "pending": "待触达", "searching": "搜索中", "found": "已定位",
+    "commented": "已留言", "failed": "失败", "skipped": "已跳过",
+}
+
+
+def _lead_to_fields(lead: dict, found_at: Any) -> dict:
+    """
+    把一条线索映射成多维表格的 fields 字典。
+
+    Args:
+        lead: 线索字典
+        found_at: 发现时间的值。HTTP 后端（v1 API）用毫秒时间戳，
+                  lark-cli 后端（v3 API）用 "YYYY-MM-DD HH:mm:ss" 字符串
+    """
+    import json as _json
+
+    evidence = lead.get("evidence") or ""
+    if isinstance(evidence, str) and evidence.startswith("["):
+        try:
+            items = _json.loads(evidence)
+            evidence = " / ".join(str(i) for i in items)
+        except (ValueError, TypeError):
+            pass
+
+    fields: dict[str, Any] = {
+        "抖音号": lead.get("display_id") or "",
+        "昵称": lead.get("nickname") or "",
+        "意向等级": LEVEL_LABELS.get(lead.get("intent_level") or "", None),
+        "意向分": int(lead.get("intent_score") or 0),
+        "车型": lead.get("car_model") or "",
+        "判定依据": (lead.get("intent_reason") or "")[:200],
+        "来源直播间": lead.get("monitor_name") or lead.get("live_room") or "",
+        "弹幕原文": (evidence or "")[:500],
+        "处理状态": STATUS_LABELS.get(lead.get("status") or "", "待处理"),
+        "触达状态": OUTREACH_LABELS.get(lead.get("outreach_status") or "", "待触达"),
+    }
+    # 联系方式只在真有值时写，空值会让开放平台报错
+    contact = lead.get("contact_value") or ""
+    if contact:
+        fields["联系方式"] = contact
+    fields["发现时间"] = found_at
+
+    # 去掉 None 值（单选字段没匹配上时会是 None）
+    return {k: v for k, v in fields.items() if v is not None}
 
 
 class BitableWriter:
@@ -240,43 +297,7 @@ class BitableWriter:
 
     def _build_fields(self, lead: dict) -> dict:
         """把一条线索映射成多维表格的 fields 字典"""
-        level_map = {"high": "高意向", "medium": "中意向", "low": "低意向"}
-        status_map = {"new": "待处理", "contacted": "已跟进", "ignored": "已忽略"}
-        outreach_map = {
-            "pending": "待触达", "searching": "搜索中", "found": "已定位",
-            "commented": "已留言", "failed": "失败", "skipped": "已跳过",
-        }
-
-        evidence = lead.get("evidence") or ""
-        if isinstance(evidence, str) and evidence.startswith("["):
-            try:
-                import json
-                items = json.loads(evidence)
-                evidence = " / ".join(str(i) for i in items)
-            except (ValueError, TypeError):
-                pass
-
-        fields: dict[str, Any] = {
-            "抖音号": lead.get("display_id") or "",
-            "昵称": lead.get("nickname") or "",
-            "意向等级": level_map.get(lead.get("intent_level") or "", None),
-            "意向分": int(lead.get("intent_score") or 0),
-            "车型": lead.get("car_model") or "",
-            "判定依据": (lead.get("intent_reason") or "")[:200],
-            "来源直播间": lead.get("monitor_name") or lead.get("live_room") or "",
-            "弹幕原文": (evidence or "")[:500],
-            "处理状态": status_map.get(lead.get("status") or "", "待处理"),
-            "触达状态": outreach_map.get(lead.get("outreach_status") or "", "待触达"),
-        }
-        # 电话号码字段只在真有联系方式时写，空值会让开放平台报错
-        contact = lead.get("contact_value") or ""
-        if contact:
-            fields["联系方式"] = contact
-        # 发现时间用毫秒时间戳
-        fields["发现时间"] = lead.get("_found_ts") or 0
-
-        # 去掉 None 值（单选字段没匹配上时会是 None）
-        return {k: v for k, v in fields.items() if v is not None}
+        return _lead_to_fields(lead, lead.get("_found_ts") or 0)
 
     async def create_records(self, leads: list[dict]) -> tuple[list[str], str]:
         """
@@ -432,12 +453,391 @@ class BitableWriter:
         return result
 
 
+# ============================================================
+# 字段定义（飞书 v3 shortcut JSON 规范）
+#
+# lark-cli 后端建字段用这份；scripts/bootstrap_bitable.py 也 import 它，
+# 避免两处各写一份字段表导致漂移。
+# ============================================================
+
+LEAD_TABLE_FIELDS_V3: list[dict] = [
+    {"name": "抖音号", "type": "text", "style": {"type": "plain"},
+     "description": "抖音平台分配的不变 ID（displayId），本表的去重键"},
+    {"name": "昵称", "type": "text", "style": {"type": "plain"}},
+    {"name": "意向等级", "type": "select", "multiple": False, "options": [
+        {"name": "高意向", "hue": "Red", "lightness": "Light"},
+        {"name": "中意向", "hue": "Orange", "lightness": "Light"},
+        {"name": "低意向", "hue": "Blue", "lightness": "Light"},
+    ]},
+    {"name": "意向分", "type": "number",
+     "style": {"type": "plain", "precision": 0, "percentage": False, "thousands_separator": False},
+     "description": "0-100，规则引擎打分"},
+    {"name": "车型", "type": "text", "style": {"type": "plain"}, "description": "客户关注的车型"},
+    {"name": "联系方式", "type": "text", "style": {"type": "plain"},
+     "description": "电话/微信/QQ，从弹幕提取"},
+    {"name": "判定依据", "type": "text", "style": {"type": "plain"}, "description": "命中的购车信号"},
+    {"name": "来源直播间", "type": "text", "style": {"type": "plain"}},
+    {"name": "弹幕原文", "type": "text", "style": {"type": "plain"},
+     "description": "触发这条线索的原始弹幕"},
+    {"name": "处理状态", "type": "select", "multiple": False, "options": [
+        {"name": "待处理", "hue": "Gray", "lightness": "Lighter"},
+        {"name": "已跟进", "hue": "Green", "lightness": "Light"},
+        {"name": "已忽略", "hue": "Red", "lightness": "Lighter"},
+    ]},
+    {"name": "触达状态", "type": "select", "multiple": False, "options": [
+        {"name": "待触达", "hue": "Gray", "lightness": "Lighter"},
+        {"name": "搜索中", "hue": "Orange", "lightness": "Light"},
+        {"name": "已定位", "hue": "Wathet", "lightness": "Light"},
+        {"name": "已留言", "hue": "Green", "lightness": "Light"},
+        {"name": "失败", "hue": "Red", "lightness": "Lighter"},
+        {"name": "已跳过", "hue": "Gray", "lightness": "Lighter"},
+    ]},
+    {"name": "发现时间", "type": "datetime", "style": {"format": "yyyy/MM/dd HH:mm"}},
+]
+
+
+def _cell_text(value: Any) -> str:
+    """把多维表格单元格的多种返回形态统一成字符串"""
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        return str(value.get("text") or value.get("name") or "")
+    if isinstance(value, list):
+        parts = []
+        for item in value:
+            parts.append(_cell_text(item))
+        return "".join(parts)
+    return str(value)
+
+
+class LarkCliBitableWriter:
+    """通过 lark-cli 写多维表格
+
+    认证完全交给 lark-cli（用户身份，或已绑定的应用），
+    token 过期由 lark-cli 自己续期——适合 24h 后台自跑程序。
+
+    适用场景：已经用 lark-cli 授权过，但拿不到企业自建应用的 app_secret。
+    """
+
+    def __init__(
+        self,
+        app_token: str,
+        table_id: str,
+        identity: str = "user",
+        cli_path: str = "",
+        timeout: int = 60,
+    ):
+        self.app_token = (app_token or "").strip()
+        self.table_id = (table_id or "").strip()
+        self.identity = (identity or "user").strip() or "user"
+        self._configured_cli = (cli_path or "").strip()
+        self.timeout = timeout
+        self._resolved_cli = ""
+
+    # ============================================================
+    # 基础配置
+    # ============================================================
+
+    @property
+    def cli_path(self) -> str:
+        """定位 lark-cli 可执行文件
+
+        launchd 注入的 PATH 很短（只有 /usr/bin:/bin 等），
+        用户级 npm 全局目录不在里面，所以要显式兜底。
+        """
+        if self._resolved_cli:
+            return self._resolved_cli
+        if self._configured_cli and Path(self._configured_cli).exists():
+            self._resolved_cli = self._configured_cli
+            return self._resolved_cli
+        found = shutil.which("lark-cli")
+        if found:
+            self._resolved_cli = found
+            return found
+        for cand in (
+            Path.home() / ".npm-global/bin/lark-cli",
+            Path("/opt/homebrew/bin/lark-cli"),
+            Path("/usr/local/bin/lark-cli"),
+        ):
+            if cand.exists():
+                self._resolved_cli = str(cand)
+                return found if found else str(cand)
+        return ""
+
+    @property
+    def is_configured(self) -> bool:
+        return bool(self.app_token and self.table_id and self.cli_path)
+
+    # ============================================================
+    # CLI 调用
+    # ============================================================
+
+    def _run_sync(self, args: list[str], payload: Optional[dict] = None) -> dict:
+        import subprocess
+
+        cmd = [self.cli_path, *args]
+        tmp: Optional[str] = None
+        try:
+            if payload is not None:
+                # --json @file 只接受 cwd / /tmp / ~/files 下的路径
+                with tempfile.NamedTemporaryFile(
+                    "w", suffix=".json", delete=False, encoding="utf-8", dir="/tmp"
+                ) as f:
+                    json.dump(payload, f, ensure_ascii=False)
+                    tmp = f.name
+                cmd += ["--json", f"@{tmp}"]
+            cmd += ["--as", self.identity, "--format", "json"]
+
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=self.timeout)
+            out = (proc.stdout or "").strip()
+            if not out:
+                raise RuntimeError(f"lark-cli 无输出: {(proc.stderr or '')[:300]}")
+            data = json.loads(out)
+            if not data.get("ok", True):
+                err = data.get("error") or data
+                raise RuntimeError(json.dumps(err, ensure_ascii=False)[:400])
+            return data
+        finally:
+            if tmp:
+                Path(tmp).unlink(missing_ok=True)
+
+    async def _run(self, args: list[str], payload: Optional[dict] = None) -> dict:
+        # subprocess 是阻塞的，放线程里跑，别卡住事件循环
+        return await asyncio.to_thread(self._run_sync, args, payload)
+
+    # ============================================================
+    # 字段
+    # ============================================================
+
+    async def list_fields(self) -> list[dict]:
+        data = await self._run([
+            "base", "+field-list",
+            "--base-token", self.app_token,
+            "--table-id", self.table_id,
+        ])
+        return (data.get("data") or {}).get("fields") or []
+
+    async def ensure_fields(self, spec: Optional[list[dict]] = None) -> list[str]:
+        """按 spec 补建缺失字段（幂等）"""
+        if not self.is_configured:
+            return []
+        spec = spec or LEAD_TABLE_FIELDS_V3
+        existing = await self.list_fields()
+        existing_names = {f.get("name") for f in existing}
+        created: list[str] = []
+
+        for field in spec:
+            name = field["name"]
+            if name in existing_names:
+                continue
+            try:
+                await self._run(
+                    ["base", "+field-create", "--base-token", self.app_token,
+                     "--table-id", self.table_id],
+                    field,
+                )
+                created.append(name)
+                log.info(f"✅ 已创建字段: {name}")
+            except Exception as e:
+                log.error(f"创建字段「{name}」失败: {e}")
+        return created
+
+    # ============================================================
+    # 记录
+    # ============================================================
+
+    def _build_fields(self, lead: dict) -> dict:
+        """v3 API 的日期字段接受 "YYYY-MM-DD HH:mm:ss" 字符串"""
+        found_at = lead.get("_found_at") or lead.get("created_at") or ""
+        return _lead_to_fields(lead, found_at)
+
+    async def create_records(self, leads: list[dict]) -> tuple[list[str], str]:
+        if not leads:
+            return [], ""
+        records = [{"fields": self._build_fields(lead)} for lead in leads]
+        try:
+            data = await self._run(
+                ["base", "+record-batch-create", "--base-token", self.app_token,
+                 "--table-id", self.table_id],
+                {"create_records": records},
+            )
+        except Exception as e:
+            log.error(f"批量写入多维表格失败: {e}")
+            return [], str(e)
+
+        d = data.get("data") or {}
+        ids = [str(x) for x in (d.get("record_id_list") or [])]
+        return ids, ""
+
+    async def update_record(self, record_id: str, lead: dict) -> tuple[bool, str]:
+        if not record_id:
+            return False, "参数缺失"
+        payload = self._build_fields(lead)
+        try:
+            await self._run(
+                ["base", "+record-upsert", "--base-token", self.app_token,
+                 "--table-id", self.table_id, "--record-id", record_id],
+                payload,
+            )
+            return True, ""
+        except Exception as e:
+            return False, str(e)
+
+    async def _fetch_douyin_map(self) -> dict[str, str]:
+        """拉一次全表，建立 抖音号 → record_id 映射（用于去重）"""
+        try:
+            data = await self._run([
+                "base", "+record-list",
+                "--base-token", self.app_token,
+                "--table-id", self.table_id,
+                "--limit", "200",
+            ])
+        except Exception as e:
+            log.warning(f"[多维表格] 读取现有记录失败: {e}")
+            return {}
+
+        d = data.get("data") or {}
+        names = d.get("fields") or []
+        ids = d.get("record_id_list") or []
+        rows = d.get("data") or []
+        try:
+            di = names.index("抖音号")
+        except ValueError:
+            return {}
+
+        if len(ids) >= 200:
+            log.warning(
+                f"[多维表格] 记录数已达 {len(ids)} 条，接近 record-list 单次上限，"
+                "超出部分的去重可能失效"
+            )
+
+        out: dict[str, str] = {}
+        for rid, row in zip(ids, rows):
+            if di >= len(row):
+                continue
+            value = _cell_text(row[di])
+            if value:
+                out[value] = str(rid)
+        return out
+
+    async def search_by_douyin_id(self, douyin_id: str) -> Optional[str]:
+        """按抖音号查已有记录的 record_id"""
+        if not douyin_id:
+            return None
+        return (await self._fetch_douyin_map()).get(douyin_id)
+
+    # ============================================================
+    # 对外入口
+    # ============================================================
+
+    async def sync_leads(self, leads: list[dict], update_existing: bool = True) -> dict:
+        """同步线索到多维表格（按抖音号去重）
+
+        性能要点：
+        - 全表映射只拉一次（而且只在有线索缺 record_id 时才拉）
+        - 更新走 record-batch-update（逐条不同值，单次上限 200）
+        - 新建走 record-batch-create（单次上限 200）
+        """
+        result = {"created": 0, "updated": 0, "failed": 0, "error": "", "record_ids": {}}
+        if not self.is_configured:
+            result["error"] = "多维表格未配置或找不到 lark-cli"
+            return result
+        if not leads:
+            return result
+
+        await self.ensure_fields()
+
+        # 只有在有线索缺 record_id 时才拉一次全表映射
+        by_dy: dict[str, str] = {}
+        if any(not lead.get("_bitable_record_id") for lead in leads):
+            by_dy = await self._fetch_douyin_map()
+
+        to_update: list[tuple[str, dict]] = []
+        to_create: list[tuple[dict, dict]] = []   # (lead, fields)
+
+        for lead in leads:
+            key = lead.get("lead_key") or lead.get("display_id")
+            record_id = lead.get("_bitable_record_id") or by_dy.get(lead.get("display_id") or "")
+            fields = self._build_fields(lead)
+            if record_id and update_existing:
+                to_update.append((record_id, fields))
+                result["record_ids"][key] = record_id
+            else:
+                to_create.append((lead, fields))
+
+        # ---- 批量更新 ----
+        for i in range(0, len(to_update), 200):
+            chunk = to_update[i:i + 200]
+            payload = {"update_records": {rid: fields for rid, fields in chunk}}
+            try:
+                await self._run(
+                    ["base", "+record-batch-update", "--base-token", self.app_token,
+                     "--table-id", self.table_id],
+                    payload,
+                )
+                result["updated"] += len(chunk)
+            except Exception as e:
+                log.error(f"[多维表格] 批量更新失败: {e}")
+                result["failed"] += len(chunk)
+                result["error"] = str(e)
+
+        # ---- 批量新建 ----
+        for i in range(0, len(to_create), 200):
+            chunk = to_create[i:i + 200]
+            payload = {"create_records": [{"fields": fields} for _lead, fields in chunk]}
+            try:
+                data = await self._run(
+                    ["base", "+record-batch-create", "--base-token", self.app_token,
+                     "--table-id", self.table_id],
+                    payload,
+                )
+                ids = [str(x) for x in ((data.get("data") or {}).get("record_id_list") or [])]
+                result["created"] += len(chunk)
+                for idx, (lead, _fields) in enumerate(chunk):
+                    key = lead.get("lead_key") or lead.get("display_id")
+                    if idx < len(ids):
+                        result["record_ids"][key] = ids[idx]
+            except Exception as e:
+                log.error(f"[多维表格] 批量新建失败: {e}")
+                result["failed"] += len(chunk)
+                result["error"] = str(e)
+
+        return result
+
+
 def get_bitable_writer(config=None) -> BitableWriter:
-    """按配置构造写入器"""
+    """按配置构造写入器
+
+    三种后端：
+    - ``http``：企业自建应用 app_id/app_secret（换 tenant_access_token）
+      或用户 access_token，直连开放平台
+    - ``lark_cli``：交给 lark-cli 写，认证与 token 续期都由 lark-cli 负责
+    - ``auto``（默认）：有 app 凭据走 http，否则有 lark-cli 就走 lark_cli
+    """
     if config is None:
         from ..config import get_config
         config = get_config()
     n = config.notify
+
+    backend = (n.bitable_backend or "auto").strip().lower()
+    if backend == "auto":
+        if n.bitable_app_id and n.bitable_app_secret:
+            backend = "http"
+        elif n.bitable_user_token:
+            backend = "http"
+        else:
+            backend = "lark_cli"
+
+    if backend == "lark_cli":
+        return LarkCliBitableWriter(
+            app_token=n.bitable_app_token,
+            table_id=n.bitable_table_id,
+            identity=n.bitable_lark_cli_identity,
+            cli_path=n.bitable_lark_cli_path,
+        )
+
     return BitableWriter(
         app_id=n.bitable_app_id,
         app_secret=n.bitable_app_secret,

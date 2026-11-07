@@ -174,6 +174,19 @@ class NotifyConfig(BaseModel):
     # 后台自跑程序推荐用 app_id/app_secret；user_token 适合临时排查，
     # 但会过期，过期后需要重新授权。
     bitable_user_token: str = ""
+    # 写入后端：auto / http / lark_cli
+    #   http     —— 直连开放平台（app 凭据或 user_token）
+    #   lark_cli —— 交给 lark-cli 写，认证与 token 续期由 lark-cli 负责
+    #   auto     —— 有 app 凭据走 http，否则走 lark_cli
+    bitable_backend: str = "auto"
+    # lark_cli 后端：用哪个身份调 lark-cli（user = 当前授权用户，bot = 绑定应用）
+    bitable_lark_cli_identity: str = "user"
+    # lark_cli 可执行文件路径（留空自动探测；launchd 的 PATH 很短，建议显式指定）
+    bitable_lark_cli_path: str = ""
+    # 哪些意向等级自动写入多维表格
+    bitable_levels: list[str] = ["high", "medium", "low"]
+    # 同一用户两次写表的最小间隔（分钟），避免频繁更新
+    bitable_cooldown_minutes: int = 5
 
 
 class OutreachConfig(BaseModel):
