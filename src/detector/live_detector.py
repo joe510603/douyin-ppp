@@ -58,6 +58,8 @@ class LiveDetector:
 
     def __init__(self):
         self._client: Optional[httpx.AsyncClient] = None
+        # 浏览器数据目录（在 __init__ 里解析一次，避免 nested function 作用域问题）
+        self._browser_data_dir = str(Path("data/browser_data"))
 
     def _get_effective_cookie(self) -> str:
         """获取有效的 Cookie，优先使用有 ttwid 的"""
@@ -373,21 +375,54 @@ class LiveDetector:
 
             def _fetch_sync():
                 nonlocal info
-                browser = None  # 确保变量已定义
+                browser = None
+                context = None
+                page = None
                 with sync_playwright() as p:
-                    # 使用持久化上下文（包含登录状态）
+                    # 【2026-10-13 fix】必须先注入 config 里的最新 cookie 覆盖 profile，
+                    # 否则用 data/browser_data 里失效的 ttwid 打开用户主页会被重定向到首页。
+                    # 策略：先尝试持久化上下文（保留浏览器其他状态），启动后立即 add_cookies
+                    # 用 config 里的新 cookie 覆盖；持久化失败才回退到独立 browser（手动注入）。
+                    effective_cookie = self._get_effective_cookie()
+                    inject_cookies = []
+                    if effective_cookie:
+                        from urllib.parse import unquote
+                        for part in effective_cookie.split(";"):
+                            part = part.strip()
+                            if "=" in part:
+                                k, v = part.split("=", 1)
+                                inject_cookies.append({
+                                    'name': k.strip(),
+                                    'value': unquote(v.strip()),
+                                    'domain': '.douyin.com',
+                                    'path': '/',
+                                })
+
                     try:
                         context = p.chromium.launch_persistent_context(
-                            user_data_dir=str(Path("data/browser_data")),
+                            user_data_dir=str(self._browser_data_dir),
                             headless=True,
                             viewport={"width": 1400, "height": 900},
                             user_agent=self.WEB_UA,
                             args=["--no-sandbox", "--disable-setuid-sandbox",
                                   "--disable-dev-shm-usage", "--disable-blink-features=AutomationControlled"],
                         )
+                        log.info(f"[浏览器] 持久化上下文启动成功，注入 {len(inject_cookies)} 条 cookie 覆盖 profile...")
+                        # 必须先访问 domain 一次才能 add_cookies
+                        first_page = context.pages[0] if context.pages else context.new_page()
+                        try:
+                            first_page.goto("https://www.douyin.com/", wait_until="domcontentloaded", timeout=15000)
+                        except Exception:
+                            pass  # 即使失败也继续
+                        if inject_cookies:
+                            try:
+                                context.add_cookies(inject_cookies)
+                                log.info(f"[浏览器] ✅ 已注入 {len(inject_cookies)} 条 cookie 覆盖 profile")
+                            except Exception as e:
+                                log.warning(f"设置 cookies 失败: {e}")
                         page = context.pages[0] if context.pages else context.new_page()
-                    except Exception:
-                        # 回退：使用独立 browser
+                    except Exception as e:
+                        log.warning(f"持久化上下文启动失败，回退独立 browser: {e}")
                         browser = p.chromium.launch(
                             headless=True,
                             args=["--no-sandbox", "--disable-setuid-sandbox",
@@ -397,28 +432,13 @@ class LiveDetector:
                             viewport={"width": 1400, "height": 900},
                             user_agent=self.WEB_UA,
                         )
-                        # 注入 Cookie
-                        cookie = self._get_effective_cookie()
-                        if cookie:
-                            from urllib.parse import unquote
-                            cookies = []
-                            for part in cookie.split(";"):
-                                part = part.strip()
-                                if "=" in part:
-                                    key, value = part.split("=", 1)
-                                    cookies.append({
-                                        'name': key.strip(),
-                                        'value': unquote(value.strip()),
-                                        'domain': '.douyin.com',
-                                        'path': '/',
-                                    })
-                            if cookies:
-                                try:
-                                    context.add_cookies(cookies)
-                                except Exception as e:
-                                    log.debug(f"设置 cookies 失败: {e}")
+                        if inject_cookies:
+                            try:
+                                context.add_cookies(inject_cookies)
+                                log.info(f"[浏览器] ✅ 已注入 {len(inject_cookies)} 条 cookie (独立 browser)")
+                            except Exception as e:
+                                log.warning(f"设置 cookies 失败: {e}")
                         page = context.new_page()
-                        browser = None
 
                     # 打开用户主页
                     profile_url = f"https://www.douyin.com/user/{sec_user_id}"
@@ -539,24 +559,12 @@ class LiveDetector:
                         except:
                             pass
 
-                    # 方式5: 检测直播入口元素（确定在播但可能拿不到 room_id）
-                    if not info.status:
-                        try:
-                            live_banner = page.locator('[class*="live"], [class*="直播"]').first
-                            if live_banner.is_visible(timeout=2000):
-                                info.status = True
-                                log.debug(f"[浏览器] 检测到直播入口元素")
-                        except:
-                            pass
-
-                    # 方式6: 查找"直播中"文字
-                    if not info.status:
-                        try:
-                            page.wait_for_selector("text=直播中", timeout=3000)
-                            info.status = True
-                            log.debug(f"[浏览器] 页面包含「直播中」文字")
-                        except:
-                            pass
+                    # 方式5+6（已删除 - 2026-10-13）：
+                    # 之前 detector 用 'page.wait_for_selector("text=直播中")' 当开播判定，
+                    # 但抖音用户主页里"直播中"3 个字到处都是（"主播正在直播"按钮、"相关直播"tab 等），
+                    # 导致 status=True 误报严重，明明没开播的账号也会被当工人进。
+                    # 现在只信 RENDER_DATA 里的 status=2（line 516-521 提取出来的）。
+                    # 如果 RENDER_DATA 都没拿到，status 保持 False，宁可漏报不误报。
 
                     # 设置 room_id（优先使用真实 room_id，其次 web_rid）
                     # web_rid 是 12 位短 ID，真实 room_id 是 18-19 位长 ID
@@ -1023,7 +1031,9 @@ class LiveDetector:
                     if info.status:
                         log.info(f"[浏览器] 最终结果: status=True, room_id={info.room_id}, web_rid={info.web_rid}, nickname={info.anchor_nickname}")
                     else:
-                        log.debug(f"[浏览器] 未检测到直播")
+                        # 【2026-10-13 提升为 INFO】之前 debug 级别看不到 "未开播" 状态，
+                        # 导致用户以为 detector 卡住。其实它是正常工作的"没开播"信号。
+                        log.info(f"[浏览器] 未检测到直播 (room_id='', web_rid='', nickname='')")
 
                     context.close()
                     if browser:
@@ -1054,29 +1064,35 @@ class LiveDetector:
         stagger_delay: float = 4.0,
     ) -> dict[str, LiveRoomInfo]:
         """
-        批量检测多个账号（支持错峰）。
+        批量检测多个账号（并发）。
+
+        【2026-10-13 改动】原来是顺序扫描（9 个账号 × 15s = 2 分钟多），期间直播间上下播
+        可能错过窗口。现在用 asyncio.gather 并发，所有账号一起检测，~15s 完成一轮。
 
         Args:
             accounts: 监控账号列表
-            stagger_delay: 每个账号检测之间的延迟（秒）
-                           14账号/60s间隔 → 约4.3s/账号，避免瞬时并发
+            stagger_delay: 已废弃（保留参数兼容）。原本用于错峰避免同时请求，
+                           现在浏览器实例天然隔离，并发不再有封禁风险。
 
         Returns:
             {sec_user_id: LiveRoomInfo}
         """
-        result_map = {}
-        for i, acc in enumerate(accounts):
+        if not accounts:
+            return {}
+
+        async def _detect_one(acc: MonitorAccount) -> tuple[str, LiveRoomInfo]:
             try:
-                # 【错峰修复】每个账号检测前等待 stagger_delay，避免14个账号同时请求
-                if i > 0 and stagger_delay > 0:
-                    await asyncio.sleep(stagger_delay)
-                result = await self.detect(acc)
-                result_map[acc.sec_user_id] = result
+                return (acc.sec_user_id, await self.detect(acc))
             except Exception as e:
                 log.error(f"批量检测异常 [{acc.name}]: {e}")
-                result_map[acc.sec_user_id] = LiveRoomInfo(status=False)
+                return (acc.sec_user_id, LiveRoomInfo(status=False))
 
-        return result_map
+        # 并发跑所有账号，每个账号独立 LiveDetector（避免共享 httpx 跨 event loop）
+        results = await asyncio.gather(
+            *[_detect_one(acc) for acc in accounts],
+            return_exceptions=False,
+        )
+        return dict(results)
 
 
 # 全局检测器实例

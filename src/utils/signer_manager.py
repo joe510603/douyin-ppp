@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import subprocess
 import time
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urlparse
 
 import httpx
 
@@ -15,22 +17,59 @@ from .logger import get_logger
 log = get_logger("signer_manager")
 
 
+def _resolve_signer_url(explicit: Optional[str] = None) -> tuple[str, int]:
+    """解析签名服务地址：(host, port)。
+
+    优先级：
+      1. 显式 host 入参
+      2. SIGNER_URL 环境变量（完整 URL，如 http://signer:3010）
+      3. DOUYIN_PPP_SIGNER_URL 环境变量（兼容旧名）
+      4. 默认 localhost:3010（单机本地启动的旧行为）
+    """
+    if explicit:
+        url = explicit
+    else:
+        url = (
+            os.environ.get("SIGNER_URL")
+            or os.environ.get("DOUYIN_PPP_SIGNER_URL")
+            or "http://localhost:3010"
+        )
+    parsed = urlparse(url if "://" in url else f"http://{url}")
+    host = parsed.hostname or "localhost"
+    port = parsed.port or 3010
+    return host, port
+
+
 class SignerManager:
     """签名服务生命周期管理"""
-    
-    def __init__(self, port: int = 3010, websdk_path: str = "websdk"):
-        self.port = port
+
+    def __init__(
+        self,
+        port: int = 3010,
+        websdk_path: str = "websdk",
+        host: Optional[str] = None,
+    ):
         self.websdk_path = Path(websdk_path)
+        # 解析签名服务地址（host + port），host 入参允许传完整 URL
+        resolved_host, resolved_port = _resolve_signer_url(host)
+        # 如果调用方显式传了 port 入参，优先用 port（兼容旧 API）
+        self.host = resolved_host
+        self.port = port if host is None else resolved_port
         self._process: Optional[subprocess.Popen] = None
         self._health_check_task: Optional[asyncio.Task] = None
         self._is_running = False
-    
+
+    @property
+    def base_url(self) -> str:
+        """签名服务的 base URL，http://<host>:<port>"""
+        return f"http://{self.host}:{self.port}"
+
     async def check_health(self) -> bool:
         """检查签名服务是否健康"""
         try:
             async with httpx.AsyncClient(timeout=2.0) as client:
                 response = await client.post(
-                    f"http://localhost:{self.port}/signature",
+                    f"{self.base_url}/signature",
                     content="health_check"
                 )
                 return response.status_code == 200

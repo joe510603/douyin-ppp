@@ -173,7 +173,10 @@ def create_data_page(on_export_complete=None):
                 {"name": "create_time", "label": "时间", "field": "create_time", "align": "center", "sortable": True},
                 {"name": "message_type", "label": "类型", "field": "message_type", "align": "center"},
                 {"name": "content", "label": "内容", "field": "content", "align": "left", "sortable": True},
-                {"name": "user_nickname", "label": "用户", "field": "user_nickname", "align": "left"},
+                {"name": "user_nickname", "label": "用户昵称", "field": "user_nickname", "align": "left"},
+                {"name": "user_id", "label": "ID", "field": "user_id", "align": "left"},
+                {"name": "user_short_id", "label": "抖音号", "field": "user_short_id", "align": "left"},
+                {"name": "user_display_id", "label": "displayId", "field": "user_display_id", "align": "left"},
                 {"name": "monitor_name", "label": "监控账号", "field": "monitor_name", "align": "left"},
             ]
             table.columns = live_columns

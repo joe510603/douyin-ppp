@@ -41,6 +41,10 @@ def _build_danmaku_html(item: dict) -> str:
     monitor_name = item.get("monitor_name", "")
     item_id = item.get("_id", "")
 
+    # 三个 ID：抖音号（用户设置）、displayId（平台分配、稳定）、当前 user_id（可能 = 抖音号 也可能 = displayId）
+    user_short_id = item.get("user_short_id", "") or ""
+    user_display_id = item.get("user_display_id", "") or ""
+
     if "Gift" in str(msg_type):
         item_class = "danmaku-item danmaku-item-gift"
         prefix = "🎁"
@@ -58,12 +62,35 @@ def _build_danmaku_html(item: dict) -> str:
     # HTML 转义
     safe_content = content[:100].replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
     safe_nickname = nickname[:16].replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    safe_short_id = user_short_id[:20].replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    safe_display_id = user_display_id[:20].replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+    # ID 标签：抖音号（用户设置、可能改了 / 搜不到）
+    # 显示规则：有就显示，缺了标 "—"
+    short_id_tag = (
+        f'<span style="color:#A78BFA;font-size:10px;font-family:ui-monospace,SFMono-Regular,monospace;'
+        f'background:rgba(167,139,250,0.12);padding:1px 5px;border-radius:4px;margin-right:4px;'
+        f'title="抖音号（用户设置，可能已改/隐私）">{safe_short_id}</span>'
+        if safe_short_id else
+        f'<span style="color:#6B7280;font-size:10px;margin-right:4px;">—</span>'
+    )
+
+    # displayId（平台分配、稳定，用于反查）；只在跟抖音号不一样时显示，避免冗余
+    display_id_tag = ""
+    if safe_display_id and safe_display_id != safe_short_id:
+        display_id_tag = (
+            f'<span style="color:#34D399;font-size:10px;font-family:ui-monospace,SFMono-Regular,monospace;'
+            f'background:rgba(52,211,153,0.10);padding:1px 5px;border-radius:4px;margin-right:6px;'
+            f'title="displayId（平台分配、稳定不变）">{safe_display_id}</span>'
+        )
 
     return (
         f'<div class="w-full {item_class}" data-id="{item_id}" style="display:flex;align-items:center;">'
-        f'<span style="color:#6B7280;font-size:12px;min-width:55px;margin-right:8px;">{time_str}</span>'
-        f'<span style="margin-right:2px;">{prefix}</span>'
-        f'<span style="color:#818CF8;font-size:13px;font-weight:500;min-width:80px;max-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-right:8px;">{safe_nickname}</span>'
+        f'<span style="color:#6B7280;font-size:12px;margin-right:8px;font-variant-numeric:tabular-nums;">{time_str}</span>'
+        f'<span style="margin-right:4px;">{prefix}</span>'
+        f'<span style="color:#818CF8;font-size:13px;font-weight:500;min-width:80px;max-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-right:6px;">{safe_nickname}</span>'
+        f'{short_id_tag}'
+        f'{display_id_tag}'
         f'<span style="color:#E5E7EB;font-size:13px;flex:1;word-break:break-word;">{safe_content}</span>'
         f'{monitor_tag}'
         f'</div>'

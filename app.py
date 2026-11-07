@@ -116,9 +116,16 @@ async def initialize():
     
     # 启动时检查并启动签名服务
     log.info("🔧 检查签名服务状态...")
-    signer_ok = await ensure_signer_running()
-    if not signer_ok:
-        log.warning("⚠️ 签名服务启动失败，将使用 Playwright 回退方案（性能较低）")
+    # 在 Docker / 多容器场景下，签名服务是独立容器，已经通过 SIGNER_URL 注入，
+    # 不要在本容器内尝试启动本地子进程（会失败且会留垃圾进程）。
+    import os
+    if os.environ.get("DOUYIN_PPP_SKIP_SIGNER_AUTOSTART") == "1":
+        log.info("🐳 已设置 DOUYIN_PPP_SKIP_SIGNER_AUTOSTART=1，跳过本地启动签名服务（假设外部已就绪）")
+        signer_ok = True
+    else:
+        signer_ok = await ensure_signer_running()
+        if not signer_ok:
+            log.warning("⚠️ 签名服务启动失败，将使用 Playwright 回退方案（性能较低）")
 
     # 启动时检查 Cookie 状态
     cookie = config.douyin.cookie

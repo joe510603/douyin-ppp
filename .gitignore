@@ -53,7 +53,8 @@ exports/
 
 # Node.js (签名服务)
 websdk/node_modules/
-websdk/package-lock.json
+# package-lock.json 故意提交：锁定 jsdom 版本，保证别人 clone 后 npm install 装出一样环境
+# （不锁版本会导致装到半残的 jsdom，node server.js 报 MODULE_NOT_FOUND）
 
 # Browser profiles
 browser_data/

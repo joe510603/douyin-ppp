@@ -2,22 +2,35 @@
 
 from __future__ import annotations
 
-import httpx
+import os
 from typing import Optional
+
+import httpx
+
 from ..utils.logger import get_logger
 
 log = get_logger("signer_client")
 
 
+def _default_server_url() -> str:
+    """默认签名服务 URL：env 优先，否则 localhost:3010"""
+    return (
+        os.environ.get("SIGNER_URL")
+        or os.environ.get("DOUYIN_PPP_SIGNER_URL")
+        or "http://localhost:3010"
+    )
+
+
 class SignerClient:
     """Node.js 签名服务客户端"""
-    
-    def __init__(self, server_url: str = "http://localhost:3010"):
+
+    def __init__(self, server_url: Optional[str] = None):
         """
         Args:
-            server_url: 签名服务地址
+            server_url: 签名服务地址，None 时从 SIGNER_URL/DOUYIN_PPP_SIGNER_URL env 推断，
+                       最后回落到 http://localhost:3010。
         """
-        self.server_url = server_url
+        self.server_url = server_url or _default_server_url()
         self._client = httpx.AsyncClient(timeout=10.0)
     
     async def get_signature(self, x_ms_stub: str) -> Optional[str]:

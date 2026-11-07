@@ -1,0 +1,98 @@
+# ============================================================================
+# Douyin PPP — Docker Compose 编排
+#
+# 用法：
+#   cd /path/to/douyin-ppp
+#   docker compose build            # 构建两个镜像
+#   docker compose up -d            # 后台启动
+#   docker compose logs -f app       # 跟踪主程序日志
+#   docker compose down              # 停止并移除容器（保留数据卷）
+#
+# 访问 Web UI：http://localhost:9527
+# ============================================================================
+
+name: douyin-ppp
+
+services:
+  # ----- 签名服务 -----
+  signing:
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile.signer
+    image: douyin-ppp/signer:local
+    container_name: douyin-ppp-signer
+    restart: unless-stopped
+    ports:
+      - "3010:3010"          # 暴露宿主机端口用于调试（可选）
+    networks:
+      - douyin-net
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "--post-data=hc", "--timeout=3", "http://127.0.0.1:3010/signature"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ----- Python 主程序 -----
+  app:
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile.app
+      args:
+        # 默认清华源；海外构建改 https://pypi.org/simple
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}
+    image: douyin-ppp/app:local
+    container_name: douyin-ppp-app
+    restart: unless-stopped
+    depends_on:
+      signing:
+        condition: service_healthy   # 等签名服务健康后再启动 app
+    ports:
+      - "9527:9527"                  # Web UI 端口
+    environment:
+      # ----- 应用基础 -----
+      DOUYIN_PPP_APP_HOST: "0.0.0.0"
+      DOUYIN_PPP_APP_PORT: "9527"
+      DOUYIN_PPP_APP_DEBUG: "false"
+      # ----- 跨容器签名服务地址 -----
+      # signer 是 docker-compose service name，docker 网络 DNS 自动解析
+      SIGNER_URL: "http://signer:3010"
+      # 跳过容器内自动启动本地签名服务（它由独立容器提供）
+      DOUYIN_PPP_SKIP_SIGNER_AUTOSTART: "1"
+      # ----- Python 编码 -----
+      PYTHONIOENCODING: "utf-8"
+      LANG: "C.UTF-8"
+      # ----- 镜像源（按需覆盖）-----
+      PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.tuna.tsinghua.edu.cn/simple}
+      # ----- 时区 -----
+      TZ: ${TZ:-Asia/Shanghai}
+    volumes:
+      # 持久化数据（SQLite + 浏览器 profile + 导出 + 日志）
+      - ./data:/app/data
+      # 可选：挂载自定义配置覆盖镜像内默认
+      # - ./my-config.yaml:/app/config.yaml:ro
+      # 可选：挂载浏览器缓存，避免每次容器重建都要重新登录
+      # （默认已经通过 ./data 覆盖 data/browser_data 与 data/xhs_browser_data）
+    networks:
+      - douyin-net
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:9527/"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+networks:
+  douyin-net:
+    driver: bridge
+    name: douyin-ppp-net

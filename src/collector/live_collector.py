@@ -1583,40 +1583,44 @@ class LiveCollector:
         except Exception as e:
             log.error(f"发送 ACK 失败: {e}")
     
-    def _extract_user_id(self, user) -> tuple[str, str]:
+    def _extract_user_id(self, user) -> tuple[str, str, str]:
         """
         从 User proto 中提取用户 ID。
 
         Returns:
-            tuple[short_id, display_id]:
-            - short_id: 抖音号（用户设置的，仅当有效时才返回）
-            - display_id: displayId 或其他备用 ID
+            tuple[short_id, display_id, internal_id]:
+            - short_id: 抖音号（用户设置的，可被用户修改，可被搜索）
+            - display_id: 抖音 displayId（proto field 38，平台分配的字符串 ID，永远不变）
+                          用于后端 API 反查 user_profile；用户一般搜不到这个
+            - internal_id: 抖音内部数字 ID（user.id / idStr），不可搜索
         """
         if not user:
-            return "", ""
+            return "", "", ""
 
         short_id = ""
         display_id = ""
+        internal_id = ""
 
         try:
             # 1. 优先提取 shortId（抖音号）
             if hasattr(user, 'shortId') and user.shortId:
                 short_id = str(user.shortId)
 
-            # 2. 提取 displayId 作为备用
+            # 2. 提取 displayId（field 38 字符串，平台分配的稳定 ID）
             if hasattr(user, 'displayId') and user.displayId:
                 display_id = str(user.displayId)
-            # 3. 备用：尝试 idStr
-            elif hasattr(user, 'idStr') and user.idStr:
-                display_id = str(user.idStr)
-            # 4. 备用：尝试 id（内部数值）
-            elif hasattr(user, 'id') and user.id:
-                display_id = str(user.id)
+
+            # 3. 提取内部数字 ID（idStr / id），仅在 displayId 缺失时回退
+            if not display_id:
+                if hasattr(user, 'idStr') and user.idStr:
+                    internal_id = str(user.idStr)
+                elif hasattr(user, 'id') and user.id:
+                    internal_id = str(user.id)
 
         except Exception:
             pass
 
-        return short_id, display_id
+        return short_id, display_id, internal_id
 
     async def _process_message(self, method: str, payload: bytes, room_id: str):
         """根据方法名处理消息"""
@@ -1631,15 +1635,16 @@ class LiveCollector:
                 chat_msg.ParseFromString(payload)
 
                 user_name = getattr(chat_msg.user, 'nickName', '未知用户') if chat_msg.HasField('user') else "未知用户"
-                short_id, display_id = self._extract_user_id(chat_msg.user) if chat_msg.HasField('user') else ("", "")
+                short_id, display_id, internal_id = self._extract_user_id(chat_msg.user) if chat_msg.HasField('user') else ("", "", "")
                 content = chat_msg.content
 
                 comment = LiveComment(
                     content=content,
                     message_type=MessageType.CHAT,
                     room_id=room_id,
-                    user_id=short_id or display_id,  # 优先用抖音号，没有则用 displayId
-                    user_short_id=short_id,  # 真正的抖音号
+                    user_id=short_id or display_id or internal_id,  # 优先用抖音号，其次 displayId，最后内部 ID
+                    user_short_id=short_id,         # 抖音号（可搜、可变）
+                    user_display_id=display_id,        # 平台分配的 displayId（不变，用于反查）
                     user_nickname=user_name,
                     user_avatar=getattr(chat_msg.user, 'avatarUrl', '') if chat_msg.HasField('user') else '',
                     monitor_name=self.monitor_name,
@@ -1648,7 +1653,7 @@ class LiveCollector:
                     raw_data=chat_msg.SerializeToString().hex()[:200],
                 )
                 self._stats["chat_count"] += 1
-                log.info(f"💬 [{short_id or display_id}/{user_name}]: {content}")
+                log.info(f"💬 [{short_id or display_id or internal_id}/{user_name}]: {content}")
 
             elif method == 'WebcastGiftMessage':
                 # 礼物消息
@@ -1656,15 +1661,16 @@ class LiveCollector:
                 gift_msg.ParseFromString(payload)
 
                 user_name = getattr(gift_msg.user, 'nickName', '未知用户') if gift_msg.HasField('user') else "未知用户"
-                short_id, display_id = self._extract_user_id(gift_msg.user) if gift_msg.HasField('user') else ("", "")
+                short_id, display_id, internal_id = self._extract_user_id(gift_msg.user) if gift_msg.HasField('user') else ("", "", "")
                 gift_name = "礼物"
 
                 comment = LiveComment(
                     content=f"[礼物] {user_name} 送出 {gift_name}",
                     message_type=MessageType.GIFT,
                     room_id=room_id,
-                    user_id=short_id or display_id,
+                    user_id=short_id or display_id or internal_id,
                     user_short_id=short_id,
+                    user_display_id=display_id,
                     user_nickname=user_name,
                     user_avatar=getattr(gift_msg.user, 'avatarUrl', '') if gift_msg.HasField('user') else '',
                     monitor_name=self.monitor_name,
@@ -1674,7 +1680,7 @@ class LiveCollector:
                     raw_data=None,
                 )
                 self._stats["gift_count"] += 1
-                log.info(f"🎁 [{short_id or display_id}/{user_name}] 送出礼物")
+                log.info(f"🎁 [{short_id or display_id or internal_id}/{user_name}] 送出礼物")
 
             elif method == 'WebcastMemberMessage':
                 # 进场消息
@@ -1682,14 +1688,15 @@ class LiveCollector:
                 member_msg.ParseFromString(payload)
 
                 user_name = getattr(member_msg.user, 'nickName', '未知用户') if member_msg.HasField('user') else "未知用户"
-                short_id, display_id = self._extract_user_id(member_msg.user) if member_msg.HasField('user') else ("", "")
+                short_id, display_id, internal_id = self._extract_user_id(member_msg.user) if member_msg.HasField('user') else ("", "", "")
 
                 comment = LiveComment(
                     content=f"[进场] {user_name}",
                     message_type=MessageType.MEMBER,
                     room_id=room_id,
-                    user_id=short_id or display_id,
+                    user_id=short_id or display_id or internal_id,
                     user_short_id=short_id,
+                    user_display_id=display_id,
                     user_nickname=user_name,
                     user_avatar=getattr(member_msg.user, 'avatarUrl', '') if member_msg.HasField('user') else '',
                     monitor_name=self.monitor_name,
@@ -1698,7 +1705,7 @@ class LiveCollector:
                     raw_data=None,
                 )
                 self._stats["member_count"] += 1
-                log.debug(f"🚪 [{short_id or display_id}/{user_name}] 进入直播间")
+                log.debug(f"🚪 [{short_id or display_id or internal_id}/{user_name}] 进入直播间")
 
             elif method == 'WebcastLikeMessage':
                 # 点赞消息
@@ -1706,14 +1713,15 @@ class LiveCollector:
                 like_msg.ParseFromString(payload)
 
                 user_name = getattr(like_msg.user, 'nickName', '未知用户') if like_msg.HasField('user') else "未知用户"
-                short_id, display_id = self._extract_user_id(like_msg.user) if like_msg.HasField('user') else ("", "")
+                short_id, display_id, internal_id = self._extract_user_id(like_msg.user) if like_msg.HasField('user') else ("", "", "")
 
                 comment = LiveComment(
                     content=f"[点赞] {user_name}",
                     message_type=MessageType.LIKE,
                     room_id=room_id,
-                    user_id=short_id or display_id,
+                    user_id=short_id or display_id or internal_id,
                     user_short_id=short_id,
+                    user_display_id=display_id,
                     user_nickname=user_name,
                     user_avatar=getattr(like_msg.user, 'avatarUrl', '') if like_msg.HasField('user') else '',
                     monitor_name=self.monitor_name,
@@ -1721,7 +1729,7 @@ class LiveCollector:
                     anchor_id=self.anchor_id,
                     raw_data=None,
                 )
-                log.debug(f"👍 [{short_id or display_id}/{user_name}] 点赞")
+                log.debug(f"👍 [{short_id or display_id or internal_id}/{user_name}] 点赞")
                 
             elif method == 'WebcastRoomStatsMessage':
                 # 在线人数更新（RoomStatsMessage）

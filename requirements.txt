@@ -5,6 +5,7 @@ nicegui>=2.7.0
 httpx>=0.27.0
 websockets>=12.0
 aiohttp>=3.9.0
+websocket-client>=1.7.0  # live_collector 用 websocket.WebSocketApp（同步 WS 客户端）
 
 # Protobuf
 protobuf>=5.27.0
@@ -13,7 +14,7 @@ protobuf>=5.27.0
 # pyexecjs>=1.5.1  # 已移除,改用 xhshow 纯算法
 
 # 小红书签名（纯Python算法，无需外部服务）
-xhshow>=1.0.0
+xhshow>=0.2.0,<2.0  # 修正：原写 >=1.0.0 是错的，PyPI 实际只到 0.2.0
 
 # Data Processing
 pandas>=2.2.0

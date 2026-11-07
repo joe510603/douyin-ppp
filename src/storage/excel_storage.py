@@ -37,6 +37,8 @@ EXCEL_COLUMNS = [
     ("消息类型", "message_type"),
     ("内容", "content"),
     ("用户ID", "user_id"),
+    ("抖音号", "user_short_id"),
+    ("displayId", "user_display_id"),
     ("用户昵称", "user_nickname"),
     ("直播间ID", "room_id"),
     ("监控账号", "monitor_name"),

@@ -1,19 +1,49 @@
+# ============================================================================
+# Douyin PPP — Docker build context exclusions
+# ============================================================================
+
+# VCS
 .git
+.gitignore
 .github
-.mypy_cache
-.pytest_cache
+
+# Python bytecode / caches
 __pycache__
 *.pyc
 .pyo
-.env
+.mypy_cache
+.pytest_cache
+.ruff_cache
+
+# Virtual envs
 .venv
 venv
-.gitignore
-README.md
+
+# Local secrets / runtime overrides
+.env
+.env.*
+!.env.example
+
+# Local data (运行时挂载，不用打进镜像)
+data/
+logs/
+
+# Node (在 docker 镜像里重新 npm install)
+websdk/node_modules/
+websdk/npm-debug.log
+
+# Tests (运行时不需要)
 tests/
-data/db/*.db
-data/exports/*.xlsx
-data/logs/*.log
+
+# Docs (用户可以从 GitHub 读)
+docs/
+CHANGELOG.md
+README_UPGRADE.md
+
+# IDE / OS
 .idea/
-.vscode
+.vscode/
 .DS_Store
+
+# 日志文件
+*.log

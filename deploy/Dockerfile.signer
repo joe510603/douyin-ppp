@@ -1,0 +1,44 @@
+# ============================================================================
+# Douyin PPP — 签名服务镜像（Node.js + jsdom + webmssdk）
+# 极简 Alpine 镜像，~80MB
+# 注意：未使用 # syntax= directive，避免去 docker.io 拉 frontend 镜像（国内网络不稳）
+# ============================================================================
+
+FROM node:20-alpine AS runtime
+
+# Alpine 自带的 /sbin/tini 是 busybox 的 stub，不是真正的 tini；
+# 装 tini 包才能正确转发信号（PID 1 信号处理）
+RUN apk add --no-cache tini
+
+ENV NODE_ENV=production \
+    NPM_CONFIG_UPDATE_NOTIFIER=false \
+    TINI_SUBREAPER=true
+
+WORKDIR /app
+
+# 仅先 copy package*.json，利用 layer cache
+COPY websdk/package.json websdk/package-lock.json* ./
+
+# 装 jsdom 等依赖（用 npm ci 加速并锁定版本；lock 缺失时 fallback 到 npm install）
+ARG NPM_REGISTRY=https://registry.npmmirror.com
+RUN npm config set registry ${NPM_REGISTRY} \
+    && (npm ci --omit=dev --no-audit --no-fund || npm install --omit=dev --no-audit --no-fund) \
+    && npm cache clean --force
+
+# 拷贝 webmssdk.js 和 server.js
+COPY websdk/server.js ./
+COPY websdk/webmssdk.js ./
+
+# 日志目录
+RUN mkdir -p /app/logs
+
+# 签名服务端口
+EXPOSE 3010
+
+# 健康检查：POST /signature 期望 200
+HEALTHCHECK --interval=15s --timeout=5s --start-period=10s --retries=3 \
+    CMD wget -qO- --post-data=hc --timeout=3 http://127.0.0.1:3010/signature >/dev/null || exit 1
+
+# 前台运行（容器 foreground 进程约定），tini 转发信号
+ENTRYPOINT ["/sbin/tini", "--"]
+CMD ["node", "server.js"]
