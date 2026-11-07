@@ -485,8 +485,8 @@ async def pull_bitable_status(db=None, config=None) -> dict:
 
     # 取本地有 record_id 的线索（只有这些才对得上飞书的记录）
     cursor = await db._db.execute(
-        "SELECT id, display_id, status, outreach_status, bitable_synced_status "
-        "FROM leads WHERE display_id != ''"
+        "SELECT id, display_id, status, outreach_status, bitable_synced_status, "
+        "bitable_record_id FROM leads WHERE display_id != ''"
     )
     rows = await cursor.fetchall()
 
@@ -502,11 +502,19 @@ async def pull_bitable_status(db=None, config=None) -> dict:
 
         remote_st = remote.get("处理状态") or ""
         remote_os = remote.get("触达状态") or ""
-        if not remote_st and not remote_os:
-            continue
 
         local_st = STATUS_LABELS.get(r.get("status") or "", "待处理")
         local_os = OUTREACH_LABELS.get(r.get("outreach_status") or "", "待触达")
+
+        # 飞书端状态为空 → 说明这条记录建的时候状态字段被跳过了
+        # （历史记录，或首次同步时守卫判定「本地没变过」而没写）。
+        # 把本地的值补写回飞书，否则飞书表里这一格永远是空白，
+        # 销售看着会以为这条线索还没被处理。
+        # 只补空字段，不覆盖飞书端已有的值——销售改过的状态依然是权威的。
+        if not remote_st or not remote_os:
+            if await _write_back_status(writer, r, local_st, local_os, remote_st, remote_os):
+                updated += 1
+            continue
 
         # 本地状态和上次同步进飞书的值一致 → 说明本地这次没动过，
         # 可以安全采纳飞书的值（销售改的）
@@ -548,6 +556,32 @@ async def pull_bitable_status(db=None, config=None) -> dict:
     if updated:
         log.info(f"[多维表格] 回拉状态：{updated} 条已更新，{skipped} 条跳过")
     return result
+
+
+async def _write_back_status(
+    writer, row: dict, local_st: str, local_os: str, remote_st: str, remote_os: str
+) -> bool:
+    """把本地的状态补写回飞书（飞书端该字段为空时）
+
+    只补空字段，不覆盖飞书端已有的值——
+    销售改过的状态依然是权威的。
+    """
+    rid = row.get("bitable_record_id") or ""
+    if not rid:
+        return False
+    patch: dict = {}
+    if not remote_st:
+        patch["处理状态"] = local_st
+    if not remote_os:
+        patch["触达状态"] = local_os
+    if not patch:
+        return False
+    try:
+        await writer.patch_fields(rid, patch)
+        return True
+    except Exception as e:
+        log.warning(f"[多维表格] 补写状态失败 {rid}: {e}")
+        return False
 
 
 _service: Optional[LeadService] = None

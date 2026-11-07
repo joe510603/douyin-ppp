@@ -439,6 +439,30 @@ class BitableWriter:
             return False, f"code={data.get('code')} msg={data.get('msg')}"
         return True, ""
 
+    async def patch_fields(self, record_id: str, fields: dict) -> tuple[bool, str]:
+        """只更新指定字段（部分更新），不动其他列
+
+        用于「补写飞书端为空的字段」这类场景——
+        不能用 update_record（PUT 是整体替换，会把没传的列清空）。
+        """
+        if not self.is_configured or not record_id or not fields:
+            return False, "参数缺失"
+
+        url = (f"{_API_BASE}/bitable/v1/apps/{self.app_token}"
+               f"/tables/{self.table_id}/records/{record_id}")
+        body = {"fields": fields}
+
+        try:
+            async with httpx.AsyncClient(timeout=self.timeout) as client:
+                resp = await client.patch(url, headers=await self._headers(), json=body)
+                data = resp.json()
+        except Exception as e:
+            return False, str(e)
+
+        if data.get("code") != 0:
+            return False, f"code={data.get('code')} msg={data.get('msg')}"
+        return True, ""
+
     async def search_by_douyin_id(self, douyin_id: str) -> Optional[str]:
         """
         按抖音号查已有记录的 record_id（用于去重）。
@@ -814,6 +838,23 @@ class LarkCliBitableWriter:
                 ["base", "+record-upsert", "--base-token", self.app_token,
                  "--table-id", self.table_id, "--record-id", record_id],
                 payload,
+            )
+            return True, ""
+        except Exception as e:
+            return False, str(e)
+
+    async def patch_fields(self, record_id: str, fields: dict) -> tuple[bool, str]:
+        """只更新指定字段（部分更新），不动其他列
+
+        用于「补写飞书端为空的字段」这类场景。
+        """
+        if not record_id or not fields:
+            return False, "参数缺失"
+        try:
+            await self._run(
+                ["base", "+record-upsert", "--base-token", self.app_token,
+                 "--table-id", self.table_id, "--record-id", record_id],
+                fields,
             )
             return True, ""
         except Exception as e:

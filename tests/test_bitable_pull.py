@@ -54,7 +54,7 @@ class _FakeConfig:
 @pytest.fixture
 def fake_writer(monkeypatch):
     """伪造的写入器，返回预设的状态映射"""
-    state = {"map": {}, "err": None}
+    state = {"map": {}, "err": None, "patched": []}
 
     class _Writer:
         is_configured = True
@@ -64,17 +64,23 @@ def fake_writer(monkeypatch):
                 raise RuntimeError(state["err"])
             return state["map"]
 
+        async def patch_fields(self, record_id, fields):
+            state["patched"].append((record_id, fields))
+            return True, ""
+
     monkeypatch.setattr("src.notify.bitable.get_bitable_writer", lambda config=None: _Writer())
     return state
 
 
-def _row(lead_id, display_id, status="new", outreach_status="pending", synced=""):
+def _row(lead_id, display_id, status="new", outreach_status="pending", synced="",
+         record_id="rec1"):
     return {
         "id": lead_id,
         "display_id": display_id,
         "status": status,
         "outreach_status": outreach_status,
         "bitable_synced_status": synced,
+        "bitable_record_id": record_id,
     }
 
 
@@ -164,3 +170,37 @@ def test_pull_reports_error(fake_writer):
 
     assert result["error"]
     assert result["updated"] == 0
+
+
+def test_pull_backfills_empty_feishu_status(fake_writer):
+    """飞书端状态是空 → 把本地的值补写回去
+
+    建记录时守卫跳过了状态字段，飞书表里那一格就是空白，
+    销售看着会以为这条还没处理。
+    """
+    fake_writer["map"] = {"abc123": {"处理状态": "", "触达状态": ""}}
+    db = _FakeDB([_row(1, "abc123", synced="待处理|待触达")])
+
+    result = asyncio.run(pull_bitable_status(db=db, config=_FakeConfig()))
+
+    assert result["updated"] == 1
+    assert len(fake_writer["patched"]) == 1
+    rid, patch = fake_writer["patched"][0]
+    assert rid == "rec1"
+    assert patch["处理状态"] == "待处理"
+    assert patch["触达状态"] == "待触达"
+
+
+def test_pull_backfills_only_empty_field(fake_writer):
+    """飞书端只有处理状态为空 → 只补那一个字段
+
+    触达状态销售已经改了，不能覆盖。
+    """
+    fake_writer["map"] = {"abc123": {"处理状态": "", "触达状态": "已留言"}}
+    db = _FakeDB([_row(1, "abc123", synced="待处理|待触达")])
+
+    asyncio.run(pull_bitable_status(db=db, config=_FakeConfig()))
+
+    _rid, patch = fake_writer["patched"][0]
+    assert "处理状态" in patch
+    assert "触达状态" not in patch
