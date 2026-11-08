@@ -78,17 +78,16 @@ def create_dashboard(monitor_accounts_ref, global_stats_ref):
     with ui.element("div").classes("app-card w-full q-mt-lg q-pa-md page-enter-delay-2"):
         ui.label("监控状态").classes("section-title q-mb-md")
 
-        @ui.refreshable
-        def table_ui():
-            columns = [
-                {"name": "name", "label": "账号名称", "field": "name", "align": "left", "sortable": True},
-                {"name": "sec_user_id", "label": "用户ID", "field": "sec_user_id", "align": "left"},
-                {"name": "status", "label": "状态", "field": "status", "align": "center", "sortable": True},
-                {"name": "viewer_count", "label": "在线人数", "field": "viewer_count", "align": "center", "sortable": True},
-                {"name": "room_id", "label": "房间号", "field": "room_id", "align": "center"},
-                {"name": "error_message", "label": "备注", "field": "error_message", "align": "left"},
-            ]
+        columns = [
+            {"name": "name", "label": "账号名称", "field": "name", "align": "left", "sortable": True},
+            {"name": "sec_user_id", "label": "用户ID", "field": "sec_user_id", "align": "left"},
+            {"name": "status", "label": "状态", "field": "status", "align": "center", "sortable": True},
+            {"name": "viewer_count", "label": "在线人数", "field": "viewer_count", "align": "center", "sortable": True},
+            {"name": "room_id", "label": "房间号", "field": "room_id", "align": "center"},
+            {"name": "error_message", "label": "备注", "field": "error_message", "align": "left"},
+        ]
 
+        def _build_rows() -> list[dict]:
             rows = []
             for sec_id, info in monitor_accounts_ref.items():
                 status_val = info.get("status", "idle")
@@ -105,32 +104,47 @@ def create_dashboard(monitor_accounts_ref, global_stats_ref):
                     "web_rid": web_rid if web_rid else room_id,  # 优先用 web_rid
                     "error_message": info.get("error_message", "") or "",
                 })
+            return rows
 
-            table = ui.table(columns=columns, rows=rows, row_key="sec_user_id", pagination=10).classes("w-full app-table")
+        # 表格只创建一次，之后只换数据。
+        #
+        # 之前这里用的是 @ui.refreshable + 每 3 秒 refresh()：
+        # refresh 会销毁并重建整个表格 DOM，导致——
+        #   - 翻页/改每页条数时，表格被重建，用户刚点的页码被重置回第 1 页
+        #   - 视觉上整张表闪一下（用户报的现象）
+        # 改成 rows = ... + update() 原地更新，表格实例和分页状态都保留。
+        table = ui.table(
+            columns=columns,
+            rows=_build_rows(),
+            row_key="sec_user_id",
+            pagination=10,
+        ).classes("w-full app-table")
 
-            # room_id 列渲染为可点击的直播间链接（使用 web_rid）
-            table.add_slot('body-cell-room_id', '''
-                <q-td :props="props" class="text-center">
-                    <a
-                        :href="'https://live.douyin.com/' + (props.row.web_rid || props.value)"
-                        target="_blank"
-                        class="text-primary hover:underline"
-                        v-if="props.value && props.value !== '-'"
-                    >
-                        {{ props.value }}
-                    </a>
-                    <span v-else>{{ props.value }}</span>
-                </q-td>
-            ''')
-
-        table_ui()
+        # room_id 列渲染为可点击的直播间链接（使用 web_rid）
+        table.add_slot('body-cell-room_id', '''
+            <q-td :props="props" class="text-center">
+                <a
+                    :href="'https://live.douyin.com/' + (props.row.web_rid || props.value)"
+                    target="_blank"
+                    class="text-primary hover:underline"
+                    v-if="props.value && props.value !== '-'"
+                >
+                    {{ props.value }}
+                </a>
+                <span v-else>{{ props.value }}</span>
+            </q-td>
+        ''')
 
         def safe_table_refresh():
-            """安全刷新表格，防止 slot 已删除时崩溃"""
+            """只换表格数据，不重建 DOM
+
+            这样翻页、改每页条数、滚动位置都能保留，也不会闪。
+            """
             try:
-                table_ui.refresh()
+                table.rows = _build_rows()
+                table.update()
             except Exception:
-                pass
+                pass  # 静默忽略，避免 timer 中断事件循环
 
         ui.timer(3.0, safe_table_refresh)
 
