@@ -176,3 +176,62 @@ def test_lead_to_fields_includes_store():
 def test_lead_to_fields_omits_store_when_no_monitor_name():
     f = _lead_to_fields(_lead(monitor_name=""), "2026-11-07 10:00:00")
     assert "门店" not in f
+
+
+# ============================================================
+# 新建 vs 更新：守卫只该管更新
+# ============================================================
+
+def test_build_fields_new_record_writes_status():
+    """新建记录时必须写状态字段
+
+    飞书端那两格要是空的，销售看着会以为这条线索还没处理。
+    """
+    from src.notify.bitable import BitableWriter
+
+    w = BitableWriter(app_id="a", app_secret="b", app_token="c", table_id="d")
+    # 本地状态和上次同步一致 → 守卫会判定「没变过」
+    lead = _lead(status="new", outreach_status="pending",
+                 bitable_synced_status="待处理|待触达")
+    f = w._build_fields(lead, is_new=True)
+    assert f["处理状态"] == "待处理"
+    assert f["触达状态"] == "待触达"
+
+
+def test_build_fields_update_skips_unchanged_status():
+    """更新已有记录时，本地没变过就不写状态字段"""
+    from src.notify.bitable import BitableWriter
+
+    w = BitableWriter(app_id="a", app_secret="b", app_token="c", table_id="d")
+    lead = _lead(status="new", outreach_status="pending",
+                 bitable_synced_status="待处理|待触达")
+    f = w._build_fields(lead)
+    assert "处理状态" not in f
+    assert "触达状态" not in f
+
+
+def test_build_fields_update_writes_changed_status():
+    """更新时本地真的改了状态 → 要写"""
+    from src.notify.bitable import BitableWriter
+
+    w = BitableWriter(app_id="a", app_secret="b", app_token="c", table_id="d")
+    lead = _lead(status="contacted", outreach_status="pending",
+                 bitable_synced_status="待处理|待触达")
+    f = w._build_fields(lead)
+    assert f["处理状态"] == "已跟进"
+
+
+def test_lark_cli_build_fields_new_record_writes_status():
+    """lark_cli 后端同理"""
+    from src.notify.bitable import LarkCliBitableWriter
+
+    w = LarkCliBitableWriter(app_token="c", table_id="d")
+    lead = _lead(status="new", outreach_status="pending",
+                 bitable_synced_status="待处理|待触达",
+                 _found_at="2026-11-07 10:00:00")
+    f = w._build_fields(lead, is_new=True)
+    assert f["处理状态"] == "待处理"
+    assert f["触达状态"] == "待触达"
+
+    f2 = w._build_fields(lead)
+    assert "处理状态" not in f2

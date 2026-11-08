@@ -374,15 +374,22 @@ class BitableWriter:
     # 记录
     # ============================================================
 
-    def _build_fields(self, lead: dict) -> dict:
+    def _build_fields(self, lead: dict, is_new: bool = False) -> dict:
         """把一条线索映射成多维表格的 fields 字典
 
         状态字段只在本地确实变了的时候才写，避免覆盖销售在飞书表里改的值。
+
+        Args:
+            lead: 线索字典
+            is_new: True 表示这是**新建**记录。
+                新建时必须写状态字段——飞书端那两格不能是空的，
+                销售看着会以为线索还没处理。
+                守卫只适用于「更新已有记录」。
         """
         return _lead_to_fields(
             lead,
             lead.get("_found_ts") or 0,
-            skip_status=not status_changed(lead),
+            skip_status=(not is_new) and (not status_changed(lead)),
         )
 
     async def create_records(self, leads: list[dict]) -> tuple[list[str], str]:
@@ -397,7 +404,7 @@ class BitableWriter:
         if not leads:
             return [], "没有待写入的线索"
 
-        records = [{"fields": self._build_fields(lead)} for lead in leads]
+        records = [{"fields": self._build_fields(lead, is_new=True)} for lead in leads]
         url = (f"{_API_BASE}/bitable/v1/apps/{self.app_token}"
                f"/tables/{self.table_id}/records/batch_create")
 
@@ -799,22 +806,27 @@ class LarkCliBitableWriter:
     # 记录
     # ============================================================
 
-    def _build_fields(self, lead: dict) -> dict:
+    def _build_fields(self, lead: dict, is_new: bool = False) -> dict:
         """v3 API 的日期字段接受 "YYYY-MM-DD HH:mm:ss" 字符串
 
         状态字段只在本地确实变了的时候才写，避免覆盖销售在飞书表里改的值。
+
+        Args:
+            lead: 线索字典
+            is_new: True 表示这是**新建**记录——新建时必须写状态字段，
+                飞书端那两格不能是空的。守卫只适用于「更新已有记录」。
         """
         found_at = lead.get("_found_at") or lead.get("created_at") or ""
         return _lead_to_fields(
             lead,
             found_at,
-            skip_status=not status_changed(lead),
+            skip_status=(not is_new) and (not status_changed(lead)),
         )
 
     async def create_records(self, leads: list[dict]) -> tuple[list[str], str]:
         if not leads:
             return [], ""
-        records = [{"fields": self._build_fields(lead)} for lead in leads]
+        records = [{"fields": self._build_fields(lead, is_new=True)} for lead in leads]
         try:
             data = await self._run(
                 ["base", "+record-batch-create", "--base-token", self.app_token,
@@ -981,12 +993,14 @@ class LarkCliBitableWriter:
         for lead in leads:
             key = lead.get("lead_key") or lead.get("display_id")
             record_id = lead.get("_bitable_record_id") or by_dy.get(lead.get("display_id") or "")
-            fields = self._build_fields(lead)
             if record_id and update_existing:
+                # 更新已有记录：状态字段套守卫，不覆盖销售改过的值
+                fields = self._build_fields(lead)
                 to_update.append((record_id, fields))
                 result["record_ids"][key] = record_id
             else:
-                to_create.append((lead, fields))
+                # 新建记录：必须写状态字段，飞书端那两格不能是空的
+                to_create.append((lead, self._build_fields(lead, is_new=True)))
 
         # ---- 批量更新 ----
         for i in range(0, len(to_update), 200):
