@@ -238,3 +238,24 @@ def test_lead_to_copywriter_input_empty_evidence():
     lead = {"display_id": "u1", "evidence": ""}
     out = lead_to_copywriter_input(lead)
     assert out["danmaku"] == ""
+
+
+def test_问价位走价格角度():
+    """「su7max现在什么价位了」是真实问价，必须用 price 角度
+
+    词表没对齐的话会落到车型兜底，回「看到你在看SU7」——回避了客户问的价格。
+    """
+    cw = Copywriter(_cfg())
+    out = cw.generate(_lead(danmaku="su7max现在什么价位了", car_model="SU7"))
+    assert out["template_id"].startswith("price")
+
+
+def test_问修车多少钱不用价格角度():
+    """问剐蹭修复费不是问买车价，不能回「给你报个落地价」"""
+    cw = Copywriter(_cfg())
+    out = cw.generate(_lead(
+        danmaku="我把别人的小米su7max挂蹭了3个小地方 修的花大概是要多少钱",
+        car_model="SU7",
+    ))
+    assert not out["template_id"].startswith("price")
+    assert "落地价" not in out["text"]

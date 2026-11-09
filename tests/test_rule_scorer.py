@@ -183,3 +183,33 @@ def test_提及车型但无购买行为降到低意向(scorer):
     r = scorer.score("yu7标准版")
     assert r.level == IntentLevel.LOW.value
     assert r.car_model == "YU7"
+
+
+def test_问修车多少钱不算购车问价(scorer):
+    """问剐蹭修复费不是问买车价
+
+    真实案例：「我把别人的小米su7max挂蹭了3个小地方 修的花大概是要多少钱」
+    —— 命中了「多少钱」，但这是修车费。
+    不排除的话话术会回「看到你问SU7多少钱，可以给你报个落地价」，答非所问。
+    """
+    r = scorer.score("我把别人的小米su7max挂蹭了3个小地方 修的花大概是要多少钱")
+    assert "价格询问" not in r.signals
+
+
+def test_正常购车问价仍然算价格询问(scorer):
+    """排除规则不能误伤真正的购车问价"""
+    for text in ("su7 落地多少钱", "SU7 Max 落地价多少 全款能优惠多少",
+                 "这个车子多少米？", "裸车报价多少"):
+        r = scorer.score(text)
+        assert "价格询问" in r.signals, text
+
+
+def test_问质保保养仍然算购车相关(scorer):
+    """「质保几年」是买车问题，不能被售后语境排除"""
+    r = scorer.score("质保几年")
+    assert not r.excluded
+
+
+def test_问维修费不算价格询问(scorer):
+    r = scorer.score("去4S店修车要多少钱")
+    assert "价格询问" not in r.signals

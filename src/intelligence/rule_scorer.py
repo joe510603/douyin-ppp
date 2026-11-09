@@ -115,6 +115,34 @@ _REVIEWER_RE = re.compile(
     re.IGNORECASE,
 )
 
+# 售后语境：问的是「修车/事故/理赔」的钱，不是「买车」的钱
+# 例："我把别人的小米su7max挂蹭了3个小地方 修的花大概是要多少钱"
+#     —— 命中了「多少钱」，但这是问剐蹭修复费，不是问购车落地价。
+#     不排除的话话术会回「看到你问SU7多少钱，这个可以给你报个落地价」，
+#     答非所问，还可能被当成骚扰。
+# 只收明确的损伤/维修词，「质保几年」「保养多少钱」这类仍属购车问题，不能排除。
+_AFTERSALE_CONTEXT_RE = re.compile(
+    r"刮蹭|剐蹭|蹭(了|到)?|修车|维修|修理|钣金|钣喷|喷漆|定损|理赔|"
+    r"事故|碰撞|追尾|换(了)?(配件|零件|轮胎|电池|后视镜|保险)|掉漆|凹了|变形",
+    re.IGNORECASE,
+)
+
+
+def is_aftersale_context(text: str) -> bool:
+    """这句话问的是「修车/事故/理赔」的钱，不是「买车」的钱
+
+    话术层（copywriter）也要用这个判断——
+    否则规则层不把「修车多少钱」算成购车问价了，话术模板却照样匹配上
+    「多少钱」然后回「可以给你报个落地价」，照样答非所问。
+    """
+    return bool(text) and bool(_AFTERSALE_CONTEXT_RE.search(text))
+
+
+# 某些信号在特定语境下要作废：类别名 → 语境正则
+_SIGNAL_CONTEXT_EXCLUDE: dict[str, re.Pattern] = {
+    "价格询问": _AFTERSALE_CONTEXT_RE,
+}
+
 # ============================================================
 # 车型识别
 # ============================================================
@@ -223,9 +251,15 @@ class RuleScorer:
         score = 0
         signals: list[str] = []
         for name, weight, pattern in _COMPILED_CATEGORIES:
-            if pattern.search(content):
-                score += weight
-                signals.append(name)
+            if not pattern.search(content):
+                continue
+            # 语境排除：信号命中了，但整句落在不该算这个信号的语境里
+            # （例：问「修车多少钱」不算购车「价格询问」）
+            ctx_re = _SIGNAL_CONTEXT_EXCLUDE.get(name)
+            if ctx_re is not None and ctx_re.search(content):
+                continue
+            score += weight
+            signals.append(name)
 
         # 只提车型、没有任何购买行为（如"看一下YU7"）→ 记为弱信号
         # 这种情况在直播间很常见，是典型的"对某款车感兴趣但还没问价"

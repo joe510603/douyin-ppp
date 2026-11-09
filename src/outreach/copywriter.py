@@ -16,6 +16,8 @@ from typing import Any
 
 import yaml
 
+from ..intelligence.rule_scorer import is_aftersale_context
+
 _DEFAULT_TPL = {
     "salutation_default": "老板",
     "car_alias": {},
@@ -93,8 +95,15 @@ class Copywriter:
             kws = [str(k) for k in (t.get("keywords") or [])]
             if not kws:
                 continue
-            if any(k and k in danmaku for k in kws):
-                return t
+            if not any(k and k in danmaku for k in kws):
+                continue
+            # 价格角度但整句在售后语境里 → 不选这个角度
+            # 例："修车要多少钱"——回"给你报个落地价"是答非所问。
+            # 规则层（rule_scorer）已经排除了这种误判，话术层必须同步排除，
+            # 否则规则不把它当购车问价、话术却照样回落地价。
+            if t.get("id") == "price" and is_aftersale_context(danmaku):
+                continue
+            return t
         # 弹幕里没具体问题：车型明确走「车型关注」，否则走通用
         fallback_id = "model" if (car and car != "小米汽车") else "generic"
         for t in self._templates:
