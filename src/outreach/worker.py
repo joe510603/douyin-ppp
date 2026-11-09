@@ -188,16 +188,21 @@ class OutreachWorker:
     def _set_status(self, lead: dict, status: str, error: str = "") -> None:
         """回写本地 + 飞书
 
-        本地立刻写（调用方马上要看到结果）；
-        飞书用「只改这一个字段」的方式写，不碰其他列。
+        干跑时**完全不改状态**（本地也不改）。
+        干跑只是验证「能不能找到人、能不能挑到作品、话术长什么样」，
+        一旦把状态写成 searching/found，这条线索就会卡在队列外——
+        回拉也不会把它改回 pending（本地相对上次同步的值变了，走「跳过」分支），
+        下一轮真跑时这些线索就再也不会被处理。
+        多机共用一张飞书表时更危险：干跑会把另一台机器写的真实触达状态盖掉。
         """
+        if self._dry:
+            return
+
         try:
             self.st.set_outreach_status(lead["id"], status, error)
         except Exception as e:
             self.log(f"  ⚠️ 本地状态回写失败: {e}")
 
-        if self._dry:
-            return
         try:
             self._push_feishu_status(lead, status)
         except Exception as e:

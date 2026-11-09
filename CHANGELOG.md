@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.13] - 2026-11-09
+
+### Fixed
+- **干跑会污染线索状态**（真 bug）：干跑时 `_set_status` 仍会写本地 `outreach_status`
+  （searching → found），只是不写飞书。后果有两个：
+  - 这条线索就卡在队列外了——回拉不会把它改回 pending
+    （本地相对上次同步的值变了，走「跳过」分支），下一轮真跑时这些线索再也不会被处理
+  - 多机共用一张飞书表时更危险：干跑会把**另一台机器**写的真实触达状态盖掉
+  现在干跑**完全不改状态**（本地也不改）。日志、UI 实时事件、
+  `outreach_records` 里的干跑记录都照常保留——干跑该有的留痕一样不少
+
+### Testing
+- 测试 196 → 199（新增 `tests/test_outreach_worker.py`）
+- 扫码登录后实测干跑 3 条：1 条走完「搜人 → 挑作品 → 生成话术」、
+  1 条用户无公开作品（跳过）、1 条抖音号搜不到且昵称 fallback 也没搜到（失败）；
+  干跑前后 `leads.outreach_status` 分布逐项一致，飞书端未被写入
+
+---
+
 ## [2.0.12] - 2026-11-09
 
 ### Fixed
