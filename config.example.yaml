@@ -98,5 +98,25 @@ outreach:
   max_per_run: 10
   comments_per_user: 1
   fail_stop_threshold: 3   # 连续失败几次自动停止
-  message_template: '看到你在{live_room}聊到{model}，我们门店在售同款车型，方便留个联系方式细聊吗？'
   timeout: 30
+  dry_run: true            # ⚠️ 默认开着：只生成话术，不发送。第一次务必先干跑
+  stop_on_risk: true       # 撞到验证码/登录失效立即停手
+  dedupe_days: 30          # 同一抖音号多少天内不重复打扰
+  rest_every: 5            # 每发几条长休息一次
+  rest_min: 120
+  rest_max: 240
+  recent_days: 120         # 只看最近多少天发布的作品
+  intent_levels: []        # 只触达这些意向等级（空 = 全部）
+  stores: []               # 只触达这些门店（空 = 全部）
+  profile_dir: data/outreach_profile  # 触达专用浏览器 profile（扫码一次，长期复用）
+  headless: false          # 有头模式更稳；服务器上跑改 true
+  templates_file: ''       # 话术库路径（留空用 src/outreach/templates.yaml）
+  max_chars: 60
+  salutation: 老板
+  salutation_pool:         # 称呼变体，和模板变体组合能大幅降低重复率
+  - 老板
+  - 这位朋友
+  - 你好
+  allow_contact_words: false  # ⚠️ 别开：评论区留微信/电话会被限流甚至封号
+  verify_after_post: true     # 发完回查：抖音会静默删营销评论
+  verify_scrolls: 1

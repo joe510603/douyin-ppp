@@ -1,249 +1,271 @@
-"""触达任务编排器 — 限速、每日上限、失败自停、执行记录
+"""触达任务编排器 —— asyncio 侧入口
 
-执行顺序：
-1. 校验开关与每日上限
-2. 取待触达线索（有抖音号、状态 pending）
-3. 启动浏览器（一次任务复用一个会话）
-4. 逐条：生成话术 → 随机延时 → 搜人 → 留言 → 落库
-5. 连续失败达到阈值立即停止（避免把账号打进风控）
+线程模型（重要）
+----------------
+触达要用 Playwright 的 **sync API**（抖音网页操作成熟稳定的那套），
+而主进程是 asyncio 架构。两者的关键约束：
+
+- Playwright sync API **不能跨线程调用** —— 对象必须在创建它的线程里用
+- 所以整个触达流程跑在**一个专用线程**里，主进程只负责：
+  - 起这个线程、把结果收回来
+  - 展示进度（回调）
+  - 不阻塞自己的事件循环（NiceGUI 页面照常响应）
+
+这样既不用把 1000 多行的抖音操作逻辑重写成 async，
+也不会让「跑一轮要几分钟」的任务卡死 Web 服务。
+
+安全阀
+------
+所有「会不会把号跑废」的判断都在 worker 里：
+干跑默认开、每日上限、随机间隔、长休息、N 天去重、连续失败自停、撞风控立即停。
 """
 
 from __future__ import annotations
 
 import asyncio
-import json
-import random
+import threading
 import uuid
 from datetime import datetime
-from typing import Optional
+from typing import Callable, Optional
 
 from ..config import get_config
-from ..models.lead import OutreachRecord, OutreachStatus
 from ..storage.db_storage import get_db
 from ..utils.logger import get_logger
-from .operator import DouyinOperator
+from .store import OutreachStore
 
 log = get_logger("outreach_runner")
 
 
 class OutreachRunner:
-    """抖音触达任务执行器"""
+    """触达任务执行器（asyncio 侧）"""
 
     def __init__(self):
         self.config = get_config()
         self._running = False
+        self._thread: Optional[threading.Thread] = None
+        self._last_result: dict = {}
+        self._logs: list[str] = []
+        self._lock = threading.Lock()
 
     @property
     def is_running(self) -> bool:
         return self._running
 
+    @property
+    def last_result(self) -> dict:
+        return dict(self._last_result)
+
+    def recent_logs(self, limit: int = 200) -> list[str]:
+        with self._lock:
+            return list(self._logs[-limit:])
+
+    def _append_log(self, msg: str) -> None:
+        with self._lock:
+            self._logs.append(msg)
+            if len(self._logs) > 1000:
+                del self._logs[:500]
+
+    def _db_path(self) -> str:
+        db = get_db()
+        path = getattr(db, "db_path", None)
+        if path:
+            return str(path)
+        return "data/db/douyin_ppp.db"
+
     async def run(
         self,
         limit: Optional[int] = None,
-        message_override: str = "",
+        dry_run: Optional[bool] = None,
+        only: Optional[list[str]] = None,
     ) -> dict:
-        """
-        执行一轮触达任务。
+        """跑一轮触达任务
 
         Args:
-            limit: 本轮最多处理多少条，默认取配置
-            message_override: 指定留言文案（留空则用模板或 AI 生成）
+            limit: 本轮最多处理几条
+            dry_run: 干跑（不发送、不回写状态）
+            only: 只处理指定的抖音号
 
         Returns:
-            {"total","success","failed","skipped","stopped_reason"}
+            {"ok", "total", "sent", "failed", "skipped", "dry", "stopped"}
         """
         if self._running:
-            return {"total": 0, "success": 0, "failed": 0, "skipped": 0,
-                    "stopped_reason": "已有触达任务在运行"}
+            return {"ok": False, "error": "已有触达任务在跑", "total": 0,
+                    "sent": 0, "failed": 0, "skipped": 0}
 
-        oc = self.config.outreach
-        if not oc.enabled:
-            return {"total": 0, "success": 0, "failed": 0, "skipped": 0,
-                    "stopped_reason": "触达功能未启用（配置管理 → 触达）"}
-
-        db = get_db()
-        if not db or not db._db:
-            return {"total": 0, "success": 0, "failed": 0, "skipped": 0,
-                    "stopped_reason": "数据库未就绪"}
-
-        max_per_run = int(limit or oc.max_per_run)
-
-        # 每日上限检查
-        done_today = await db.count_outreach_today()
-        if done_today >= oc.daily_limit:
-            return {"total": 0, "success": 0, "failed": 0, "skipped": 0,
-                    "stopped_reason": f"已达每日上限（今日 {done_today}/{oc.daily_limit}）"}
-
-        # 取待触达线索
-        leads, _ = await db.query_leads(outreach_status="pending", limit=max_per_run * 2)
-        targets = [l for l in leads if l.get("display_id")][:max_per_run]
-
-        if not targets:
-            return {"total": 0, "success": 0, "failed": 0, "skipped": 0,
-                    "stopped_reason": "没有待触达线索"}
+        o = self.config.outreach
+        if not o.enabled and dry_run is not True:
+            return {"ok": False, "error": "触达功能未启用（配置页 → 抖音触达）",
+                    "total": 0, "sent": 0, "failed": 0, "skipped": 0}
 
         self._running = True
-        stats = {"total": 0, "success": 0, "failed": 0, "skipped": 0, "stopped_reason": ""}
-        consecutive_failures = 0
+        self._logs = []
+        started = datetime.now().strftime("%H:%M:%S")
+        self._append_log(f"▶ [{started}] 触达任务开始"
+                          f"{'（干跑）' if (o.dry_run if dry_run is None else dry_run) else ''}")
 
+        loop = asyncio.get_event_loop()
         try:
-            async with DouyinOperator() as op:
-                for idx, lead in enumerate(targets):
-                    # 每日上限二次检查
-                    done_today = await db.count_outreach_today()
-                    if done_today >= oc.daily_limit:
-                        stats["stopped_reason"] = f"已达每日上限（{done_today}/{oc.daily_limit}）"
-                        break
-
-                    display_id = lead.get("display_id") or ""
-                    lead_id = lead.get("id")
-
-                    # 生成话术
-                    message = message_override or await self._build_message(lead)
-
-                    record = OutreachRecord(
-                        id=uuid.uuid4().hex[:16],
-                        lead_id=lead_id,
-                        display_id=display_id,
-                        nickname=lead.get("nickname") or "",
-                        message=message,
-                        status=OutreachStatus.SEARCHING.value,
-                    )
-                    await db.insert_outreach_record(record)
-                    await db.update_lead(lead_id, outreach_status=OutreachStatus.SEARCHING.value)
-                    stats["total"] += 1
-
-                    # 随机延时（第一条之前也等一下，更像真人）
-                    await asyncio.sleep(random.uniform(oc.min_delay, oc.max_delay))
-
-                    ok, note, profile_url = await op.search_and_comment(
-                        display_id, message, comments_per_user=oc.comments_per_user
-                    )
-
-                    if ok:
-                        stats["success"] += 1
-                        consecutive_failures = 0
-                        await db.update_outreach_record(
-                            record.id,
-                            status=OutreachStatus.COMMENTED.value,
-                            target_url=profile_url,
-                            error="",
-                        )
-                        await db.update_lead(
-                            lead_id,
-                            outreach_status=OutreachStatus.COMMENTED.value,
-                            outreach_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                            outreach_note=profile_url,
-                        )
-                        log.info(f"[触达] ✅ {display_id} 留言成功")
-                    else:
-                        stats["failed"] += 1
-                        consecutive_failures += 1
-                        await db.update_outreach_record(
-                            record.id,
-                            status=OutreachStatus.FAILED.value,
-                            target_url=profile_url,
-                            error=note[:300],
-                        )
-                        await db.update_lead(
-                            lead_id,
-                            outreach_status=OutreachStatus.FAILED.value,
-                            outreach_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                            outreach_note=note[:300],
-                        )
-                        log.warning(f"[触达] ❌ {display_id} 失败: {note}")
-
-                        # 连续失败达阈值 → 立即停止，保护账号
-                        if consecutive_failures >= oc.fail_stop_threshold:
-                            stats["stopped_reason"] = (
-                                f"连续失败 {consecutive_failures} 次，已自动停止"
-                            )
-                            log.warning(f"[触达] {stats['stopped_reason']}")
-                            break
-
+            # 在线程里跑同步的 worker，主事件循环不受阻
+            result = await loop.run_in_executor(
+                None,
+                self._run_in_thread,
+                limit, dry_run, only,
+            )
         except Exception as e:
             log.error(f"触达任务异常: {e}", exc_info=True)
-            stats["stopped_reason"] = f"任务异常: {e}"
+            result = {"ok": False, "error": str(e), "total": 0,
+                      "sent": 0, "failed": 0, "skipped": 0}
         finally:
             self._running = False
 
-        return stats
+        self._last_result = result
+        summary = (
+            f"发 {result.get('sent', 0)}　干跑 {result.get('dry', 0)}　"
+            f"失败 {result.get('failed', 0)}　跳过 {result.get('skipped', 0)}"
+        )
+        self._append_log(f"■ 触达任务结束：{summary}")
+        log.info(f"[触达] 任务结束：{summary}")
+        return result
 
-    async def _build_message(self, lead: dict) -> str:
-        """
-        生成留言文案。
+    def _run_in_thread(self, limit, dry_run, only) -> dict:
+        """在线程里跑 worker（同步）"""
+        from .worker import OutreachWorker
 
-        优先级：配置模板 → AI 生成 → 配置模板兜底
-        """
-        template = self.config.outreach.message_template or ""
-        evidence = ""
-        raw = lead.get("evidence") or ""
-        if raw:
+        config = get_config()
+        worker = OutreachWorker(
+            config,
+            self._db_path(),
+            log=self._append_log,
+            on_event=self._on_event,
+        )
+        try:
+            return worker.run(limit=limit, dry_run=dry_run, only=only)
+        finally:
             try:
-                items = json.loads(raw)
-                if isinstance(items, list):
-                    evidence = "；".join(str(i) for i in items)
-            except (json.JSONDecodeError, TypeError):
-                evidence = str(raw)[:200]
+                worker.st.close()
+            except Exception:
+                pass
 
-        model_text = self._fill_template(template, lead)
+    def _on_event(self, event: dict) -> None:
+        """worker 的事件回调（在线程里触发）"""
+        t = event.get("type")
+        if t == "need_login":
+            self._append_log("⚠️ 需要登录：请先扫码登录触达专用浏览器")
+        elif t == "risk":
+            self._append_log(f"🛑 风控：{event.get('error')}")
+        elif t == "sent":
+            self._append_log(f"✅ 已留言：{event.get('text', '')[:40]}")
 
-        # 有 LLM 就让 AI 写一版更自然的
-        llm = self.config.llm
-        if llm.enabled and llm.api_key:
+    # ================================================================
+    # 查询接口（给页面用）
+    # ================================================================
+
+    def pending_count(self) -> int:
+        """还有多少条待触达"""
+        try:
+            st = OutreachStore(self._db_path())
             try:
-                from ..intelligence.prompts import (
-                    MESSAGE_SYSTEM_PROMPT,
-                    build_message_prompt,
-                    parse_json_object,
-                )
-                from ..utils.llm_client import LLMClient
+                return len(st.pending_leads(
+                    intent_levels=list(self.config.outreach.intent_levels or []),
+                    stores=list(self.config.outreach.stores or []),
+                ))
+            finally:
+                st.close()
+        except Exception:
+            return 0
 
-                prompt = build_message_prompt(
-                    nickname=lead.get("nickname") or "",
-                    display_id=lead.get("display_id") or "",
-                    context=evidence,
-                    intent_level=lead.get("intent_level") or "",
-                    car_model=lead.get("car_model") or "",
-                )
-                async with LLMClient() as client:
-                    if client.is_enabled:
-                        raw_reply = await client.chat(
-                            [
-                                {"role": "system", "content": MESSAGE_SYSTEM_PROMPT},
-                                {"role": "user", "content": prompt},
-                            ],
-                            temperature=0.7,
-                            max_tokens=500,
-                        )
-                        if raw_reply:
-                            obj = parse_json_object(raw_reply)
-                            msg = str(obj.get("message") or "").strip()
-                            if msg:
-                                return msg[:200]
-            except Exception as e:
-                log.warning(f"AI 生成留言失败，改用模板: {e}")
+    def recent_runs(self, limit: int = 10) -> list[dict]:
+        try:
+            st = OutreachStore(self._db_path())
+            try:
+                return st.recent_runs(limit)
+            finally:
+                st.close()
+        except Exception:
+            return []
 
-        return model_text
+    def recent_touches(self, limit: int = 50) -> list[dict]:
+        try:
+            st = OutreachStore(self._db_path())
+            try:
+                return st.recent_touches(limit)
+            finally:
+                st.close()
+        except Exception:
+            return []
 
-    def _fill_template(self, template: str, lead: dict) -> str:
-        """填充留言模板"""
-        if not template:
-            return "看到你在直播间聊到我们店里的车型，方便留个联系方式细聊吗？"
-        return template.format(
-            name=lead.get("nickname") or "朋友",
-            nickname=lead.get("nickname") or "朋友",
-            model=lead.get("car_model") or "我们店里的车型",
-            live_room=lead.get("monitor_name") or lead.get("live_room") or "直播间",
-            display_id=lead.get("display_id") or "",
-        )[:200]
+    def sent_today(self) -> int:
+        try:
+            st = OutreachStore(self._db_path())
+            try:
+                return st.sent_today()
+            finally:
+                st.close()
+        except Exception:
+            return 0
 
+    # ================================================================
+    # 话术预览（不发任何东西）
+    # ================================================================
+
+    def preview(self, limit: int = 10) -> list[dict]:
+        """给页面预览「将要发出去的话术」
+
+        只生成不发送，也不动任何状态。
+        """
+        from .copywriter import Copywriter
+        from .worker import lead_to_copywriter_input
+
+        o = self.config.outreach
+        cfg_dict = {
+            "comment": {
+                "max_chars": o.max_chars,
+                "salutation": o.salutation,
+                "salutation_pool": list(o.salutation_pool or []),
+                "templates_file": o.templates_file,
+                "allow_contact_words": o.allow_contact_words,
+            },
+            "dm": {"max_chars": 120},
+        }
+        cw = Copywriter(cfg_dict, log=lambda m: None)
+        st = OutreachStore(self._db_path())
+        try:
+            leads = st.pending_leads(
+                intent_levels=list(o.intent_levels or []),
+                stores=list(o.stores or []),
+            )
+        finally:
+            st.close()
+
+        out = []
+        for lead in leads[:limit]:
+            item = {
+                "display_id": lead.get("display_id") or "",
+                "nickname": lead.get("nickname") or "",
+                "car_model": lead.get("car_model") or "",
+                "store": lead.get("store") or "",
+                "intent_level": lead.get("intent_level") or "",
+                "intent_score": lead.get("intent_score") or 0,
+                "intent_reason": lead.get("intent_reason") or "",
+            }
+            c = cw.generate(lead_to_copywriter_input(lead))
+            item["text"] = c.get("text", "")
+            item["template_id"] = c.get("template_id", "")
+            item["ok"] = c.get("ok", True)
+            item["reason"] = c.get("reason", "")
+            out.append(item)
+        return out
+
+
+# ============================================================
+# 全局单例
+# ============================================================
 
 _runner: Optional[OutreachRunner] = None
 
 
-def get_runner() -> OutreachRunner:
-    """获取全局执行器实例"""
+def get_outreach_runner() -> OutreachRunner:
+    """获取全局触达执行器"""
     global _runner
     if _runner is None:
         _runner = OutreachRunner()

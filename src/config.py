@@ -193,7 +193,11 @@ class NotifyConfig(BaseModel):
 
 
 class OutreachConfig(BaseModel):
-    """抖音触达（搜人 + 作品留言）配置"""
+    """抖音触达（搜人 + 作品留言）配置
+
+    安全阀的默认值刻意保守：干跑默认开、每日上限小、间隔长。
+    真要放开（dry_run=False）应该由用户在配置页明确改。
+    """
     enabled: bool = False
     # 全自动模式（关闭时需在页面上手动触发）
     auto_mode: bool = False
@@ -208,10 +212,52 @@ class OutreachConfig(BaseModel):
     comments_per_user: int = 1
     # 连续失败多少次自动停止本轮任务
     fail_stop_threshold: int = 3
-    # 留言文案模板，{name} 昵称 {model} 车型 {nickname} 抖音号
-    message_template: str = "看到你在{live_room}聊到{model}，我们门店在售同款车型，方便留个联系方式细聊吗？"
     # 浏览器操作超时（秒）
     timeout: int = 30
+
+    # ---- 干跑 / 安全阀 ----
+    # 干跑：只生成话术、不发送、不回写状态。**默认开**，确认话术没问题再关。
+    dry_run: bool = True
+    # 遇到验证码/登录失效/操作频繁立即停手
+    stop_on_risk: bool = True
+    # 同一抖音号多少天内不重复触达
+    dedupe_days: int = 30
+    # 每发几条长休息一次（模拟真人节奏）
+    rest_every: int = 5
+    rest_min: int = 120
+    rest_max: int = 240
+    # 只触达最近多少天发布的作品；找不到再放宽
+    recent_days: int = 120
+    # 只触达这些意向等级（空 = 全部）
+    intent_levels: list[str] = []
+    # 只触达这些门店（空 = 全部）
+    stores: list[str] = []
+
+    # ---- 浏览器 ----
+    # 专用浏览器 profile 目录（扫码一次，长期复用）
+    profile_dir: str = "data/outreach_profile"
+    # 有头模式更稳；服务器上跑改 True
+    headless: bool = False
+
+    # ---- 留言文案 ----
+    # 话术库路径（留空用 src/outreach/templates.yaml）
+    templates_file: str = ""
+    # 留言最大字数（抖音评论框能发更长，但短的更像真人）
+    max_chars: int = 60
+    # 称呼前缀，空则不带
+    salutation: str = "老板"
+    # 称呼变体池：模板变体 × 称呼变体，组合数相乘。
+    # 实测待触达池里「价格」角度有 78 条，只靠模板变体必然大量重复。
+    # ⚠️ 别加太随便的称呼（卖车的叫「老板」是行业习惯，「亲」就别了）
+    salutation_pool: list[str] = ["老板", "这位朋友", "你好"]
+    # 是否允许留言里出现「微信/电话/加V」等引流词。
+    # ⚠️ 默认关闭：抖音对评论区留联系方式会屏蔽、限流，甚至禁言。
+    allow_contact_words: bool = False
+    # 发完立刻回查：评论区里真的出现了才算「已留言」。
+    # 实测抖音会静默删掉营销味评论，所以这个开关别关。
+    verify_after_post: bool = True
+    # 发完那条回查滚几屏（1 屏够判断「当场有没有出现」）
+    verify_scrolls: int = 1
 
 
 class Settings(BaseSettings):

@@ -5,6 +5,49 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.11] - 2026-11-09
+
+### Added
+- **抖音自动触达**：在抖音真实界面搜索线索的抖音号 → 定位主页 → 挑最近的作品 → 按弹幕内容和车型生成一条像真人写的留言 → 发出 → 回查确认 → 回写状态
+  - 复用 `douyin-touch` 项目的实战经验（响应监听抓数据、首页搜索框搜人、发完回查、风控 DOM 检测）
+  - 线索中心新增「抖音触达队列」页签：话术预览、开始触达、运行日志、触达记录
+  - 配置页新增触达参数区块（干跑开关、限速、回查、称呼变体、浏览器 profile）
+  - `outreach_records` 表补明细字段（record_id / sec_uid / aweme_id / template_id / verified），新增 `outreach_runs` 表
+
+### Fixed
+- **话术会编造客户没问过的事**：模板选择原来用「判定依据」（"命中信号：价格询问"），
+  客户只说了「su7」也会回「看到你问SU7的价格」。改为用**弹幕原文**（`evidence` 字段），
+  并新增「车型关注」角度——具体但不撒谎
+- **话术截断超长 1 字**：`_truncate` 在标点处截断后补「～」，
+  `cut[:i] + "～"` 实际是 limit+1 字
+
+### Changed
+- **话术重复率降低 3.7 倍**：模板变体（同一角度多种说法）× 称呼变体（老板/这位朋友/你好）组合，
+  202 条待触达从 21 种话术提升到 77 种，最高重复从 18 次降到 8 次。
+  变体用**抖音号做种子**确定性选择——同一个人永远同一句话（可复盘），不同人自然分散
+- **触达跑在专用线程**：Playwright sync API 不能跨线程用，而主进程是 asyncio 架构。
+  整个触达流程在专用线程跑，主页面照常响应，不用把 1000 多行操作逻辑重写成 async
+- **不再重复造轮子**：触达直接用本项目的 `leads` 表、`outreach_records` 表和
+  `notify/bitable.py` 写入器（部分更新语义，不会覆盖销售改过的「处理状态」），
+  不再另建独立 SQLite 和飞书模块
+- **干跑默认开启**：`outreach.dry_run` 默认 `true`，确认话术没问题再关。
+  真发前还有二次确认弹窗
+- 删除旧的 `src/outreach/operator.py`（直接 goto `/search?q` 实测搜不到人，
+  被 `douyin_api.py` 取代）
+
+### Changed (config)
+- `outreach` 新增：`dry_run` / `stop_on_risk` / `dedupe_days` / `rest_every` /
+  `rest_min` / `rest_max` / `recent_days` / `intent_levels` / `stores` /
+  `profile_dir` / `headless` / `templates_file` / `max_chars` / `salutation` /
+  `salutation_pool` / `allow_contact_words` / `verify_after_post` / `verify_scrolls`
+- 移除 `outreach.message_template`（改用 templates.yaml 的话术库）
+
+### Testing
+- 测试 177 → 196（新增 `tests/test_outreach_copywriter.py`）
+- UI 用 Playwright 实测：话术预览表渲染、干跑开关、配置项齐全
+
+---
+
 ## [2.0.10] - 2026-11-07
 
 ### Fixed

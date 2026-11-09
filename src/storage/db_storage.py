@@ -175,7 +175,15 @@ CREATE TABLE IF NOT EXISTS outreach_records (
     status TEXT DEFAULT 'pending',
     error TEXT DEFAULT '',
     created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
-    updated_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
+    updated_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
+    -- ---- 触达执行明细（v2.0.11 接入自动触达时补）----
+    record_id TEXT DEFAULT '',     -- 飞书多维表格的 record_id（回写触达状态用）
+    sec_uid TEXT DEFAULT '',       -- 抖音定位到的用户 ID
+    aweme_id TEXT DEFAULT '',      -- 留言的作品 ID
+    aweme_desc TEXT DEFAULT '',    -- 作品文案（复盘用）
+    template_id TEXT DEFAULT '',   -- 用的哪条话术模板
+    channel TEXT DEFAULT 'comment',-- comment / dm
+    verified INTEGER DEFAULT 0     -- 1=回查确认评论真的在页面上
 );
 """
 
@@ -183,6 +191,26 @@ CREATE_OUTREACH_INDEXES_SQL = [
     "CREATE INDEX IF NOT EXISTS idx_outreach_status ON outreach_records(status);",
     "CREATE INDEX IF NOT EXISTS idx_outreach_lead ON outreach_records(lead_id);",
     "CREATE INDEX IF NOT EXISTS idx_outreach_created ON outreach_records(created_at);",
+    "CREATE INDEX IF NOT EXISTS idx_outreach_display ON outreach_records(display_id);",
+]
+
+# 每轮触达任务的摘要（看板展示 + 排障）
+CREATE_TABLE_OUTREACH_RUNS_SQL = """
+CREATE TABLE IF NOT EXISTS outreach_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    dry_run INTEGER DEFAULT 0,
+    total INTEGER DEFAULT 0,
+    sent INTEGER DEFAULT 0,
+    failed INTEGER DEFAULT 0,
+    skipped INTEGER DEFAULT 0,
+    note TEXT DEFAULT '',
+    started_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
+    finished_at TEXT DEFAULT ''
+);
+"""
+
+CREATE_OUTREACH_RUNS_INDEXES_SQL = [
+    "CREATE INDEX IF NOT EXISTS idx_outreach_runs_started ON outreach_runs(started_at);",
 ]
 
 
@@ -356,6 +384,29 @@ class DBStorage:
                 log.info(f"回填门店字段：{len(rows)} 条")
         except Exception as e:
             log.warning(f"回填门店字段失败: {e}")
+
+        # 迁移：触达记录补明细字段（v2.0.11 接入自动触达时加）
+        for col, ddl in (
+            ("record_id", "TEXT DEFAULT ''"),
+            ("sec_uid", "TEXT DEFAULT ''"),
+            ("aweme_id", "TEXT DEFAULT ''"),
+            ("aweme_desc", "TEXT DEFAULT ''"),
+            ("template_id", "TEXT DEFAULT ''"),
+            ("channel", "TEXT DEFAULT 'comment'"),
+            ("verified", "INTEGER DEFAULT 0"),
+        ):
+            try:
+                await self._db.execute(
+                    f"ALTER TABLE outreach_records ADD COLUMN {col} {ddl}"
+                )
+                await self._db.commit()
+            except aiosqlite.OperationalError:
+                pass
+
+        # 触达运行记录（每轮一行摘要，用于看板和排障）
+        await self._db.executescript(CREATE_TABLE_OUTREACH_RUNS_SQL)
+        for sql in CREATE_OUTREACH_RUNS_INDEXES_SQL:
+            await self._db.execute(sql)
 
     async def save_analysis_result(
         self,

@@ -623,17 +623,67 @@ def create_config_page():
                 min=1, max=10, step=1,
             ).props("dense outlined").classes("col-6 col-sm-2 app-input")
 
-            outreach_per_user = ui.number(
-                "每人留言作品数",
-                value=config.outreach.comments_per_user,
-                min=1, max=5, step=1,
+            outreach_dedupe = ui.number(
+                "N 天内不重复",
+                value=config.outreach.dedupe_days,
+                min=0, max=365, step=1,
             ).props("dense outlined").classes("col-6 col-sm-2 app-input")
 
-            outreach_template = ui.input(
-                "留言模板（留空则由 AI 生成）",
-                value=config.outreach.message_template,
-                placeholder="看到你在{live_room}聊到{model}，方便留个联系方式细聊吗？",
-            ).props("dense outlined").classes("col-12 col-sm-8 app-input")
+            outreach_recent = ui.number(
+                "只看近几天作品",
+                value=config.outreach.recent_days,
+                min=7, max=3650, step=1,
+            ).props("dense outlined").classes("col-6 col-sm-2 app-input")
+
+            outreach_max_chars = ui.number(
+                "留言字数上限",
+                value=config.outreach.max_chars,
+                min=10, max=200, step=5,
+            ).props("dense outlined").classes("col-6 col-sm-2 app-input")
+
+        with ui.row().classes("w-full items-end q-col-gutter-sm q-mt-sm"):
+            outreach_dry_switch = ui.switch(
+                "干跑模式（只生成话术，不发送）",
+                value=config.outreach.dry_run,
+            ).classes("col-6 col-sm-3")
+
+            outreach_verify_switch = ui.switch(
+                "发完回查（确认评论真的在页面上）",
+                value=config.outreach.verify_after_post,
+            ).classes("col-6 col-sm-3")
+
+            outreach_contact_switch = ui.switch(
+                "允许留言里留联系方式（⚠️ 会被限流，别开）",
+                value=config.outreach.allow_contact_words,
+            ).classes("col-6 col-sm-4")
+
+            outreach_salutation = ui.input(
+                "称呼",
+                value=config.outreach.salutation,
+            ).props("dense outlined").classes("col-6 col-sm-3 app-input")
+
+        with ui.row().classes("w-full items-end q-col-gutter-sm q-mt-sm"):
+            outreach_salutation_pool = ui.input(
+                "称呼变体（逗号分隔，和模板变体组合能降低重复率）",
+                value=",".join(config.outreach.salutation_pool or []),
+            ).props("dense outlined").classes("col-12 col-sm-6 app-input")
+
+            outreach_profile_dir = ui.input(
+                "触达专用浏览器 profile 目录",
+                value=config.outreach.profile_dir,
+            ).props("dense outlined").classes("col-12 col-sm-6 app-input")
+
+        with ui.row().classes("w-full items-end q-col-gutter-sm q-mt-sm"):
+            outreach_headless_switch = ui.switch(
+                "无头模式（服务器上跑用；有头更稳）",
+                value=config.outreach.headless,
+            ).classes("col-6 col-sm-3")
+
+            outreach_templates_file = ui.input(
+                "话术库路径（留空用内置）",
+                value=config.outreach.templates_file,
+                placeholder="src/outreach/templates.yaml",
+            ).props("dense outlined clearable").classes("col-12 col-sm-9 app-input")
 
         def save_outreach_config():
             config.outreach.enabled = outreach_enabled_switch.value
@@ -642,8 +692,20 @@ def create_config_page():
             config.outreach.max_delay = float(outreach_max_delay.value or 120)
             config.outreach.max_per_run = int(outreach_max_run.value or 10)
             config.outreach.fail_stop_threshold = int(outreach_fail_stop.value or 3)
-            config.outreach.comments_per_user = int(outreach_per_user.value or 1)
-            config.outreach.message_template = outreach_template.value or ""
+            config.outreach.dedupe_days = int(outreach_dedupe.value or 30)
+            config.outreach.recent_days = int(outreach_recent.value or 120)
+            config.outreach.max_chars = int(outreach_max_chars.value or 60)
+            config.outreach.dry_run = bool(outreach_dry_switch.value)
+            config.outreach.verify_after_post = bool(outreach_verify_switch.value)
+            config.outreach.allow_contact_words = bool(outreach_contact_switch.value)
+            config.outreach.headless = bool(outreach_headless_switch.value)
+            config.outreach.salutation = (outreach_salutation.value or "老板").strip()
+            pool_raw = (outreach_salutation_pool.value or "").strip()
+            config.outreach.salutation_pool = [
+                s.strip() for s in pool_raw.replace("，", ",").split(",") if s.strip()
+            ]
+            config.outreach.profile_dir = (outreach_profile_dir.value or "").strip()
+            config.outreach.templates_file = (outreach_templates_file.value or "").strip()
             try:
                 save_config(config)
                 reload_config()
