@@ -166,13 +166,20 @@ class OutreachStore:
         self._conn.commit()
 
     def recent_touch_days(self, display_id: str, days: int) -> bool:
-        """这个抖音号最近 N 天内触达过没有（防止重复打扰）"""
+        """这个抖音号最近 N 天内**真的发出去过**没有（防止重复打扰）
+
+        只认 status='sent'（真的发出去了）。
+        干跑记录（dry_run）不算——干跑没打扰过客户，
+        要是把干跑也算进去，干跑验证完的人就永远真发不出去了，
+        「先干跑看看再真发」这个流程直接走不通。
+        失败记录（failed）也不算，那是没发出去，可以重试。
+        """
         if not display_id or days <= 0:
             return False
         since = time.time() - days * 86400
         row = self._conn.execute(
             "SELECT COUNT(*) AS n FROM outreach_records "
-            "WHERE display_id = ? AND status IN ('sent','dry_run') "
+            "WHERE display_id = ? AND status = 'sent' "
             "AND created_at >= ?",
             [display_id, since],
         ).fetchone()

@@ -5,6 +5,40 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.14] - 2026-11-09
+
+### Fixed
+- **抖音软风控没被识别，账号被限流了**（真 bug）：抖音的软风控**不弹验证码、不提示「操作频繁」**，
+  就是把评论静默吞掉——点发送、没报错、回查评论区也没有。
+  原来的风控检测只看页面上的验证码/提示词，识别不了这种情况，
+  结果一条条继续发，越撞越狠。
+  现在「发送无回执 + 回查不到」会计数，连续达到 `silent_block_threshold`（默认 2）
+  就判定账号被限流并**立即停手**
+- **风控冷却**：命中风控后 `risk_cooldown_minutes`（默认 120）分钟内拒绝启动触达，
+  避免继续撞风控把号搞废。冷却依据是 `outreach_runs.note` 里的风控标记
+- **干跑记录会挡住真发**：去重 `recent_touch_days` 把 `dry_run` 也算成「已触达」，
+  干跑验证完的人就永远真发不出去了，「先干跑看看再真发」这个流程直接走不通。
+  现在只认 `status='sent'`（真发出去了），失败记录也不算（可以重试）
+
+### Added
+- **`scripts/outreach_console.py` 触达控制台**：在终端实时看到每一步
+  （搜索 → 定位 → 挑作品 → 生成话术 → 发送 → 回查），
+  带模式/限速/窗口/冷却状态横幅。默认干跑，`--real` 才真发
+- **触达日志实时输出**：之前只存在内存里，任务跑完才打印；
+  现在边跑边打到控制台和服务日志
+- **`scripts/find_reset_touches.py`**：扫飞书全表变更历史，找出
+  「曾经留言过、但被重置回待触达」的线索（跨机重复评论的来源）
+
+### Changed
+- **`outreach.hide_window`（默认开）**：浏览器窗口摆到屏幕外，看不见但不挡你干活。
+  ⚠️ 别直接开 headless——抖音对无头浏览器的检测更严，风控风险明显更高
+- 新增配置：`hide_window` / `silent_block_threshold` / `risk_cooldown_minutes`
+
+### Testing
+- 测试 208 → 210
+
+---
+
 ## [2.0.13] - 2026-11-09
 
 ### Fixed

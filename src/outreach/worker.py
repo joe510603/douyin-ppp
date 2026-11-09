@@ -103,6 +103,8 @@ class OutreachWorker:
         self.cw = Copywriter(self._copywriter_cfg(), log=self.log)
         self.stop_reason = ""
         self._dry = True
+        # 连续「发出去但回查不到」的次数（软风控信号）
+        self._silent_blocks = 0
 
     # ================================================================
     # 配置适配
@@ -250,6 +252,7 @@ class OutreachWorker:
         o = self.cfg.outreach
         dry = bool(o.dry_run if dry_run is None else dry_run)
         self._dry = dry
+        self._silent_blocks = 0
         per_run = int(limit or o.max_per_run or 10)
         daily_limit = int(o.daily_limit or 30)
 
@@ -511,6 +514,20 @@ class OutreachWorker:
                     self._set_status(lead, STATUS_PENDING, "评论未发出，待重发")
                     summary["failed"] += 1
                     self.log("  ⚠️ 评论没发出去（无回执），已退回「待触达」")
+
+                    # 抖音的**软风控**：页面不弹验证码、不提示「操作频繁」，
+                    # 只是把评论静默吞掉——发送按钮点了、没报错、回查也没有。
+                    # 单次可能是偶发，连续出现就是账号被限流了，
+                    # 必须停手，不能继续发把号搞废。
+                    self._silent_blocks += 1
+                    thr = int(o.silent_block_threshold or 2)
+                    self.log(f"  ⚠️ 静默拦截计数 {self._silent_blocks}/{thr}")
+                    if self._silent_blocks >= thr:
+                        raise RiskControl(
+                            f"连续 {self._silent_blocks} 条评论发出去但页面看不到，"
+                            f"判定账号被限流（软风控），已停手。冷却 "
+                            f"{int(o.risk_cooldown_minutes or 120)} 分钟后再试"
+                        )
                     self._emit(type="failed", lead=lead, error="回查未出现在评论区")
                     return
             if v.get("found"):
@@ -534,6 +551,9 @@ class OutreachWorker:
         """拿一个可用的页面：有常驻浏览器就复用，没有就自己开一个"""
         from contextlib import contextmanager
 
+        # 窗口摆屏幕外：看不见但不是 headless（抖音对无头检测更严，风控风险高）
+        offscreen = bool(getattr(self.cfg.outreach, "hide_window", True))
+
         @contextmanager
         def _ctx():
             if session is not None and session.alive():
@@ -545,7 +565,8 @@ class OutreachWorker:
                     pass
                 yield page
                 return
-            with Browser(profile_dir, headless=headless, slow_mo=120, offscreen=True) as (_c, page):
+            with Browser(profile_dir, headless=headless, slow_mo=120,
+                         offscreen=offscreen) as (_c, page):
                 yield page
 
         return _ctx()

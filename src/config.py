@@ -238,6 +238,15 @@ class OutreachConfig(BaseModel):
     profile_dir: str = "data/outreach_profile"
     # 有头模式更稳；服务器上跑改 True
     headless: bool = False
+    # 浏览器窗口摆到屏幕外：看不见、但不挡你干活。
+    # ⚠️ 别直接开 headless——抖音对无头浏览器的检测更严，风控风险明显更高。
+    #    「看不见窗口」用有头 + 屏幕外实现就够了。
+    hide_window: bool = True
+    # 连续多少次「发送没报错但回查不到评论」判定账号被限流并停手。
+    # 这是抖音的**软风控**：页面不弹验证码、不提示操作频繁，就是把评论静默吞掉。
+    silent_block_threshold: int = 2
+    # 命中风控后冷却多少分钟内不允许再启动触达（避免继续撞风控把号搞废）
+    risk_cooldown_minutes: int = 120
 
     # ---- 留言文案 ----
     # 话术库路径（留空用 src/outreach/templates.yaml）

@@ -60,10 +60,56 @@ class OutreachRunner:
             return list(self._logs[-limit:])
 
     def _append_log(self, msg: str) -> None:
+        """记一条触达日志
+
+        除了存内存（给网页看），还实时打到控制台 + 服务日志。
+        触达是个长流程（每条要几十秒），不实时输出的话
+        干等的人根本不知道跑到哪一步了。
+        """
         with self._lock:
             self._logs.append(msg)
             if len(self._logs) > 1000:
                 del self._logs[:500]
+        try:
+            print(msg, flush=True)
+        except Exception:
+            pass
+        try:
+            log.info("[触达] %s", msg)
+        except Exception:
+            pass
+
+    def risk_cooldown_left(self) -> int:
+        """风控冷却还剩多少分钟（0 = 可以跑）
+
+        抖音软风控（评论发出去但页面看不到）一旦触发，
+        继续发只会把号搞废——冷却期内直接拒绝启动。
+        """
+        try:
+            st = OutreachStore(self._db_path())
+            try:
+                runs = st.recent_runs(limit=20)
+            finally:
+                st.close()
+        except Exception:
+            return 0
+
+        minutes = int(getattr(self.config.outreach, "risk_cooldown_minutes", 120) or 0)
+        if minutes <= 0:
+            return 0
+        for r in runs:
+            note = str(r.get("note") or "")
+            if "风控" not in note and "限流" not in note:
+                continue
+            started = str(r.get("started_at") or "")
+            try:
+                t = datetime.strptime(started, "%Y-%m-%d %H:%M:%S")
+            except Exception:
+                continue
+            left = minutes - (datetime.now() - t).total_seconds() / 60
+            if left > 0:
+                return int(left)
+        return 0
 
     def _db_path(self) -> str:
         db = get_db()
@@ -96,6 +142,17 @@ class OutreachRunner:
         if not o.enabled and dry_run is not True:
             return {"ok": False, "error": "触达功能未启用（配置页 → 抖音触达）",
                     "total": 0, "sent": 0, "failed": 0, "skipped": 0}
+
+        # 风控冷却：账号刚被判限流就别再撞了。
+        # 干跑也算——干跑虽然不发评论，但照样发搜索请求，
+        # 账号被限流的时候连搜索都可能加重风控。
+        left = self.risk_cooldown_left()
+        if left > 0:
+            msg = (f"账号疑似被限流（软风控），冷却中，还剩 {left} 分钟。"
+                   f"先别跑，等风控过去再说")
+            self._append_log(f"🛑 {msg}")
+            return {"ok": False, "error": msg, "total": 0,
+                    "sent": 0, "failed": 0, "skipped": 0}
 
         self._running = True
         self._logs = []
