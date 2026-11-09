@@ -5,6 +5,37 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.12] - 2026-11-09
+
+### Fixed
+- **飞书表里 38 条线索的「触达状态」是脏数据，把真客户挡在触达队列外**（真 bug）：
+  22 条显示「已留言」、8 条「已跳过」、7 条「失败」、1 条「已定位」，
+  而本地 `outreach_records` 一条执行记录都没有、抖音 profile 只有匿名 `ttwid`、
+  config 里 0 个 sessionid——**从未登录过抖音，从未真正发出过一条评论**。
+  查飞书记录的变更历史（`lark-cli base +record-history-list`）确认：
+  这些状态是 11-08~11-09 调试双向同步时用 lark-cli 手动写进去的**测试残留**，
+  之后被回拉机制同步回了本地。后果是 22 个真实客户在飞书表里显示「已留言」，
+  销售以为联系过了不再跟进，同时这些线索被排除在自动触达队列之外。
+  已把两端都改回「待触达」：飞书 38 条 + 本地 38 条（本地现为 239 条全 pending）
+- **`+record-batch-update` 用中文字段名会静默失败**：返回 `ok`、rev 也涨，
+  但值根本没变、变更历史里也不留痕迹。必须用字段 ID（`fldXXXX`）。
+  本项目的写入路径没踩这个坑（HTTP 后端走 v1 `PATCH records/{id}` 接受中文名，
+  lark-cli 后端走 `+record-upsert` 中文名有效），但手工改表时会踩
+
+### Added
+- **状态回拉增加「无执行证据」告警**：飞书端标了「已留言/已定位」、
+  但本地 `outreach_records` 里查不到任何执行痕迹时，记 warning 日志并在返回值的
+  `suspect` 里计数。不自动推翻销售的标记（销售手工跟进后标「已留言」是合法的），
+  但下次再出现同类污染会留下痕迹，而不是静默把线索误判成已触达
+- **`scripts/reset_outreach_status.py`**：批量把触达状态重置回「待触达」，
+  飞书和本地一起改（只改一边会被下一轮回拉同步带回来）。
+  字段 ID 动态查，不硬编码；默认只预览，加 `--apply` 才写
+
+### Testing
+- 测试 196 → 199（新增 3 条可疑状态判定用例）
+
+---
+
 ## [2.0.11] - 2026-11-09
 
 ### Added
