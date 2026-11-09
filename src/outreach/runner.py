@@ -157,6 +157,37 @@ class OutreachRunner:
             self._append_log(f"✅ 已留言：{event.get('text', '')[:40]}")
 
     # ================================================================
+    # 扫码登录
+    # ================================================================
+
+    async def login(self, timeout: int = 300) -> dict:
+        """打开触达专用浏览器，等用户扫码登录
+
+        抖音的搜索和发评论都要求登录态（cookie 里有 sessionid）。
+        这里用专用 profile 扫码一次，长期复用——
+        把别处的 cookie 搬过来很容易被判「环境异常」。
+        """
+        from .login import login as _login
+
+        o = self.config.outreach
+        profile = self._profile_dir()
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(
+            None,
+            lambda: _login(profile, log=self._append_log, timeout=timeout,
+                           headless=False),
+        )
+
+    def _profile_dir(self) -> str:
+        """触达专用浏览器 profile 目录"""
+        import pathlib
+
+        p = pathlib.Path(self.config.outreach.profile_dir or "data/outreach_profile")
+        if not p.is_absolute():
+            p = pathlib.Path.cwd() / p
+        return str(p)
+
+    # ================================================================
     # 查询接口（给页面用）
     # ================================================================
 

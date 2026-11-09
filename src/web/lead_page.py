@@ -368,6 +368,35 @@ def create_lead_page():
         ui.notify(msg, type="positive")
         await _do_query()
 
+    async def _do_login():
+        """扫码登录触达专用浏览器
+
+        抖音的搜索和发评论都要求登录态（cookie 里有 sessionid）。
+        点一下会弹出浏览器窗口，扫码后自动检测到。
+        """
+        from ..outreach.runner import get_outreach_runner
+
+        runner = get_outreach_runner()
+        outreach_status.text = "正在打开浏览器，请在弹出的窗口里扫码登录…"
+        outreach_log.clear()
+        try:
+            result = await runner.login(timeout=300)
+        except Exception as e:
+            log.error(f"扫码登录失败: {e}", exc_info=True)
+            outreach_status.text = f"登录失败：{e}"
+            ui.notify(f"登录失败：{e}", type="negative")
+            return
+
+        for line in runner.recent_logs():
+            outreach_log.push(line)
+
+        if result.get("ok"):
+            outreach_status.text = "登录成功，可以开始触达了"
+            ui.notify("登录成功", type="positive")
+        else:
+            outreach_status.text = result.get("message") or "登录未完成"
+            ui.notify(outreach_status.text, type="warning")
+
     async def _do_outreach():
         """跑一轮触达任务
 
@@ -597,6 +626,9 @@ def create_lead_page():
 
                     ui.button("开始触达", on_click=_do_outreach).classes("col-6 col-sm-2").props(
                         "unelevated icon=play_arrow"
+                    )
+                    ui.button("扫码登录", on_click=_do_login).classes("col-6 col-sm-2").props(
+                        "flat dense icon=qr_code_scanner"
                     )
                     ui.button("刷新队列", on_click=_refresh_outreach_info).classes("col-6 col-sm-2").props(
                         "flat dense icon=refresh"
