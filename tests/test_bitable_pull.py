@@ -19,14 +19,11 @@ class _FakeDB:
 
     真实调用是 ``db._db.execute(...)``（aiosqlite 连接），
     所以这里让 ``self._db`` 指向一个带 execute 的对象。
-
-    ``touched`` 是「有过触达执行记录」的 lead_id 集合，
-    对应 outreach_records 里出现过的 lead_id。
     """
 
-    def __init__(self, rows, touched=()):
+    def __init__(self, rows):
         self.updates: list[tuple[int, dict]] = []
-        self._db = _FakeConn(rows, touched)
+        self._db = _FakeConn(rows)
 
     async def update_lead(self, lead_id, **fields):
         self.updates.append((lead_id, fields))
@@ -34,14 +31,10 @@ class _FakeDB:
 
 
 class _FakeConn:
-    def __init__(self, rows, touched=()):
+    def __init__(self, rows):
         self._rows = rows
-        self._touched = list(touched)
 
     async def execute(self, sql, params=None):
-        # 有触达执行痕迹的 lead_id（SELECT DISTINCT lead_id FROM outreach_records）
-        if "outreach_records" in sql:
-            return _Cursor([(lid,) for lid in self._touched])
         return _Cursor(self._rows)
 
 
@@ -211,44 +204,3 @@ def test_pull_backfills_only_empty_field(fake_writer):
     _rid, patch = fake_writer["patched"][0]
     assert "处理状态" in patch
     assert "触达状态" not in patch
-
-
-def test_pull_flags_suspect_when_no_touch_record(fake_writer):
-    """飞书标了「已留言」但本地没有触达执行记录 → 要告警
-
-    这种状态没有任何执行证据支撑：可能是销售手工跟进后标的（正常），
-    也可能是调试残留写进去的脏数据（会让线索被误判为已触达而漏掉）。
-    不自动推翻销售的标记，但必须计数并留日志。
-    """
-    fake_writer["map"] = {"abc123": {"处理状态": "待处理", "触达状态": "已留言"}}
-    db = _FakeDB([_row(1, "abc123", synced="待处理|待触达")], touched=[])
-
-    result = asyncio.run(pull_bitable_status(db=db, config=_FakeConfig()))
-
-    assert result["suspect"] == 1
-    # 状态仍然照常回拉（不能因为可疑就丢掉销售的标记）
-    assert result["updated"] == 1
-    assert db.updates[0][1]["outreach_status"] == "commented"
-
-
-def test_pull_no_suspect_when_touch_record_exists(fake_writer):
-    """本地有触达执行记录 → 不是可疑状态，不告警"""
-    fake_writer["map"] = {"abc123": {"处理状态": "待处理", "触达状态": "已留言"}}
-    db = _FakeDB([_row(1, "abc123", synced="待处理|待触达")], touched=[1])
-
-    result = asyncio.run(pull_bitable_status(db=db, config=_FakeConfig()))
-
-    assert result["suspect"] == 0
-
-
-def test_pull_plain_status_is_not_suspect(fake_writer):
-    """「已跳过」「失败」这类状态不参与可疑判定
-
-    只有「已留言」「已定位」才代表"真的触达过"，才有执行痕迹可查。
-    """
-    fake_writer["map"] = {"abc123": {"处理状态": "待处理", "触达状态": "已跳过"}}
-    db = _FakeDB([_row(1, "abc123", synced="待处理|待触达")], touched=[])
-
-    result = asyncio.run(pull_bitable_status(db=db, config=_FakeConfig()))
-
-    assert result["suspect"] == 0

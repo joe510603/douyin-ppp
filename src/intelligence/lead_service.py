@@ -449,7 +449,7 @@ async def pull_bitable_status(db=None, config=None) -> dict:
     避免本地运营刚改完就被飞书端的旧值冲掉。
 
     Returns:
-        {"pulled": n, "updated": n, "skipped": n, "suspect": n, "error": str}
+        {"pulled": n, "updated": n, "skipped": n, "error": str}
     """
     result = {"pulled": 0, "updated": 0, "skipped": 0, "error": ""}
 
@@ -492,20 +492,8 @@ async def pull_bitable_status(db=None, config=None) -> dict:
 
     from ..notify.bitable import STATUS_LABELS, OUTREACH_LABELS
 
-    # 有过触达执行痕迹的线索（outreach_records 里有行）
-    # 用来判断飞书端的「已留言/已定位」背后到底有没有真的执行过
-    touched_ids: set[int] = set()
-    try:
-        cur = await db._db.execute(
-            "SELECT DISTINCT lead_id FROM outreach_records WHERE lead_id IS NOT NULL"
-        )
-        touched_ids = {row[0] for row in await cur.fetchall()}
-    except Exception:
-        pass
-
     updated = 0
     skipped = 0
-    suspect = 0
     for row in rows:
         r = dict(row)
         remote = status_map.get(r.get("display_id") or "")
@@ -551,19 +539,6 @@ async def pull_bitable_status(db=None, config=None) -> dict:
         if new_outreach and new_outreach != r.get("outreach_status"):
             updates["outreach_status"] = new_outreach
 
-        # 飞书端说「已留言/已定位」，但本地 outreach_records 里找不到任何执行痕迹
-        # → 这个状态没有任何执行证据支撑。
-        # 可能是销售手工跟进后标的（正常），也可能是调试/测试残留写进去的脏数据
-        # （会导致线索被误判为已触达而漏掉）。这里不自动推翻销售的标记，
-        # 但必须留一条告警，避免下次又静默污染整张表。
-        if new_outreach in ("commented", "found") and r["id"] not in touched_ids:
-            suspect += 1
-            log.warning(
-                f"[多维表格] 线索 {r.get('display_id') or r['id']} 在飞书被标为「{remote_os}」，"
-                f"但本地没有任何触达执行记录（无 outreach_records）——"
-                f"若是测试残留请手动改回「待触达」，否则该线索会被排除出触达队列"
-            )
-
         if not updates:
             skipped += 1
             continue
@@ -578,11 +553,8 @@ async def pull_bitable_status(db=None, config=None) -> dict:
 
     result["updated"] = updated
     result["skipped"] = skipped
-    result["suspect"] = suspect
     if updated:
         log.info(f"[多维表格] 回拉状态：{updated} 条已更新，{skipped} 条跳过")
-    if suspect:
-        log.warning(f"[多维表格] 有 {suspect} 条飞书触达状态缺少本地执行记录，请核对")
     return result
 
 
