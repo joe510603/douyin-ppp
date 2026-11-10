@@ -16,6 +16,7 @@ NAV_ITEMS = [
     {"key": "wordcloud", "label": "词云分析", "icon": "cloud", "path": "/wordcloud"},
     {"key": "data", "label": "数据导出", "icon": "analytics", "path": "/data"},
     {"key": "leads", "label": "线索中心", "icon": "person_search", "path": "/leads"},
+    {"key": "outreach", "label": "抖音触达", "icon": "send_to_mobile", "path": "/outreach"},
     {"key": "service", "label": "服务管理", "icon": "settings_applications", "path": "/service"},
     {"key": "config", "label": "配置管理", "icon": "settings", "path": "/config"},
     {"key": "logs", "label": "日志", "icon": "article", "path": "/logs"},

@@ -32,6 +32,7 @@ from src.web.monitor_page import create_monitor_page
 from src.web.danmaku_page import create_danmaku_page, push_danmaku
 from src.web.data_page import create_data_page
 from src.web.lead_page import create_lead_page
+from src.web.outreach_page import create_outreach_page
 from src.web.config_page import create_config_page
 from src.web.log_page import create_log_page
 from src.web.video_scrape_page import create_video_scrape_page
@@ -586,6 +587,14 @@ def leads_page():
     create_app_header(active_page="leads")
 
     create_lead_page()
+
+
+@ui.page("/outreach")
+def outreach_page():
+    """抖音触达控制台 — 搜抖音号 + 作品留言"""
+    create_app_header(active_page="outreach")
+
+    create_outreach_page()
 
 
 @ui.page("/config")

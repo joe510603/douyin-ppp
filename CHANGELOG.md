@@ -5,6 +5,27 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.17] - 2026-11-10
+
+### Fixed
+- **「抖音触达队列」根本找不到**（用户反馈「没看到网页抖音触达队列」）：
+  它一直是线索中心页面**底部**的一个展开面板（`ui.expansion`），
+  而线索表格又高又长（判定依据那列会换行，一屏放不下几行），
+  面板被压在四屏开外——「开始触达」按钮也就没地方点。
+  现在它是**顶部导航里的独立入口**「抖音触达」（`/outreach`），
+  进来第一眼就是状态行、按钮、话术预览和控制台；
+  线索中心底部保留一个「打开触达控制台」按钮做二次入口。
+
+### Changed
+- 触达面板从 `src/web/lead_page.py` 抽到新文件 `src/web/outreach_page.py`，
+  逻辑一行没改，只是换了位置（`ui.expansion` → 普通容器）
+- 顶部导航新增「抖音触达」项（`src/web/layout.py`）
+
+### Testing
+- 测试 222（无新增，用浏览器实测了页面渲染与跳转）
+
+---
+
 ## [2.0.16] - 2026-11-11
 
 ### Fixed
