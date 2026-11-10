@@ -206,8 +206,13 @@ class ScoreResult:
 class RuleScorer:
     """规则购车意向打分器"""
 
-    def __init__(self, min_level: str = "low"):
+    def __init__(self, min_level: str = "low", exclude_aftersale: bool = True):
         self.min_level = min_level
+        # 售后语境排除开关。
+        # 关掉它就等于回到 v2.0.14 之前的口径——
+        # 给「重打分」脚本用：只有开关前后结果不同的线索才是规则变更影响的，
+        # 不会把「判定口径不同」误当成「规则变更」。
+        self.exclude_aftersale = exclude_aftersale
 
     def score(self, text: str, nickname: str = "", self_names: Optional[set] = None) -> ScoreResult:
         """
@@ -256,7 +261,11 @@ class RuleScorer:
             # 语境排除：信号命中了，但整句落在不该算这个信号的语境里
             # （例：问「修车多少钱」不算购车「价格询问」）
             ctx_re = _SIGNAL_CONTEXT_EXCLUDE.get(name)
-            if ctx_re is not None and ctx_re.search(content):
+            if (
+                ctx_re is not None
+                and self.exclude_aftersale
+                and ctx_re.search(content)
+            ):
                 continue
             score += weight
             signals.append(name)

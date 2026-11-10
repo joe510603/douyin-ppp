@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.15] - 2026-11-10
+
+### Added
+- **`scripts/rescore_leads.py`**：按新规则重打分线索。
+  只更新**新旧规则结果不同**的那些——
+  库里有些线索新旧分数不一致是因为「实时链路」和「回溯扫描」判定口径本来不同
+  （单条弹幕打分 vs 多条取最高），不是规则变了。
+  脚本用两个打分器对比（`exclude_aftersale` 开/关）来精确锁定受规则变更影响的线索。
+  实测 240 条里只有 1 条受影响（问修车多少钱那条），已重打分并同步到飞书表
+
+### Changed
+- `RuleScorer` 新增 `exclude_aftersale` 参数（默认 True）。
+  关掉它等于回到 v2.0.14 之前的口径，给重打分脚本做对比用
+
+---
+
 ## [2.0.14] - 2026-11-09
 
 ### Fixed
