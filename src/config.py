@@ -162,6 +162,15 @@ class NotifyConfig(BaseModel):
     # 推送后是否把线索标记为「已推送」
     mark_pushed: bool = True
 
+    # ---- 飞书私聊通知（给人发，不是往群里推）----
+    # 用途：触达撞上验证码/风控时立刻叫人。
+    # 走 lark-cli 的 bot 身份给你发私聊，手机飞书也能收到推送。
+    lark_im_enabled: bool = False
+    # 收信人的 open_id（lark-cli auth status 里能看到）
+    lark_im_open_id: str = ""
+    # 用哪个身份发：bot=应用给你发（推荐），user=你自己的账号发
+    lark_im_identity: str = "bot"
+
     # ---- 多维表格（线索表）----
     bitable_enabled: bool = False
     bitable_app_id: str = ""       # 企业自建应用 App ID
@@ -247,6 +256,16 @@ class OutreachConfig(BaseModel):
     silent_block_threshold: int = 2
     # 命中风控后冷却多少分钟内不允许再启动触达（避免继续撞风控把号搞废）
     risk_cooldown_minutes: int = 120
+
+    # ---- 验证码：停下来叫人 ----
+    # 撞到验证码（短信/拖拽图形）时，触达会：
+    #   1. 飞书私聊通知你
+    #   2. 把浏览器窗口挪到屏幕中间（默认开，不然窗口在屏幕外你根本看不到验证码）
+    #   3. 暂停等你手动验证
+    # 你在网页上点「我验证好了，继续」就接着跑；
+    # 等超过下面的分钟数没人管，就当放弃、结束本轮。
+    captcha_wait_minutes: int = 15
+    captcha_bring_to_front: bool = True
 
     # ---- 留言文案 ----
     # 话术库路径（留空用 src/outreach/templates.yaml）

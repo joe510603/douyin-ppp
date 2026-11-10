@@ -5,6 +5,63 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.18] - 2026-11-10
+
+### Added
+- **撞验证码时飞书私聊通知 + 暂停等人工验证**（用户反馈「我刚才发现会遇到验证码，短信或者拖拽图形，
+  遇到这种情况要给我发消息，可以飞书给我发，暂停然后让我来验证」）。
+  抖音的验证码只能人工过，原来撞上只是记条日志然后结束本轮——
+  人不在电脑前就等于这轮白跑，而且完全不知道发生了什么。
+  现在的流程：
+  1. 检测到验证码（`RiskControl`）
+  2. 浏览器窗口自动挪回**屏幕中间并置前**（不叫回来根本看不见验证码）
+  3. **飞书私聊通知**（手机也有推送，走 lark-cli bot 身份，不用群机器人 webhook）
+  4. 触达**暂停**，网页上出现橙色等待条 +「我验证好了，继续」按钮
+  5. 验证完点一下，这条线索退回「待触达」重新排队，本轮接着跑
+  6. 超过 `captcha_wait_minutes`（默认 15 分钟）没人管就结束本轮
+
+  新增 `src/notify/lark_im.py`（`LarkIMNotifier`），
+  配置项 `notify.lark_im_enabled` / `lark_im_open_id` / `lark_im_identity`、
+  `outreach.captcha_wait_minutes` / `captcha_bring_to_front`。
+
+- **验证码 ≠ 账号限流，两者分开处理**（`OutreachWorker._is_captcha`）：
+  - 验证码（安全验证页 / 验证码控件 / 「请完成安全验证」）→ 叫人、停下等人验证
+  - 限流（「操作频繁」「访问频繁」「账号存在异常」「环境异常」）→ **直接停**，
+    硬刚只会把号搞废，等人来处理没有意义
+
+- 网页触达控制台新增等待验证提示条 +「我验证好了，继续」按钮，
+  以及 `等验证` / `已继续` / `验证超时` 三个事件标签。
+
+### Fixed
+- **触达窗口其实一直挡在屏幕左上角**：「窗口藏到屏幕外」这件事以前是**假的**。
+  `--window-position=-3200,-3200` 这个启动参数在 macOS 上会被持久化 profile 的
+  「记住上次窗口位置」直接覆盖——实测「屏幕外」和「不屏幕外」的窗口位置只差 22 像素。
+  改用 Chromium 调试协议 `Browser.setWindowBounds` 挪窗口，实测有效：
+  藏起来 `left=-1160`（完全在屏幕外），叫回来 `left=120, top=80`。
+
+- **浏览器启动会抢走前台焦点**（比「窗口挡屏」更阴的坑）。
+  窗口挪到屏幕外**不等于**不影响你：浏览器一启动，macOS 就把前台应用换成它了，
+  用户切回自己的窗口继续干活，看起来一切正常，
+  但**键盘输入全进了那个看不见的浏览器**——在文档里打的字一个字都存不下来。
+  现在：启动前记住前台是谁，窗口藏好之后把焦点原样还回去。
+
+- 「叫回屏幕中央」只挪位置不够——窗口可能压在别的窗口底下，用户还是会以为没叫回来。
+  现在同时做三件事：`setWindowBounds` 挪位置 + `Page.bringToFront` 激活标签页 +
+  osascript `activate` 把 app 叫到前台。
+
+- `int(0.2)` = 0 导致「等 0 分钟」变成「不等」——等待时长改用 float。
+
+### Docs
+- 新增 `docs/触达窗口与验证码.md`：
+  窗口藏起/叫回的原理、验证码 vs 限流的区别、配置项、已知限制（锁屏休眠会挂起 Chrome）。
+
+### Testing
+- 测试 233（+11：验证码识别 2 / 暂停恢复 4 / 通知 2 / 窗口 3）
+- 新增 `scripts/check_window_offscreen.py`：真实浏览器实测
+  「藏得起来 / 不抢焦点 / 叫得回来 / 叫回来能操作」，5 项全过
+
+---
+
 ## [2.0.17] - 2026-11-10
 
 ### Fixed

@@ -127,6 +127,7 @@ class OutreachWorker:
         db_path: str | pathlib.Path,
         log: Optional[Callable[[str], None]] = None,
         on_event: Optional[Callable[[dict], None]] = None,
+        resume_event: Optional[threading.Event] = None,
     ):
         self.cfg = cfg
         self.log = log or (lambda m: print(m))
@@ -138,6 +139,11 @@ class OutreachWorker:
         self._dry = True
         # 连续「发出去但回查不到」的次数（软风控信号）
         self._silent_blocks = 0
+        # 撞验证码时用它跟主线程同步「人工验证完了，继续」
+        # （worker 在专用线程里跑，主进程是 asyncio，跨不过去，只能靠 Event）
+        self.resume_event = resume_event
+        # 正在等人工验证
+        self.waiting_human = False
 
     # ================================================================
     # 配置适配
@@ -166,6 +172,128 @@ class OutreachWorker:
             self.on_event(kw)
         except Exception:
             pass
+
+    # ================================================================
+    # 撞验证码：叫人 + 停下等
+    # ================================================================
+
+    @staticmethod
+    def _is_captcha(reason: str) -> bool:
+        """这次风控是「要人工验证」还是「账号被限流」
+
+        两者的处理完全不同：
+        - 验证码（短信/拖拽图形）：平台要你证明你是人 → 叫人、停下等他验证
+        - 限流（操作频繁/环境异常）：平台不给过了 → 硬刚只会把号搞废，直接停
+
+        ``douyin_api.check_risk`` 抛的异常文本里带上了来源，这里按关键词分。
+        """
+        r = str(reason or "").lower()
+        return any(h in r for h in ("验证码", "安全验证", "captcha", "verify"))
+
+    def _notify_captcha(self, reason: str, lead: Optional[dict] = None) -> bool:
+        """撞到验证码 → 飞书私聊通知你
+
+        验证码需要人工过，人又多半不在电脑前，
+        所以必须主动推一条消息过去（飞书手机端有推送）。
+        """
+        n = self.cfg.notify
+        if not getattr(n, "lark_im_enabled", False):
+            self.log("  （没开飞书私聊通知，只在页面上提示）")
+            return False
+        try:
+            from ..notify.lark_im import get_im_notifier
+
+            notifier = get_im_notifier(self.cfg)
+        except Exception as e:
+            self.log(f"  （通知器初始化失败：{e}）")
+            return False
+        if not notifier.is_configured:
+            self.log("  （没配 lark_im_open_id，发不出去）")
+            return False
+
+        who = ""
+        if lead:
+            who = f"抖音号 {lead.get('display_id') or ''}"
+        text = (
+            "⚠️ 抖音触达撞上验证码，已暂停等你验证\n\n"
+            f"原因：{reason}\n"
+            + (f"卡在：{who}\n" if who else "")
+            + "\n处理办法：\n"
+            "1. 浏览器窗口已经挪到屏幕中间（如果你没看到，去窗口栏找抖音）\n"
+            "2. 在那个窗口里把短信/拖拽图形验证过掉\n"
+            "3. 回到网页「抖音触达」点「我验证好了，继续」，触达会接着跑\n\n"
+            f"（{int(getattr(self.cfg.outreach, 'captcha_wait_minutes', 15) or 15)} 分钟内没人管就结束本轮）"
+        )
+        try:
+            ok, err = _run_coro_blocking(notifier.send_text(text), timeout=30)
+        except Exception as e:
+            self.log(f"  （飞书通知失败：{e}）")
+            return False
+        if ok:
+            self.log("  📱 已飞书私聊通知你")
+        else:
+            self.log(f"  （飞书通知失败：{err}）")
+        return ok
+
+    def _bring_window_back(self) -> bool:
+        """把浏览器窗口挪到屏幕中间并置前
+
+        平时窗口摆在屏幕外（--window-position=-3200,-3200），
+        撞验证码时你根本看不见那个验证码长什么样。
+        """
+        if not getattr(self.cfg.outreach, "captcha_bring_to_front", True):
+            return False
+        page = getattr(self, "_page", None)
+        if page is None:
+            return False
+        try:
+            from .browser import Session, bring_to_front
+
+            ok = bring_to_front(page.context, page, Session.app_name())
+            if ok:
+                self.log("  🪟 浏览器窗口已挪到屏幕中间")
+            return ok
+        except Exception as e:
+            self.log(f"  （窗口挪不动：{e}）")
+            return False
+
+    def _wait_for_human(self, reason: str) -> bool:
+        """暂停等人工验证
+
+        返回 True = 人工验证完了，可以接着跑；
+        返回 False = 没人管（超时），结束本轮。
+
+        实现上是个跨线程的 Event：worker 在专用线程里等，
+        网页上点「我验证好了，继续」时主进程 set()，这边就醒过来。
+        """
+        ev = self.resume_event
+        if ev is None:
+            return False
+        # 用 float：0.2 分钟（12 秒）这种小值也得能用，
+        # int(0.2) 会变成 0，直接变成「不」。
+        minutes = float(getattr(self.cfg.outreach, "captcha_wait_minutes", 15) or 0)
+        if minutes <= 0:
+            return False
+        deadline = time.time() + minutes * 60
+        ev.clear()
+        self.waiting_human = True
+        self._emit(type="captcha_wait", error=reason, minutes=minutes)
+        self.log(f"⏸ 已暂停，等你手动验证（最多等 {minutes} 分钟）")
+        try:
+            while time.time() < deadline:
+                if ev.wait(timeout=1.0):
+                    self.waiting_human = False
+                    self._emit(type="captcha_resumed")
+                    self.log("▶ 收到「继续」信号，接着跑")
+                    return True
+                # 等的过程中页面可能被用户刷新了/验证过了，
+                # 这里不动页面，只等信号——避免和用户抢鼠标。
+            self.waiting_human = False
+            self._emit(type="captcha_timeout")
+            self.log(f"⏸ 等待超时（{minutes} 分钟没人管），结束本轮")
+            return False
+        finally:
+            self.waiting_human = False
 
     def _recycle_page(self) -> None:
         """把当前页清空，释放视频解码占的内存"""
@@ -386,9 +514,25 @@ class OutreachWorker:
                     except RiskControl as e:
                         self.stop_reason = f"触发风控：{e}"
                         self.log(f"🛑 {self.stop_reason}，立即停止")
-                        self._set_status(lead, STATUS_FAILED, str(e))
-                        summary["failed"] += 1
                         self._emit(type="risk", lead=lead, error=str(e))
+
+                        # 验证码要人工过：叫人 + 把窗口叫回来 + 停下等他。
+                        # 注意这跟「账号被限流」是两回事：
+                        # 限流是平台不给过了，验证码是平台要你证明你是人。
+                        if self._is_captcha(str(e)):
+                            self._bring_window_back()
+                            self._notify_captcha(str(e), lead)
+                            if self._wait_for_human(str(e)):
+                                # 人工验证完了：这条线索退回待触达，重新来
+                                self._set_status(lead, STATUS_PENDING, "验证码已人工处理，重新排队")
+                                self.stop_reason = ""
+                                self.log("↩ 继续处理队列")
+                                continue
+                            self.stop_reason = f"验证码未人工处理：{e}"
+                        else:
+                            # 限流之类：这条线索算失败
+                            self._set_status(lead, STATUS_FAILED, str(e))
+                            summary["failed"] += 1
                         break
                     except NotLoggedIn as e:
                         self.stop_reason = f"登录失效：{e}"

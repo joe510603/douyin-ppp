@@ -50,6 +50,12 @@ class OutreachRunner:
         # 本轮进度：总数 / 已处理 / 当前在处理第几条
         self._progress: dict = {}
         self._lock = threading.Lock()
+        # 撞验证码时 worker 会停下等人工验证。
+        # 网页上点「我验证好了，继续」→ resume() → worker 那边醒过来接着跑。
+        self._resume = threading.Event()
+        self._resume.set()          # 初始状态 = 不需要等
+        self._waiting_human = False
+        self._captcha_reason = ""
 
     @property
     def is_running(self) -> bool:
@@ -58,6 +64,33 @@ class OutreachRunner:
     @property
     def last_result(self) -> dict:
         return dict(self._last_result)
+
+    # ================================================================
+    # 撞验证码：等人工验证
+    # ================================================================
+
+    @property
+    def waiting_human(self) -> bool:
+        """当前是不是在等人工验证"""
+        return self._waiting_human
+
+    def resume(self) -> bool:
+        """人工验证完了，继续跑
+
+        网页上那个「我验证好了，继续」按钮调它。
+        """
+        if not self._waiting_human:
+            return False
+        self._append_log("▶ 收到人工验证完成信号，继续触达")
+        self._waiting_human = False
+        self._captcha_reason = ""
+        self._resume.set()
+        return True
+
+    def _mark_waiting_human(self, reason: str) -> None:
+        self._waiting_human = True
+        self._captcha_reason = reason
+        self._resume.clear()
 
     def recent_logs(self, limit: int = 200) -> list[str]:
         with self._lock:
@@ -74,6 +107,8 @@ class OutreachRunner:
             p = dict(self._progress)
         p["running"] = self._running
         p["cooldown"] = self.risk_cooldown_left()
+        p["waiting_human"] = self._waiting_human
+        p["captcha_reason"] = self._captcha_reason
         return p
 
     def _append_log(self, msg: str) -> None:
@@ -191,6 +226,9 @@ class OutreachRunner:
                       "sent": 0, "failed": 0, "skipped": 0}
         finally:
             self._running = False
+            self._waiting_human = False
+            self._captcha_reason = ""
+            self._resume.set()
 
         self._last_result = result
         summary = (
@@ -211,6 +249,7 @@ class OutreachRunner:
             self._db_path(),
             log=self._append_log,
             on_event=self._on_event,
+            resume_event=self._resume,
         )
         try:
             return worker.run(limit=limit, dry_run=dry_run, only=only)
@@ -268,6 +307,19 @@ class OutreachRunner:
             self._append_log(f"🛑 风控：{event.get('error')}")
         elif t == "sent":
             self._append_log(f"✅ 已留言：{event.get('text', '')[:40]}")
+        elif t == "captcha_wait":
+            self._mark_waiting_human(str(event.get("error") or ""))
+            self._append_log(
+                "⏸ 撞上验证码，已暂停等你人工验证"
+                f"（最多 {event.get('minutes') or 15} 分钟）"
+            )
+        elif t == "captcha_resumed":
+            self._waiting_human = False
+            self._captcha_reason = ""
+        elif t == "captcha_timeout":
+            self._waiting_human = False
+            self._captcha_reason = ""
+            self._append_log("⏸ 等验证码超时，结束本轮")
 
     # ================================================================
     # 扫码登录

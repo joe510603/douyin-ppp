@@ -66,6 +66,16 @@ async def _confirm_send(limit: int) -> bool:
 def create_outreach_page():
     """创建抖音触达控制台页面"""
 
+    async def _do_resume():
+        """人工验证完了，让触达接着跑"""
+        from ..outreach.runner import get_outreach_runner
+
+        runner = get_outreach_runner()
+        if runner.resume():
+            ui.notify("已继续", type="positive")
+        else:
+            ui.notify("现在没有在等验证", type="warning")
+
     async def _do_login():
         """扫码登录触达专用浏览器
 
@@ -228,6 +238,19 @@ def create_outreach_page():
                 ):
                     console_state = ui.label("空闲").classes("text-caption text-grey-8")
 
+                    # ---- 撞验证码时的等待条 ----
+                    # 撞上验证码 → 飞书通知你 + 浏览器窗口挪到屏幕中间 → 停在这儿等你
+                    with ui.element("div").classes("w-full q-mt-sm q-pa-md").style(
+                        "background:#fff4e5; border:1px solid #f0a04b; border-radius:8px;"
+                    ) as captcha_box:
+                        captcha_box.set_visibility(False)
+                        with ui.row().classes("w-full items-center q-gutter-sm"):
+                            captcha_text = ui.label("").classes("col")
+                            ui.space()
+                            ui.button("我验证好了，继续", on_click=_do_resume).props(
+                                "unelevated color=warning"
+                            )
+
                     console_bar = ui.linear_progress(value=0, show_value=False).classes("w-full")
 
                     console_log = ui.log(max_lines=400).classes("w-full")
@@ -253,6 +276,8 @@ def create_outreach_page():
                     "start": "开始", "current": "处理中", "sent": "已留言",
                     "dry": "干跑", "failed": "失败", "skipped": "跳过",
                     "unshown": "已提交未展示", "risk": "风控", "need_login": "要登录",
+                    "captcha_wait": "等验证", "captcha_resumed": "已继续",
+                    "captcha_timeout": "验证超时",
                 }
 
                 def _console_tick():
@@ -288,6 +313,8 @@ def create_outreach_page():
                             bits.append(f"模式 {mode}")
                     if cooldown:
                         bits.append(f"🛑 风控冷却剩 {cooldown} 分钟")
+                    if p.get("waiting_human"):
+                        bits.append("⏸ 等你人工验证")
                     if p.get("sent"):
                         bits.append(f"已留言 {p['sent']}")
                     if p.get("dry"):
@@ -297,6 +324,17 @@ def create_outreach_page():
                     if p.get("skipped"):
                         bits.append(f"跳过 {p['skipped']}")
                     console_state.text = "　｜　".join(bits)
+
+                    # 撞验证码时的等待条：显示/隐藏 + 文案
+                    waiting = bool(p.get("waiting_human"))
+                    captcha_box.set_visibility(waiting)
+                    if waiting:
+                        reason = p.get("captcha_reason") or ""
+                        captcha_text.text = (
+                            f"⏸ 撞上验证码，已暂停等你人工验证。{reason}\n"
+                            "浏览器窗口已挪到屏幕中间——把短信/拖拽图形验证过掉，"
+                            "然后点右边「我验证好了，继续」。"
+                        )
 
                     console_bar.value = min(1.0, done / total) if total else 0
 
