@@ -22,9 +22,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import pathlib
 import random
+import threading
 import time
 from typing import Callable, Optional
 
@@ -85,9 +87,40 @@ def lead_to_copywriter_input(lead: dict) -> dict:
     }
 
 
+def _run_coro_blocking(coro, timeout: float = 60.0):
+    """在当前线程同步地等一个 coroutine 的结果
+
+    为什么不能直接 asyncio.run
+    --------------------------
+    触达跑在 **Playwright sync API** 的线程里，而 Playwright sync API
+    会在这个线程里装一个自己的 running event loop。
+    在这个线程里调 asyncio.run() 会直接抛
+    ``RuntimeError: asyncio.run() cannot be called from a running event loop``，
+    那个 coroutine 从未被 await —— 飞书状态回写就这么静默失败了，
+    还只留下一条 RuntimeWarning。
+
+    换一条干净的线程就没有这个问题：coroutine 本身不绑定线程，绑的是 loop。
+    """
+    box: dict = {}
+
+    def _runner():
+        try:
+            box["ok"] = asyncio.run(coro)
+        except BaseException as e:  # noqa: BLE001 — 异常要带回主线程
+            box["err"] = e
+
+    t = threading.Thread(target=_runner, daemon=True)
+    t.start()
+    t.join(timeout)
+    if t.is_alive():
+        raise TimeoutError(f"飞书状态回写超时（{timeout}s）")
+    if "err" in box:
+        raise box["err"]
+    return box.get("ok")
+
+
 class OutreachWorker:
     """触达任务执行器（同步，跑在专用线程）"""
-
     def __init__(
         self,
         cfg,
@@ -226,9 +259,10 @@ class OutreachWorker:
         if not writer.is_configured:
             return
         text = FEISHU_STATUS.get(status, status)
-        import asyncio
-
-        asyncio.run(writer.patch_fields(record_id, {"触达状态": text}))
+        _run_coro_blocking(
+            writer.patch_fields(record_id, {"触达状态": text}),
+            timeout=90,
+        )
 
     # ================================================================
     # 主流程

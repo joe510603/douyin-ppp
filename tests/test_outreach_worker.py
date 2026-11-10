@@ -225,3 +225,56 @@ def test_no_cooldown_when_recent_run_is_normal(tmp_path, monkeypatch):
     monkeypatch.setattr(r, "_db_path", lambda: db)
 
     assert r.risk_cooldown_left() == 0
+
+
+def test_push_feishu_status_actually_awaits(tmp_path, monkeypatch):
+    """飞书状态回写必须真的执行，不能静默失败
+
+    触达跑在 Playwright sync API 的线程里，而 Playwright sync API
+    会在这个线程里装一个自己的 running event loop——
+    在这个线程里调 asyncio.run() 会抛
+    "asyncio.run() cannot be called from a running event loop"，
+    coroutine 从未被 await，飞书状态就永远同步不过去。
+
+    这条测试用 asyncio.run 包一层来复现那个环境：
+    修复前会失败，修复后通过。
+    """
+    import asyncio as _asyncio
+
+    from src.outreach.worker import OutreachWorker
+
+    called: dict = {}
+
+    class _FakeWriter:
+        is_configured = True
+
+        async def patch_fields(self, record_id, fields):
+            called["record_id"] = record_id
+            called["fields"] = fields
+            return True, ""
+
+    monkeypatch.setattr(
+        "src.notify.bitable.get_bitable_writer", lambda cfg=None: _FakeWriter()
+    )
+
+    db = _make_db(tmp_path)
+    w = OutreachWorker(get_config(), db, log=lambda m: None)
+
+    async def _main():
+        # 当前线程已有 running loop —— 模拟 Playwright sync API 的环境
+        w._push_feishu_status({"bitable_record_id": "rec1"}, "commented")
+
+    _asyncio.run(_main())
+
+    assert called.get("record_id") == "rec1"
+    assert called.get("fields") == {"触达状态": "已留言"}
+
+
+def test_push_feishu_status_skips_without_record_id(tmp_path):
+    """没有 record_id 的线索不写飞书（写不上去）"""
+    from src.outreach.worker import OutreachWorker
+
+    db = _make_db(tmp_path)
+    w = OutreachWorker(get_config(), db, log=lambda m: None)
+    # 不抛异常就算过
+    w._push_feishu_status({"bitable_record_id": ""}, "commented")
