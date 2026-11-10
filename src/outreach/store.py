@@ -157,11 +157,26 @@ class OutreachStore:
         self._conn.commit()
         return rid
 
-    def mark_verified(self, record_id: str, ok: bool, note: str = "") -> None:
-        """标记回查结果（评论是否真的出现在页面上）"""
+    def mark_verified(
+        self, record_id: str, ok: bool, note: str = "", status: str = ""
+    ) -> None:
+        """标记回查结果（评论是否真的出现在页面上）
+
+        回查失败时**必须同时改 status**：
+        记录刚写入时 status='sent'（表示「点了发送」），
+        但回查发现评论根本不在页面上——评论其实没发出去。
+        status 留着 'sent' 的话，去重逻辑（recent_touch_days 只认 'sent'）
+        会把它当成「已经打扰过这个人」，30 天内再也不发，
+        结果就是「明明没发出去，却再也不会发第二次」。
+        """
+        sets = "verified = ?, error = ?"
+        values: list = [1 if ok else 0, (note or "")[:300]]
+        if status:
+            sets += ", status = ?"
+            values.append(status)
+        values.append(record_id)
         self._conn.execute(
-            "UPDATE outreach_records SET verified = ?, error = ? WHERE id = ?",
-            [1 if ok else 0, (note or "")[:300], record_id],
+            f"UPDATE outreach_records SET {sets} WHERE id = ?", values
         )
         self._conn.commit()
 

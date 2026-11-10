@@ -589,7 +589,7 @@ def create_lead_page():
             ui.button("刷新", on_click=_do_query).props("flat dense icon=refresh")
 
         # ========== 触达队列页签 ==========
-        with ui.expansion("抖音触达队列（第二步：搜人 + 作品留言）", value=False).classes(
+        with ui.expansion("抖音触达队列（第二步：搜人 + 作品留言）", value=True).classes(
             "w-full q-mt-md"
         ):
             with ui.column().classes("w-full q-gutter-sm"):
@@ -651,8 +651,114 @@ def create_lead_page():
                         row_key="display_id",
                     ).classes("w-full").props("dense flat bordered wrap-cells")
 
+                # ---- 控制台：进度 + 实时日志 + 每条线索的详情 ----
+                with ui.expansion("触达控制台（进度 / 实时日志 / 处理详情）", value=True).classes(
+                    "w-full"
+                ):
+                    console_state = ui.label("空闲").classes("text-caption text-grey-8")
+
+                    console_bar = ui.linear_progress(value=0, show_value=False).classes("w-full")
+
+                    console_log = ui.log(max_lines=400).classes("w-full")
+                    console_log.style("max-height: 320px; overflow-y: auto")
+
+                    console_table = ui.table(
+                        columns=[
+                            {"name": "time", "label": "时间", "field": "time", "align": "center"},
+                            {"name": "result", "label": "结果", "field": "result", "align": "center"},
+                            {"name": "display_id", "label": "抖音号", "field": "display_id", "align": "left"},
+                            {"name": "nickname", "label": "昵称", "field": "nickname", "align": "left"},
+                            {"name": "aweme_id", "label": "作品", "field": "aweme_id", "align": "left"},
+                            {"name": "text", "label": "话术 / 说明", "field": "text", "align": "left"},
+                        ],
+                        rows=[],
+                        row_key="time_display_id",
+                    ).classes("w-full").props("dense flat bordered wrap-cells")
+
+                # 控制台状态：给 timer 用
+                _console = {"pushed": 0, "rows": []}
+
+                _EVENT_LABELS = {
+                    "start": "开始", "current": "处理中", "sent": "已留言",
+                    "dry": "干跑", "failed": "失败", "skipped": "跳过",
+                    "unshown": "已提交未展示", "risk": "风控", "need_login": "要登录",
+                }
+
+                def _console_tick():
+                    """每秒刷新控制台：进度条 + 新日志 + 处理详情表"""
+                    from ..outreach.runner import get_outreach_runner
+
+                    try:
+                        r = get_outreach_runner()
+                    except Exception as e:
+                        console_state.text = f"（读取触达状态失败：{e}）"
+                        return
+
+                    p = r.progress()
+                    total = int(p.get("total") or 0)
+                    done = int(p.get("done") or 0)
+                    idx = int(p.get("index") or 0)
+                    mode = p.get("mode") or ""
+                    cooldown = int(p.get("cooldown") or 0)
+
+                    bits = []
+                    if p.get("running"):
+                        bits.append("🟢 运行中")
+                        if mode:
+                            bits.append(f"模式 {mode}")
+                        bits.append(f"第 {idx}/{total} 条")
+                        if p.get("current"):
+                            bits.append(f"正在处理 {p['current']}")
+                    else:
+                        bits.append("⚪ 空闲")
+                        if total:
+                            bits.append(f"上轮 {done}/{total} 条")
+                        if mode:
+                            bits.append(f"模式 {mode}")
+                    if cooldown:
+                        bits.append(f"🛑 风控冷却剩 {cooldown} 分钟")
+                    if p.get("sent"):
+                        bits.append(f"已留言 {p['sent']}")
+                    if p.get("dry"):
+                        bits.append(f"干跑 {p['dry']}")
+                    if p.get("failed"):
+                        bits.append(f"失败 {p['failed']}")
+                    if p.get("skipped"):
+                        bits.append(f"跳过 {p['skipped']}")
+                    console_state.text = "　｜　".join(bits)
+
+                    console_bar.value = min(1.0, done / total) if total else 0
+
+                    # 日志增量推送
+                    logs = r.recent_logs(limit=1000)
+                    if len(logs) < _console["pushed"]:
+                        console_log.clear()
+                        _console["pushed"] = 0
+                    for line in logs[_console["pushed"]:]:
+                        console_log.push(line)
+                    _console["pushed"] = len(logs)
+
+                    # 处理详情表
+                    rows = []
+                    for ev in r.recent_events(limit=100):
+                        rows.append({
+                            "time": ev.get("time", ""),
+                            "result": _EVENT_LABELS.get(ev.get("type"), ev.get("type", "")),
+                            "display_id": ev.get("display_id", ""),
+                            "nickname": ev.get("nickname", ""),
+                            "aweme_id": (ev.get("aweme_id") or "")[:20],
+                            "text": ev.get("text") or ev.get("error") or "",
+                            "time_display_id": f"{ev.get('time','')}{ev.get('display_id','')}",
+                        })
+                    if rows != _console["rows"]:
+                        _console["rows"] = rows
+                        console_table.rows = rows
+                        console_table.update()
+
+                ui.timer(1.0, _console_tick)
+
                 # ---- 运行日志 ----
-                with ui.expansion("运行日志", value=False).classes("w-full"):
+                with ui.expansion("运行日志（任务结束后归档）", value=False).classes("w-full"):
                     outreach_log = ui.log(max_lines=300).classes("w-full")
 
                 # ---- 触达记录 ----

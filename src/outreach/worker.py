@@ -343,6 +343,9 @@ class OutreachWorker:
                         f"\n[{idx}/{len(picked)}] {lead['display_id']}　{lead.get('nickname') or ''}"
                         f"　{lead.get('car_model') or '车型未知'}　{lead.get('intent_level') or ''}"
                     )
+                    # 告诉控制台「现在正在处理第几条」，进度条才有东西可画
+                    self._emit(type="current", lead=lead, index=idx,
+                               total=len(picked))
                     try:
                         self._handle_one(dy, lead, summary)
                         consecutive_errors = 0
@@ -504,13 +507,15 @@ class OutreachWorker:
                 if res.get("comment_id"):
                     # 抖音收到了（有 cid）但没展示：多半是作者开了评论审核，
                     # 或者被判广告删了。这不算发送失败，记「待审核」，过一阵再回查。
-                    self.st.mark_verified(touch_id, False, "评论已提交但未展示（作者审核/被判广告）")
+                    self.st.mark_verified(touch_id, False, "评论已提交但未展示（作者审核/被判广告）",
+                                           status="unshown")
                     self._set_status(lead, STATUS_COMMENTED, "已提交，评论区暂未展示")
                     summary["unshown"] = summary.get("unshown", 0) + 1
                     self.log("  ⚠️ 已提交但暂时不展示（大概率作者开了评论审核），稍后 verify 会再查")
                     self._emit(type="unshown", lead=lead, text=text)
                 else:
-                    self.st.mark_verified(touch_id, False, "无发送回执且回查不到，判定未发出")
+                    self.st.mark_verified(touch_id, False, "无发送回执且回查不到，判定未发出",
+                                           status="failed")
                     self._set_status(lead, STATUS_PENDING, "评论未发出，待重发")
                     summary["failed"] += 1
                     self.log("  ⚠️ 评论没发出去（无回执），已退回「待触达」")

@@ -45,6 +45,10 @@ class OutreachRunner:
         self._thread: Optional[threading.Thread] = None
         self._last_result: dict = {}
         self._logs: list[str] = []
+        # 结构化事件流（网页控制台显示每条线索的详情）
+        self._events: list[dict] = []
+        # 本轮进度：总数 / 已处理 / 当前在处理第几条
+        self._progress: dict = {}
         self._lock = threading.Lock()
 
     @property
@@ -58,6 +62,19 @@ class OutreachRunner:
     def recent_logs(self, limit: int = 200) -> list[str]:
         with self._lock:
             return list(self._logs[-limit:])
+
+    def recent_events(self, limit: int = 200) -> list[dict]:
+        """本轮每条线索的处理详情（给网页控制台画表）"""
+        with self._lock:
+            return list(self._events[-limit:])
+
+    def progress(self) -> dict:
+        """控制台顶部要显示的进度信息"""
+        with self._lock:
+            p = dict(self._progress)
+        p["running"] = self._running
+        p["cooldown"] = self.risk_cooldown_left()
+        return p
 
     def _append_log(self, msg: str) -> None:
         """记一条触达日志
@@ -206,6 +223,45 @@ class OutreachRunner:
     def _on_event(self, event: dict) -> None:
         """worker 的事件回调（在线程里触发）"""
         t = event.get("type")
+        # 结构化事件流：网页控制台靠它显示「每条线索的处理详情」
+        lead = event.get("lead") or {}
+        item = {
+            "type": t,
+            "time": datetime.now().strftime("%H:%M:%S"),
+            "display_id": lead.get("display_id") or "",
+            "nickname": lead.get("nickname") or "",
+            "car_model": lead.get("car_model") or "",
+            "intent_level": lead.get("intent_level") or "",
+            "text": (event.get("text") or "")[:120],
+            "error": (event.get("error") or "")[:160],
+            "aweme_id": (event.get("work") or {}).get("aweme_id") or "",
+            "aweme_desc": ((event.get("work") or {}).get("desc") or "")[:40],
+        }
+        with self._lock:
+            self._events.append(item)
+            if len(self._events) > 500:
+                del self._events[:250]
+            # 进度：start 给总数，current 给序号，处理完一个 done +1
+            if t == "start":
+                self._progress = {
+                    "total": int(event.get("total") or 0),
+                    "done": 0,
+                    "index": 0,
+                    "current": "",
+                    "mode": "干跑" if event.get("dry_run") else "真发",
+                    "sent": 0, "failed": 0, "skipped": 0, "dry": 0,
+                }
+            elif t == "current":
+                self._progress["index"] = int(event.get("index") or 0)
+                self._progress["current"] = (
+                    f"{lead.get('display_id') or ''} {lead.get('nickname') or ''}".strip()
+                )
+            elif t in ("sent", "failed", "skipped", "dry", "unshown"):
+                self._progress["done"] = int(self._progress.get("done") or 0) + 1
+                key = {"sent": "sent", "failed": "failed", "skipped": "skipped",
+                       "dry": "dry", "unshown": "sent"}[t]
+                self._progress[key] = int(self._progress.get(key) or 0) + 1
+                self._progress["current"] = ""
         if t == "need_login":
             self._append_log("⚠️ 需要登录：请先扫码登录触达专用浏览器")
         elif t == "risk":
