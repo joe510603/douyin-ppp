@@ -213,3 +213,30 @@ def test_问质保保养仍然算购车相关(scorer):
 def test_问维修费不算价格询问(scorer):
     r = scorer.score("去4S店修车要多少钱")
     assert "价格询问" not in r.signals
+
+
+def test_点名车型不算版本选择(scorer):
+    """裸的 max/pro/ultra 是**点名那台车**，不是问选哪个版本
+
+    真实案例（都在线上弹幕里出现过）：
+    - 「展车有pro吗」   → 想看那台 Pro
+    - 「N70 Max能讲解一下吗」→ 点名车型
+    - 「su7max现在什么价位了」→ 纯问价，被误判成版本询问会白拿 16 分，
+      话术还会套成「几个版本怎么选」，答非所问。
+    """
+    for text in ("展车有pro吗", "N70 Max能讲解一下吗", "su7max现在什么价位了",
+                 "试驾了max,给我头都转晕了"):
+        r = scorer.score(text)
+        assert "版本选择" not in r.signals, f"{text} → {r.signals}"
+
+
+def test_版本比较算版本选择(scorer):
+    """拿两个版本比较 → 是版本询问（点名后缀 + 在比较，两个条件都要满足）"""
+    r = scorer.score("su7 max和pro哪个好，差多少")
+    assert "版本选择" in r.signals
+
+
+def test_比较颜色不算版本选择(scorer):
+    """「哪个颜色好」带了「哪个好」，但没有版本后缀 → 不能算版本询问"""
+    r = scorer.score("哪个颜色好")
+    assert "版本选择" not in r.signals

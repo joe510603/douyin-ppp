@@ -259,3 +259,102 @@ def test_问修车多少钱不用价格角度():
     ))
     assert not out["template_id"].startswith("price")
     assert "落地价" not in out["text"]
+
+
+def test_信号决定话术角度():
+    """模板选择要用规则引擎判出的信号，不是自己再匹配一遍关键词
+
+    两套词表各匹配各的会错位：客户同时问了价格和到店地址，
+    模板顺序是固定的，选出来的角度不一定是他主要关心的。
+    """
+    cw = Copywriter(_cfg())
+
+    # 问价格 → price
+    out = cw.generate(_lead(danmaku="su7落地多少钱", car_model="SU7"))
+    assert out["template_id"].startswith("price")
+
+    # 问提车 → delivery
+    out = cw.generate(_lead(danmaku="su7现在有现车吗，多久能提车", car_model="SU7"))
+    assert out["template_id"].startswith("delivery")
+
+    # 问版本 → version（原来只能落到车型兜底，回「看到你在关注SU7」，答非所问）
+    out = cw.generate(_lead(danmaku="su7 max和pro哪个好，差多少", car_model="SU7"))
+    assert out["template_id"].startswith("version")
+
+    # 问配置 → config
+    out = cw.generate(_lead(danmaku="珍珠白有吗，轮毂能选吗", car_model="SU7"))
+    assert out["template_id"].startswith("config")
+
+    # 只提车型 → model（不能编造他问了价格）
+    out = cw.generate(_lead(danmaku="su7", car_model="SU7"))
+    assert out["template_id"].startswith("model")
+    assert "多少钱" not in out["text"]
+    assert "落地价" not in out["text"]
+
+
+def test_多信号时按信号权重选角度():
+    """价格 + 到店 → price（价格询问权重 40 > 门店到店 30）"""
+    cw = Copywriter(_cfg())
+    out = cw.generate(_lead(danmaku="su7多少钱，你们店在哪", car_model="SU7"))
+    assert out["template_id"].startswith("price")
+
+
+def test_联系方式信号不产生联系方式话术():
+    """问联系方式的线索，评论区话术不能出现微信/电话
+
+    评论区留联系方式是平台限流封号的红线。
+    """
+    cw = Copywriter(_cfg())
+    out = cw.generate(_lead(danmaku="加个微信聊", car_model="SU7"))
+    text = out["text"]
+    for w in ("微信", "电话", "手机号", "加我"):
+        assert w not in text
+
+
+# ============================================================
+# 回归：信号路径要和关键词路径一样守住售后语境
+# ============================================================
+
+def test_售后语境不走价格角度():
+    """「修车有优惠吗」——问的是修车优惠，不是买车优惠
+
+    回归记录：信号路径（_pick_by_signals）先跑，
+    「金融补贴」信号命中后直接映射到 price 模板，
+    没走关键词路径里的售后守卫 → 回「给你报个落地价」，答非所问。
+    """
+    cw = Copywriter(_cfg())
+    out = cw.generate(_lead(danmaku="修车有优惠吗", car_model="SU7"))
+    assert not out["template_id"].startswith("price")
+    assert "落地价" not in out["text"]
+
+
+def test_售后语境不走价格角度_问价版本():
+    """同一句里既有优惠又提到修理，也不能被当成购车问价"""
+    cw = Copywriter(_cfg())
+    out = cw.generate(_lead(danmaku="我车刮蹭了，修车有优惠吗", car_model="SU7"))
+    assert not out["template_id"].startswith("price")
+    assert "落地价" not in out["text"]
+
+
+# ============================================================
+# 回归：车型不能认错
+# ============================================================
+
+def test_车型解析不串型号():
+    """客户问 N70 Max，不能回「SU7 Max」——那是车型说错
+
+    回归记录：话术库用子串匹配车_patterns，
+    「N70 Max」里的 max 先被匹配到 → 说成 SU7 Max。
+    """
+    cw = Copywriter(_cfg())
+    out = cw.generate(_lead(danmaku="N70 Max能讲解一下吗", car_model="N70"))
+    assert "SU7 Max" not in out["text"]
+    assert "N70" not in out["text"]
+
+
+def test_点名车型走车型关注角度():
+    """「展车有pro吗」是点名那台车，不是问选哪个版本"""
+    cw = Copywriter(_cfg())
+    out = cw.generate(_lead(danmaku="展车有pro吗", car_model="PRO"))
+    assert out["template_id"].startswith("model")
+    assert "版本" not in out["text"]

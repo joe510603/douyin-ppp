@@ -28,6 +28,26 @@ from ..models.lead import IntentLevel
 # 权重越高代表离「掏钱买车」越近
 # ============================================================
 
+# 「版本选择」的权重
+_VERSION_WEIGHT = 16
+
+# 裸的 max/pro/ultra 有两种完全不同的含义，必须分开：
+#   「展车有pro吗」        → 点名**那台车**（车型关注），不是问选哪个版本
+#   「su7 max和pro哪个好」 → 拿两个版本**比较**，这才是版本询问
+# 所以裸后缀不放进词表，另起一条规则：
+# 既点名了后缀，又在做比较，才算版本选择。
+_VERSION_TRIM_RE = re.compile(r"(?<![a-z0-9])(max|pro|ultra)(?![a-z0-9])", re.IGNORECASE)
+_VERSION_CMP_RE = re.compile(
+    r"哪个好|哪个贵|哪个强|哪个划算|差多少|差在哪|还是", re.IGNORECASE
+)
+
+# v2.0.15 之前的「版本选择」词表：裸 max|pro|ultra 直接算版本询问。
+# 留着它是为了能对比新旧口径，把受影响的线索找出来重打分。
+_VERSION_OLD_RE = re.compile(
+    r"什么版本|有哪些版本|哪个版本|标准版|max|pro|ultra|有什么区别|区别|对比|相比|哪个好",
+    re.IGNORECASE,
+)
+
 SIGNAL_CATEGORIES: list[tuple[str, int, str]] = [
     # ---- 强购买动作 ----
     ("联系方式", 45,
@@ -47,8 +67,14 @@ SIGNAL_CATEGORIES: list[tuple[str, int, str]] = [
     ("产品参数", 18,
      r"配置|参数|续航|电池|充电|能跑多少|马力|功率|油耗|空间|座椅|后备箱|悬架|刹车|"
      r"智驾|辅助驾驶|空调|音响|后备|天窗|轮毂|尺寸|轴距"),
-    ("版本选择", 16,
-     r"什么版本|有哪些版本|哪个版本|标准版|max|pro|ultra|有什么区别|区别|对比|相比|哪个好"),
+    # 「版本选择」只认**明确在问版本**的词。
+    # 早先用裸 max|pro|ultra 匹配，把「su7max」「N70 Max能讲解一下吗」
+    # 「展车有pro吗」这类**点名车型**的弹幕全判成了版本询问——
+    # 客户问的根本不是版本，白拿 16 分，话术也套成「几个版本怎么选」，答非所问。
+    # 单独提车型（max/pro/ultra）现在走「车型关注」——具体但不撒谎。
+    # 两个版本放一起比较（「max和pro哪个好」）由 _VERSION_TRIM_RE + _VERSION_CMP_RE 单独判。
+    ("版本选择", _VERSION_WEIGHT,
+     r"什么版本|哪个版本|有哪些版本|标准版|版本|有什么区别|区别|对比|相比"),
     ("库存颜色", 14,
      r"有粉色|有紫色|有白色|有黑色|有红色|生产吗|还生产|现不现货|颜色|配色"),
     ("时间节点", 12,
@@ -206,13 +232,25 @@ class ScoreResult:
 class RuleScorer:
     """规则购车意向打分器"""
 
-    def __init__(self, min_level: str = "low", exclude_aftersale: bool = True):
+    def __init__(self, min_level: str = "low", exclude_aftersale: bool = True,
+                 trim_as_version: bool = False):
         self.min_level = min_level
         # 售后语境排除开关。
         # 关掉它就等于回到 v2.0.14 之前的口径——
         # 给「重打分」脚本用：只有开关前后结果不同的线索才是规则变更影响的，
         # 不会把「判定口径不同」误当成「规则变更」。
         self.exclude_aftersale = exclude_aftersale
+        # 裸 max/pro/ultra 算不算版本询问。
+        # True = v2.0.15 之前的口径（裸后缀直接算版本选择），
+        # 也是给「重打分」脚本对比新旧口径用的开关。
+        self.trim_as_version = trim_as_version
+        # 版本选择这一类要按口径换词表，所以每个实例编译一份
+        self._categories = list(_COMPILED_CATEGORIES)
+        if trim_as_version:
+            self._categories = [
+                (name, weight, _VERSION_OLD_RE if name == "版本选择" else pattern)
+                for name, weight, pattern in _COMPILED_CATEGORIES
+            ]
 
     def score(self, text: str, nickname: str = "", self_names: Optional[set] = None) -> ScoreResult:
         """
@@ -255,7 +293,7 @@ class RuleScorer:
         model = self.extract_model(content)
         score = 0
         signals: list[str] = []
-        for name, weight, pattern in _COMPILED_CATEGORIES:
+        for name, weight, pattern in self._categories:
             if not pattern.search(content):
                 continue
             # 语境排除：信号命中了，但整句落在不该算这个信号的语境里
@@ -269,6 +307,17 @@ class RuleScorer:
                 continue
             score += weight
             signals.append(name)
+
+        # 版本比较：点名了 max/pro/ultra，又在做比较（「su7 max和pro哪个好」）
+        # → 算版本选择。只点名不比较（「展车有pro吗」）不算，那是点名那台车。
+        if (
+            not self.trim_as_version
+            and "版本选择" not in signals
+            and _VERSION_TRIM_RE.search(content)
+            and _VERSION_CMP_RE.search(content)
+        ):
+            score += _VERSION_WEIGHT
+            signals.append("版本选择")
 
         # 只提车型、没有任何购买行为（如"看一下YU7"）→ 记为弱信号
         # 这种情况在直播间很常见，是典型的"对某款车感兴趣但还没问价"

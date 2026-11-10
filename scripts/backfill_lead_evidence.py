@@ -13,6 +13,20 @@
 - 判定依据与弹幕原文一致（都是规则口径）
 - 不依赖当初是哪条代码路径写的这条线索
 
+为什么需要「重新挑」
+------------------
+实时链路（``upsert_lead``）在同一个人再次命中时，
+会把 ``evidence`` **替换成最新那一条弹幕**，而 ``evidence_count`` 却在累加。
+结果就是：库里存的是「最后一条命中的弹幕」，不是「客户问得最重的那个」。
+实测 262 条线索里有 82 条（31%）这样——
+比如客户先问「全款多少钱提回家」又发了句「N90」，
+存下来只剩「N90」，话术就会去回「看到你关注小米汽车」，完全没回应重点。
+
+所以这里按**分档 + 分数**重排：
+- 有「购买类」信号的弹幕优先（话术角度要用的是这个）
+- 纯「联系方式」信号排后面（它权重最高但对话术角度没用）
+- 同一句话去重（用户重复发同一句很常见）
+
 用法::
 
     .venv/bin/python scripts/backfill_lead_evidence.py            # 全部空证据的线索
@@ -99,21 +113,41 @@ def main() -> int:
             missing += 1
             continue
 
-        # 只保留非排除、且确实命中信号的弹幕，按分数取前 N 条
+        # 只保留非排除、且确实命中信号的弹幕
         scored = []
+        seen: set[str] = set()
+        hit_count = 0
         for m in msgs:
             r = scorer.score(m, lead["nickname"] or "")
             if r.excluded or not r.signals:
                 continue
-            scored.append((r.score, m[:200]))
+            # 去重：同一个用户把同一句话发两遍很常见，
+            # 不去重的话「qq?」能占满 3 个名额，把真正问价格的那条挤掉。
+            norm = "".join(m.split())
+            if norm in seen:
+                continue
+            seen.add(norm)
+            hit_count += 1
+            # 分档：有「购买类」信号的优先，纯「联系方式」的排后面。
+            # 联系方式权重 45 是最高的（「加个微信」确实算强意向），
+            # 但它对**话术角度**毫无用处——它不映射任何模板，
+            # 让它霸占首位会把「落地多少钱」这种真问题挤掉。
+            has_purchase = any(s != "联系方式" for s in r.signals)
+            tier = 2 if has_purchase else 1
+            scored.append((tier, r.score, m[:200]))
         if not scored:
             # 兜底：至少留一条原始弹幕，别让销售看到空原文
-            scored = [(0, m[:200]) for m in msgs[: args.top]]
+            scored = [(0, 0, m[:200]) for m in msgs[: args.top]]
+            hit_count = 0
 
-        scored.sort(key=lambda x: x[0], reverse=True)
+        # 先按档位再按分数：同档内分数高的排前面
+        scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
         top = scored[: args.top]
-        evidence = json.dumps([t[1] for t in top], ensure_ascii=False)
-        updates.append((evidence, len(top), lead["id"]))
+        evidence = json.dumps([t[2] for t in top], ensure_ascii=False)
+        # evidence_count = 命中信号的弹幕条数（去重后），
+        # 不是 len(top)——top 只是存下来给话术/销售看的那几条，
+        # 拿它当「触发条数」会把信息丢掉。
+        updates.append((evidence, hit_count, lead["id"]))
 
     print(f"可回填 {len(updates)} 条，找不到弹幕 {missing} 条")
 

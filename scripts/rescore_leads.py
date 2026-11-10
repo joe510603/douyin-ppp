@@ -5,6 +5,9 @@
 ----
 v2.0.14 给规则引擎加了「售后语境排除」——
 问「修车/剐蹭/事故要多少钱」不再算购车「价格询问」。
+v2.0.15 又修了「裸 max/pro/ultra 被当成版本询问」——
+「展车有pro吗」「su7max现在什么价位了」是点名车型，不是问选哪个版本。
+
 之前用旧规则打过分、已经落库的线索，判定还是错的，
 话术会回「看到你问SU7多少钱，可以给你报个落地价」，答非所问。
 
@@ -13,8 +16,8 @@ v2.0.14 给规则引擎加了「售后语境排除」——
 库里有些线索的新旧分数不一致，是因为「实时链路」和「回溯扫描」的判定口径
 本来就不一样（单条弹幕打分 vs 多条取最高），不是因为规则改了。
 所以这里用两个打分器对比：
-- ``RuleScorer(exclude_aftersale=False)`` —— 旧口径
-- ``RuleScorer(exclude_aftersale=True)``  —— 新口径
+- ``RuleScorer(exclude_aftersale=False, trim_as_version=True)``  —— 旧口径
+- ``RuleScorer(exclude_aftersale=True, trim_as_version=False)``  —— 新口径
 只有两者结果不同的线索才是规则变更真正影响到的，才动它。
 
 用法::
@@ -67,10 +70,15 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="按新规则重打分线索")
     ap.add_argument("--db-path", default=str(DEFAULT_DB))
     ap.add_argument("--dry-run", action="store_true", help="只看会改什么，不写库")
+    ap.add_argument(
+        "--recompute",
+        action="store_true",
+        help="按**当前证据 + 当前规则**重算并回写（证据回填后用这个）",
+    )
     args = ap.parse_args()
 
-    old_scorer = RuleScorer(exclude_aftersale=False)
-    new_scorer = RuleScorer(exclude_aftersale=True)
+    old_scorer = RuleScorer(exclude_aftersale=False, trim_as_version=True)
+    new_scorer = RuleScorer(exclude_aftersale=True, trim_as_version=False)
 
     conn = sqlite3.connect(args.db_path)
     conn.row_factory = sqlite3.Row
@@ -84,12 +92,21 @@ def main() -> int:
         texts = _evidence_items(r["evidence"] or "")
         if not texts:
             continue
-        old = _best(old_scorer, texts)
         new = _best(new_scorer, texts)
-        if old is None or new is None:
+        if new is None:
             continue
-        if old.level == new.level and old.score == new.score:
-            continue
+        if args.recompute:
+            # 重算模式：拿「当前规则在当前证据上的结果」和「库里存的值」比。
+            # 证据回填之后，存量分数可能来自另一条弹幕（或更早的规则版本），
+            # 这里统一成同一套口径。
+            if new.level == r["intent_level"] and new.score == r["intent_score"]:
+                continue
+        else:
+            old = _best(old_scorer, texts)
+            if old is None:
+                continue
+            if old.level == new.level and old.score == new.score:
+                continue
         changed.append({
             "id": r["id"],
             "display_id": r["display_id"],
@@ -101,7 +118,8 @@ def main() -> int:
             "reason": new.reason,
         })
 
-    print(f"规则变更影响到的线索：{len(changed)} 条\n")
+    title = "按当前证据重算后变化的线索" if args.recompute else "规则变更影响到的线索"
+    print(f"{title}：{len(changed)} 条\n")
     for c in changed:
         print(f"  {c['display_id']:<20}{c['nickname'][:12]:<14}"
               f"{c['old_level']}/{c['old_score']} → {c['new_level']}/{c['new_score']}"
