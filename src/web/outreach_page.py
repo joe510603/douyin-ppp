@@ -20,6 +20,9 @@ log = get_logger("outreach_page")
 
 config = get_config()
 
+# 撞验证码时等人工验证多久（页面上要显示这个数）
+captcha_wait_minutes = int(config.outreach.captcha_wait_minutes or 15)
+
 LEVEL_LABELS = {
     "high": "高意向",
     "medium": "中意向",
@@ -73,6 +76,21 @@ def create_outreach_page():
         runner = get_outreach_runner()
         if runner.resume():
             ui.notify("已继续", type="positive")
+        else:
+            ui.notify("现在没有在等验证", type="warning")
+
+    async def _do_show_window():
+        """把浏览器窗口叫到屏幕中间，让用户自己去操作验证
+
+        平时窗口藏在屏幕外（看不见），撞验证码时用户往往找不到它。
+        这里发个信号给 worker 线程（浏览器归那个线程管，主线程碰不了），
+        由它把窗口挪回来。
+        """
+        from ..outreach.runner import get_outreach_runner
+
+        runner = get_outreach_runner()
+        if runner.show_browser_window():
+            ui.notify("窗口正在叫到屏幕中间，去那个窗口里验证", type="positive")
         else:
             ui.notify("现在没有在等验证", type="warning")
 
@@ -239,7 +257,7 @@ def create_outreach_page():
                     console_state = ui.label("空闲").classes("text-caption text-grey-8")
 
                     # ---- 撞验证码时的等待条 ----
-                    # 撞上验证码 → 飞书通知你 + 浏览器窗口挪到屏幕中间 → 停在这儿等你
+                    # 撞上验证码 → 飞书通知你 + 停在这儿等你
                     with ui.element("div").classes("w-full q-mt-sm q-pa-md").style(
                         "background:#fff4e5; border:1px solid #f0a04b; border-radius:8px;"
                     ) as captcha_box:
@@ -247,6 +265,11 @@ def create_outreach_page():
                         with ui.row().classes("w-full items-center q-gutter-sm"):
                             captcha_text = ui.label("").classes("col")
                             ui.space()
+                            # 自己把窗口叫出来：平时窗口藏在屏幕外看不见，
+                            # 点这个按钮它会回到屏幕中间，你自己操作验证。
+                            ui.button("打开浏览器窗口", on_click=_do_show_window).props(
+                                "outline color=warning"
+                            )
                             ui.button("我验证好了，继续", on_click=_do_resume).props(
                                 "unelevated color=warning"
                             )
@@ -332,8 +355,10 @@ def create_outreach_page():
                         reason = p.get("captcha_reason") or ""
                         captcha_text.text = (
                             f"⏸ 撞上验证码，已暂停等你人工验证。{reason}\n"
-                            "浏览器窗口已挪到屏幕中间——把短信/拖拽图形验证过掉，"
-                            "然后点右边「我验证好了，继续」。"
+                            "点「打开浏览器窗口」把它叫到屏幕中间，你自己把短信/拖拽图形过掉——"
+                            "验证完它会自动接着跑，不用再点「继续」。\n"
+                            "（点「我验证好了，继续」也行；超过 "
+                            f"{captcha_wait_minutes} 分钟没人管就结束本轮）"
                         )
 
                     console_bar.value = min(1.0, done / total) if total else 0

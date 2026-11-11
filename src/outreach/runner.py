@@ -54,6 +54,10 @@ class OutreachRunner:
         # 网页上点「我验证好了，继续」→ resume() → worker 那边醒过来接着跑。
         self._resume = threading.Event()
         self._resume.set()          # 初始状态 = 不需要等
+        # 网页上点「打开浏览器窗口」→ 这里 set → worker 把窗口叫到屏幕中间
+        # （Playwright 的 sync API 不能跨线程用，浏览器归 worker 线程管，
+        #   所以主线程不能直接去挪窗口，只能发个信号过去）
+        self._show_window = threading.Event()
         self._waiting_human = False
         self._captcha_reason = ""
 
@@ -73,6 +77,20 @@ class OutreachRunner:
     def waiting_human(self) -> bool:
         """当前是不是在等人工验证"""
         return self._waiting_human
+
+    def show_browser_window(self) -> bool:
+        """把浏览器窗口叫到屏幕中间，让用户自己去操作
+
+        网页上那个「打开浏览器窗口（我自己验证）」按钮调它。
+
+        为什么要绕一圈发信号：浏览器是 worker 线程里的 Playwright 对象，
+        sync API 不允许跨线程调用，所以主线程不能直接去挪窗口。
+        """
+        if not self._waiting_human:
+            return False
+        self._append_log("🪟 正在把浏览器窗口叫到屏幕中间…")
+        self._show_window.set()
+        return True
 
     def resume(self) -> bool:
         """人工验证完了，继续跑
@@ -229,6 +247,7 @@ class OutreachRunner:
             self._waiting_human = False
             self._captcha_reason = ""
             self._resume.set()
+            self._show_window.clear()
 
         self._last_result = result
         summary = (
@@ -250,6 +269,7 @@ class OutreachRunner:
             log=self._append_log,
             on_event=self._on_event,
             resume_event=self._resume,
+            show_window_event=self._show_window,
         )
         try:
             return worker.run(limit=limit, dry_run=dry_run, only=only)

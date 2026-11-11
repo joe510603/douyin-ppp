@@ -251,6 +251,10 @@ class OutreachConfig(BaseModel):
     # ⚠️ 别直接开 headless——抖音对无头浏览器的检测更严，风控风险明显更高。
     #    「看不见窗口」用有头 + 屏幕外实现就够了。
     hide_window: bool = True
+    # 拦掉视频/音频的**网络请求**（省流量省 CPU）。
+    # 注意：静音本身不靠它——静音由 JS 强制兜底（见 browser.py 的 _MUTE_AUDIO），
+    # 这里只管「别下载视频」。关掉的话功能不受影响，只是多耗点资源。
+    block_media: bool = True
     # 连续多少次「发送没报错但回查不到评论」判定账号被限流并停手。
     # 这是抖音的**软风控**：页面不弹验证码、不提示操作频繁，就是把评论静默吞掉。
     silent_block_threshold: int = 2

@@ -128,6 +128,7 @@ class OutreachWorker:
         log: Optional[Callable[[str], None]] = None,
         on_event: Optional[Callable[[dict], None]] = None,
         resume_event: Optional[threading.Event] = None,
+        show_window_event: Optional[threading.Event] = None,
     ):
         self.cfg = cfg
         self.log = log or (lambda m: print(m))
@@ -142,8 +143,12 @@ class OutreachWorker:
         # 撞验证码时用它跟主线程同步「人工验证完了，继续」
         # （worker 在专用线程里跑，主进程是 asyncio，跨不过去，只能靠 Event）
         self.resume_event = resume_event
+        # 「把窗口叫到屏幕中间」的信号：网页上点按钮 → 主进程 set → 这里看到后挪窗口
+        self.show_window_event = show_window_event
         # 正在等人工验证
         self.waiting_human = False
+        # 当前页面对象（判断验证码是不是过了要用）
+        self._dy = None
 
     # ================================================================
     # 配置适配
@@ -219,9 +224,10 @@ class OutreachWorker:
             f"原因：{reason}\n"
             + (f"卡在：{who}\n" if who else "")
             + "\n处理办法：\n"
-            "1. 浏览器窗口已经挪到屏幕中间（如果你没看到，去窗口栏找抖音）\n"
+            "1. 回到网页「抖音触达」页面，点橙色提示条里的「打开浏览器窗口」\n"
+            "   （它平时藏在屏幕外，点一下才会跳到屏幕中间）\n"
             "2. 在那个窗口里把短信/拖拽图形验证过掉\n"
-            "3. 回到网页「抖音触达」点「我验证好了，继续」，触达会接着跑\n\n"
+            "3. 验证完**自动接着跑**，不用再点「继续」\n\n"
             f"（{int(getattr(self.cfg.outreach, 'captcha_wait_minutes', 15) or 15)} 分钟内没人管就结束本轮）"
         )
         try:
@@ -257,6 +263,32 @@ class OutreachWorker:
             self.log(f"  （窗口挪不动：{e}）")
             return False
 
+    def _captcha_cleared(self) -> bool:
+        """看看验证码是不是已经自己过了
+
+        用户在浏览器里把验证做完之后，页面上的验证码就消失了——
+        这时候应该**自动接着跑**，而不是让人再去网页上点一下「继续」。
+
+        判定复用 ``Douyin.check_risk``：它抛异常 = 还有风控信号（还在等），
+        不抛 = 干净了（可以继续）。
+        """
+        page = getattr(self, "_page", None)
+        dy = getattr(self, "_dy", None)
+        if page is None or dy is None:
+            return False
+        try:
+            url = page.url or ""
+            if "/verify" in url or "captcha" in url:
+                return False
+        except Exception:
+            return False
+        try:
+            dy.check_risk()
+            return True
+        except Exception:
+            # 还在风控页上（或者页面正在跳转，读不到）→ 继续等
+            return False
+
     def _wait_for_human(self, reason: str) -> bool:
         """暂停等人工验证
 
@@ -265,6 +297,10 @@ class OutreachWorker:
 
         实现上是个跨线程的 Event：worker 在专用线程里等，
         网页上点「我验证好了，继续」时主进程 set()，这边就醒过来。
+
+        等待期间同时做两件事：
+        1. 网页上点「打开浏览器窗口」→ 把窗口叫到屏幕中间（用户自己操作）
+        2. 每隔几秒看一眼页面：验证码要是已经自己过了，就**自动接着跑**
         """
         ev = self.resume_event
         if ev is None:
@@ -279,15 +315,33 @@ class OutreachWorker:
         self.waiting_human = True
         self._emit(type="captcha_wait", error=reason, minutes=minutes)
         self.log(f"⏸ 已暂停，等你手动验证（最多等 {minutes} 分钟）")
+        self.log("   网页上点「打开浏览器窗口」可以把它叫到屏幕中间，你自己操作")
+        next_probe = time.time() + 5.0
         try:
             while time.time() < deadline:
-                if ev.wait(timeout=1.0):
+                # 先处理「打开浏览器窗口」信号。
+                # 顺序很重要：不能让它被下面的 ev.wait 挡住——
+                # 用户点了按钮就得马上看到窗口，不能等到超时或「继续」才响应。
+                sw = self.show_window_event
+                if sw is not None and sw.is_set():
+                    sw.clear()
+                    self._bring_window_back()
+                    self.log("  🖐 你可以在那个窗口里手动过验证")
+
+                if ev.wait(timeout=0.5):
                     self.waiting_human = False
                     self._emit(type="captcha_resumed")
                     self.log("▶ 收到「继续」信号，接着跑")
                     return True
-                # 等的过程中页面可能被用户刷新了/验证过了，
-                # 这里不动页面，只等信号——避免和用户抢鼠标。
+
+                # 自动检测：验证码是不是已经自己过了 → 直接接着跑
+                if time.time() >= next_probe:
+                    next_probe = time.time() + 5.0
+                    if self._captcha_cleared():
+                        self.waiting_human = False
+                        self._emit(type="captcha_resumed", auto=True)
+                        self.log("🔎 检测到验证码已经过了，自动接着跑")
+                        return True
             self.waiting_human = False
             self._emit(type="captcha_timeout")
             self.log(f"⏸ 等待超时（{minutes} 分钟没人管），结束本轮")
@@ -490,6 +544,8 @@ class OutreachWorker:
             with self._page_ctx(profile_dir, bool(o.headless), session) as page:
                 self._page = page
                 dy = Douyin(page, shot_dir=shots, log=self.log)
+                # 存一份：等人工验证时要靠它判断「验证码是不是已经过了」
+                self._dy = dy
                 if not dy.cookies_ok():
                     self.stop_reason = "未登录：浏览器 profile 里没有 sessionid，先扫码登录"
                     self.log(f"❌ {self.stop_reason}")
@@ -586,6 +642,7 @@ class OutreachWorker:
 
         finally:
             self._page = None
+            self._dy = None
 
         note = self.stop_reason or ("干跑" if dry else "")
         self.st.finish_run(
@@ -736,6 +793,8 @@ class OutreachWorker:
 
         # 窗口摆屏幕外：看不见但不是 headless（抖音对无头检测更严，风控风险高）
         offscreen = bool(getattr(self.cfg.outreach, "hide_window", True))
+        # 别下载视频（省流量省 CPU）。静音另有 JS 兜底，不依赖这一项。
+        block_media = bool(getattr(self.cfg.outreach, "block_media", True))
 
         @contextmanager
         def _ctx():
@@ -749,7 +808,8 @@ class OutreachWorker:
                 yield page
                 return
             with Browser(profile_dir, headless=headless, slow_mo=120,
-                         offscreen=offscreen) as (_c, page):
+                         offscreen=offscreen,
+                         block_media=block_media) as (_c, page):
                 yield page
 
         return _ctx()

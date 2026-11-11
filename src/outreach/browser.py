@@ -22,6 +22,41 @@ Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
 window.chrome = window.chrome || {runtime: {}};
 """
 
+# 强制静音 —— 打开作品时抖音会直接放视频带声音，吵人还暴露「有人在看」
+#
+# 为什么用 JS 兜底而不是只靠拦网络请求：
+# - 只拦网络请求：万一页面逻辑等视频加载，评论区可能不渲染（为了安静把功能搞坏不值）
+# - 只靠 JS 静音：MediaSource / blob / 缓存里的音频还能出声
+# 所以两层都要：JS 静音是**保证没声音**，网络拦截是可选项（省流量省 CPU）。
+_MUTE_AUDIO = """
+(() => {
+  const mute = (el) => { try { el.muted = true; el.volume = 0; } catch (e) {} };
+  // 1. play() 之前先静音（覆盖绝大多数自动播放）
+  const origPlay = HTMLMediaElement.prototype.play;
+  HTMLMediaElement.prototype.play = function () {
+    mute(this);
+    return origPlay.apply(this, arguments);
+  };
+  // 2. 页面上已经存在的媒体元素
+  const muteAll = () => {
+    try { document.querySelectorAll('video,audio').forEach(mute); } catch (e) {}
+  };
+  // 3. 后续新插入的媒体元素也静音（抖音是无限流，元素一直在换）
+  const start = () => {
+    muteAll();
+    try {
+      new MutationObserver(muteAll).observe(document.documentElement,
+        {childList: true, subtree: true});
+    } catch (e) {}
+  };
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', start);
+  } else {
+    start();
+  }
+})();
+"""
+
 _UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
        "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
 
@@ -220,6 +255,8 @@ class Browser:
         )
         self.app_name = _chrome_app_name(self._pw)
         self.ctx.add_init_script(_STEALTH)
+        # 静音是默认行为：触达要打开作品看评论区，抖音会直接放视频带声音。
+        self.ctx.add_init_script(_MUTE_AUDIO)
         if self.block_media:
             # 拦掉视频/音频请求：页面秒开，也不会有声音吵到人
             def _route(route):

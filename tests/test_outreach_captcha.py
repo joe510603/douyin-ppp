@@ -58,6 +58,19 @@ def _worker(tmp_path, **cfg_over):
     return w, ev
 
 
+def _worker_with_show(tmp_path, **cfg_over):
+    """带「叫窗口」信号的 worker"""
+    cfg = get_config()
+    cfg.outreach.captcha_wait_minutes = 0.2
+    for k, v in cfg_over.items():
+        setattr(cfg.outreach, k, v)
+    ev = threading.Event()
+    show = threading.Event()
+    w = OutreachWorker(cfg, str(tmp_path / "t.db"), log=lambda m: None,
+                       resume_event=ev, show_window_event=show)
+    return w, ev, show
+
+
 def test_等待人工验证时收到等待事件(tmp_path):
     w, ev = _worker(tmp_path)
     events = []
@@ -217,4 +230,138 @@ def test_激活应用失败不影响流程():
         assert calls, "应该尝试过激活"
     finally:
         browser.activate_app = orig
+
+
+# ============================================================
+# 「打开浏览器窗口」按钮
+# ============================================================
+
+def test_点了打开窗口按钮会把窗口叫回来(tmp_path, monkeypatch):
+    """网页上点按钮 → worker 线程把窗口挪到屏幕中间"""
+    w, ev, show = _worker_with_show(tmp_path)
+    called = []
+    monkeypatch.setattr(w, "_bring_window_back", lambda: called.append(1) or True)
+
+    result = {}
+
+    def _waiter():
+        result["ok"] = w._wait_for_human("出现验证码控件")
+
+    t = threading.Thread(target=_waiter)
+    t.start()
+    time.sleep(0.3)
+
+    show.set()                      # ← 相当于网页上点了按钮
+    time.sleep(0.5)
+    ev.set()                        # 验证完了
+    t.join(timeout=5)
+
+    assert called, "应该调过 _bring_window_back"
+    assert result["ok"] is True
+
+
+def test_没点按钮不会乱动窗口(tmp_path, monkeypatch):
+    """不该没事就把用户窗口叫到屏幕中间（抢焦点）"""
+    w, ev, show = _worker_with_show(tmp_path)
+    called = []
+    monkeypatch.setattr(w, "_bring_window_back", lambda: called.append(1) or True)
+
+    t = threading.Thread(target=lambda: w._wait_for_human("出现验证码控件"))
+    t.start()
+    time.sleep(0.8)
+    ev.set()
+    t.join(timeout=5)
+    assert called == [], "没点按钮就不该动窗口"
+
+
+# ============================================================
+# 验证完了自动接着跑
+# ============================================================
+
+class _FakePage:
+    def __init__(self, url="https://www.douyin.com/video/123"):
+        self.url = url
+
+
+class _FakeDy:
+    """假装是 Douyin 对象"""
+
+    def __init__(self, blocked: bool):
+        self.blocked = blocked
+        self.calls = 0
+
+    def check_risk(self):
+        self.calls += 1
+        if self.blocked:
+            from src.outreach.douyin_api import RiskControl
+
+            raise RiskControl("出现验证码控件")
+
+
+def test_验证码还在就继续等(tmp_path, monkeypatch):
+    w, ev, show = _worker_with_show(tmp_path)
+    dy = _FakeDy(blocked=True)
+    w._dy = dy
+    w._page = _FakePage()
+    monkeypatch.setattr(w, "_captcha_cleared", lambda: False)
+
+    t0 = time.time()
+    w._wait_for_human("出现验证码控件")
+    assert time.time() - t0 >= 10, "验证码还在就该一直等"
+
+
+def test_验证码过了自动继续(tmp_path, monkeypatch):
+    """验证完不用再点「继续」，自动接着跑"""
+    w, ev, show = _worker_with_show(tmp_path)
+    w._dy = _FakeDy(blocked=False)
+    w._page = _FakePage()
+
+    t0 = time.time()
+    ok = w._wait_for_human("出现验证码控件")
+    assert ok is True, "验证码过了应该自动继续"
+    assert time.time() - t0 < 10, "应该很快就检测到，不用等满超时"
+
+
+def test_验证码判定看页面状态(tmp_path):
+    """URL 还在 verify/captcha 上 → 不算过了"""
+    w, ev, show = _worker_with_show(tmp_path)
+    w._dy = _FakeDy(blocked=False)
+    w._page = _FakePage(url="https://www.douyin.com/verify?x=1")
+    assert w._captcha_cleared() is False
+
+    w._page = _FakePage(url="https://www.douyin.com/video/123")
+    assert w._captcha_cleared() is True
+
+
+def test_没有页面时不瞎判(tmp_path):
+    w, ev, show = _worker_with_show(tmp_path)
+    w._dy = None
+    w._page = None
+    assert w._captcha_cleared() is False
+
+
+# ============================================================
+# runner：叫窗口的接口
+# ============================================================
+
+def test_runner_没在等验证时不能叫窗口():
+    from src.outreach.runner import OutreachRunner
+
+    r = OutreachRunner()
+    assert r.waiting_human is False
+    assert r.show_browser_window() is False
+
+
+def test_runner_在等验证时能叫窗口():
+    from src.outreach.runner import OutreachRunner
+
+    r = OutreachRunner()
+    r._mark_waiting_human("出现验证码控件")
+    assert r.waiting_human is True
+    assert r.show_browser_window() is True
+    assert r._show_window.is_set(), "应该给 worker 发了信号"
+    # 叫完窗口不等于恢复，还要人点「继续」或自动检测
+    assert r.resume() is True
+    assert r._resume.is_set()
+
 

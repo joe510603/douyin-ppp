@@ -5,6 +5,49 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.19] - 2026-11-11
+
+### Added
+- **触达静音：打开作品不放音**（用户反馈「要关闭网页的声音，避免打开作品放声音」）。
+  抖音的作品页是自动播放视频的，直接开进去会突然出声——吵人，还暴露「有人在看」。
+  两层防线：
+  - **JS 强制静音**（`browser._MUTE_AUDIO`，进每个页面都注入）：
+    改掉 `HTMLMediaElement.prototype.play` 让它播之前先 `muted = true`，
+    再用 `MutationObserver` 盯着后续插入的媒体元素（抖音是无限流，元素一直在换）。
+    这一层是**保证没声音**的——只拦网络请求管不住 MediaSource / blob / 缓存里的音频。
+  - **网络层拦媒体**（新配置 `outreach.block_media`，默认 `true`）：省流量省 CPU。
+    这一层是可选的，**关掉也不影响静音**。
+
+- **撞验证码时可以直接按按钮把浏览器叫出来**
+  （用户反馈「触发风控了后能不能给个按钮，让我自己去打开网页然后完成验证后，
+  项目再操作，不然我又看不到」）。
+  平时窗口藏在屏幕外，只靠自动置前的话，遇到「窗口压在别的窗口底下」
+  「置前没生效」这类情况用户根本找不到它。
+  现在网页的橙色等待条里有两个按钮：
+  - 「打开浏览器窗口」→ 窗口回到屏幕中间并置前，用户自己操作验证
+  - 「我验证好了，继续」→ 手动恢复（保留）
+  这个动作必须**绕一圈发信号给 worker 线程**：浏览器是那个线程里的 Playwright 对象，
+  sync API 不允许跨线程调用，主线程碰不了它。
+
+- **验证码验证完自动接着跑**：等待期间每 5 秒探一次页面，
+  验证码消失（`Douyin.check_risk` 不再抛异常）就直接继续，
+  不用再手动点「我验证好了，继续」。
+
+### Fixed
+- 「打开浏览器窗口」信号会被 `ev.wait(timeout=1.0)` 挡住最多 1 秒，
+  而且如果用户同时点「继续」，窗口还没叫出来就结束了。
+  改成**先处理叫窗口信号、再等继续信号**，等待粒度降到 0.5 秒。
+
+### Testing
+- 测试 245（+12）
+- 新增 `scripts/check_mute_media.py`：静音 + 拦媒体 + 页面渲染
+- 新增 `scripts/check_comment_box_media.py`：**对比**拦/不拦两组，
+  拿真实 profile 打开真实作品页，验评论区 DOM 照常渲染
+  （实测：两组 `commentArea` 都是 True；不拦那组实测有 1 个视频正在播——那就是声音来源）
+- 新增 `scripts/check_outreach_page.py`：断言两个按钮都在、等待条空闲时隐藏、话术预览有数据
+
+---
+
 ## [2.0.18] - 2026-11-10
 
 ### Added
