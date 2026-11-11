@@ -5,6 +5,65 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.22] - 2026-11-11
+
+### Fixed
+- **「账号被限流」是误判——真相是抖音在要求「本人操作验证」**。
+  用户反馈：「我用手机能留言，用另一台电脑也能留言，
+  所以你这边发消息是不是有问题，你真实发一条，让我看看你怎么发的」——
+  **用户的直觉是对的**。
+
+  真发一条 + 全程抓网络，抓到的真相：
+
+  ```
+  REQ  POST .../aweme/v1/web/comment/publish
+  RESP 200 .../aweme/v1/web/comment/publish        ← 响应体 len=0（空的）
+  REQ  GET  .../passport/safe/query_decision/
+  RESP 200 → {"account_flow": "verify",             ← 要验证，不是限流！
+               "verify_scene": "comment",
+               "verify_ways": [mobile_sms_verify, qr_code_verify]}
+  ```
+
+  页面上弹的是「**接收短信验证码**」对话框（底部还有「使用原设备扫码」）。
+
+  三个 bug 叠在一起，导致评论没发出去却被判成账号限流：
+
+  1. **publish 响应体从来没被读过**：匹配串写成 `/comment/publish/`（带斜杠），
+     真实 URL 是 `/comment/publish`（不带）→ 永远匹配不上。
+     （顺带发现：这个接口被验证拦下时响应体本来就是空的，
+     所以还必须靠裁决接口 + 页面弹窗判断。）
+  2. **风控检测不认识这个弹窗**：「接收短信验证码」不在关键词表里
+     → 不知道该停下叫人。
+  3. 流程一路走下去 → 回查评论区当然找不到（评论根本没发出去）
+     → 误判「账号被限流」→ 停手 + **冷却 120 分钟** + 通知「扫码没用」。
+
+  账号从头到尾**没有被限流**。已修复：
+  - `publish` 响应匹配串修正
+  - 新增 `VERIFY_TEXTS`（短信验证码/本人操作/扫码…）与 `LIMIT_TEXTS`（限流类）两组关键词
+  - **接上平台自己的裁决接口** `passport/safe/query_decision/`，
+    读 `account_flow`：`verify` = 要人工验证，`block` = 被限制。
+    这是最权威的信号，比猜页面文案准得多。
+  - `RiskControl` 异常自带 `kind`，调用方不再重新匹配关键词（只有一套判据）
+  - 已把 4 条误判的运行记录改正，**冷却已清零**（原本还锁着 108 分钟）
+
+- **人工验证之后，评论可能根本没发出去**——现在会**先回查再决定**：
+  已经发出去 → 直接算成功（不重复发，重复评论是抖音的限流/封号风险）；
+  没发出去 → 补发一次。原来是直接跳过这条线索，等于白跑。
+
+### Changed
+- 飞书通知文案改成：抖音要的是**身份验证**，**扫码和短信都能用**，
+  并说明弹窗底部有「使用原设备扫码」。
+
+### Testing
+- 测试 271（+11）
+- 新增 `tests/test_douyin_verify.py`：关键词分类 / 裁决接口解析 /
+  publish URL 匹配 / 验证后回查与补发
+- 新增 `scripts/check_publish_response.py`：抓 publish 与裁决接口的响应体
+- 新增 `scripts/check_verify_stop.py`：端到端验证「要验证时正确停下叫人」
+- 实测：账号从未被限流，手机/电脑能留言完全正常
+
+---
+
 ## [2.0.21] - 2026-11-11
 
 ### Changed

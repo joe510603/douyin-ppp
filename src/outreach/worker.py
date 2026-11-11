@@ -32,7 +32,9 @@ from typing import Callable, Optional
 
 from .browser import Browser, Session
 from .copywriter import Copywriter
-from .douyin_api import Douyin, DouyinError, NoWorks, NotLoggedIn, RiskControl
+from .douyin_api import (
+    Douyin, DouyinError, NoWorks, NotLoggedIn, RiskControl, VERIFY_TEXTS,
+)
 from .store import (
     STATUS_COMMENTED,
     STATUS_FAILED,
@@ -186,7 +188,7 @@ class OutreachWorker:
     def _risk_kind(reason: str) -> str:
         """风控分三类，处理方式完全不同
 
-        - ``captcha``：要人工验证（短信/拖拽图形）→ 叫人、停下等
+        - ``captcha``：要人工验证（短信/图形验证码）→ 叫人、停下等
         - ``login``：登录态没了 → 叫人扫码
         - ``limit``：账号被限流 → 直接停，扫码没用
 
@@ -197,10 +199,10 @@ class OutreachWorker:
         现在统一成三类，**只有一套判据**——两套判据迟早会漂。）
         """
         r = str(reason or "").lower()
-        if any(h in r for h in ("验证码", "安全验证", "captcha", "verify")):
-            return "captcha"
         if any(h in r for h in ("登录", "login", "sessionid", "未登录", "扫码")):
             return "login"
+        if any(h in r for h in VERIFY_TEXTS):
+            return "captcha"
         return "limit"
 
     def _notify_risk(self, kind: str, reason: str, lead: Optional[dict] = None) -> bool:
@@ -234,11 +236,16 @@ class OutreachWorker:
         cool_min = int(getattr(self.cfg.outreach, "risk_cooldown_minutes", 120) or 120)
 
         if kind == "captcha":
-            title = "⚠️ 抖音触达撞上验证码，已暂停等你验证"
+            title = "⚠️ 抖音要求验证本人操作，触达已暂停等你处理"
             steps = (
+                "抖音在发评论时弹了**身份验证**（不是限流，账号是好的）：\n"
+                "  「为保障账号安全，请先完成身份验证，以确保为本人操作」\n\n"
+                "怎么办：\n"
                 "1. 回到网页「抖音触达」点橙色提示条里的「打开浏览器窗口」\n"
-                "   （窗口平时藏在屏幕外，点一下才会跳到屏幕中间）\n"
-                "2. 在那个窗口里把短信/拖拽图形验证过掉\n"
+                "   （窗口平时在屏幕右侧，点一下会跳到屏幕中间）\n"
+                "2. 在那个窗口里按抖音的提示验证：\n"
+                "   · **扫码验证**——弹窗底部有「使用原设备扫码」，用抖音 App 扫\n"
+                "   · 或者**短信验证码**——输入 187****52 收到的数字\n"
                 "3. 验证完**自动接着跑**，不用再点「继续」\n\n"
                 f"（{wait_min} 分钟内没人管就结束本轮）"
             )
@@ -633,7 +640,9 @@ class OutreachWorker:
                         self._handle_one(dy, lead, summary)
                         consecutive_errors = 0
                     except RiskControl as e:
-                        kind = self._risk_kind(str(e))
+                        # 优先用异常自带的类型（只有一套判据），
+                        # 老异常没有 kind 时再退回关键词判断。
+                        kind = getattr(e, "kind", "") or self._risk_kind(str(e))
                         self.stop_reason = f"触发风控：{e}"
                         self.log(f"🛑 {self.stop_reason}，立即停止")
                         self._emit(type="risk", lead=lead, error=str(e), kind=kind)
@@ -735,6 +744,53 @@ class OutreachWorker:
     # 单条线索
     # ================================================================
 
+    def _post_with_human_help(self, dy: Douyin, aweme_id: str, text: str,
+                              lead: dict) -> dict:
+        """发评论；如果抖音要人工验证，就叫人，处理完再发
+
+        为什么要有这一层
+        ----------------
+        抖音发评论时可能弹「身份验证」（短信验证码 / 扫码），
+        这时评论**根本没发出去**。如果只是抛异常让整轮结束，
+        这条线索就白跑了——人验完了，评论还是没发。
+
+        所以：叫人 → 等他验完 → **先回查**评论到底发出去没有：
+        - 发出去了（验证通过后抖音自动提交）→ 直接算成功
+        - 没发出去 → 补发一次
+
+        为什么要先回查再补发：重复评论在抖音是明确的限流/封号风险。
+        """
+        for _attempt in (1, 2):
+            try:
+                return dy.post_comment(aweme_id, text)
+            except RiskControl as e:
+                if getattr(e, "kind", "") != "verify":
+                    raise
+                # 要人工验证 → 叫人
+                self.stop_reason = f"触发风控：{e}"
+                self.log(f"🛑 {self.stop_reason}")
+                self._emit(type="risk", lead=lead, error=str(e), kind="verify")
+                self._bring_window_back()
+                self._notify_risk("captcha", str(e), lead)
+                if not self._wait_for_human(str(e)):
+                    raise DouyinError(f"验证码未人工处理：{e}") from e
+                self.stop_reason = ""
+
+                # 验证完了：这条评论到底发出去了没有？
+                found = False
+                try:
+                    chk = dy.check_comment(aweme_id, text, nickname=None, scrolls=4)
+                    found = bool(chk.get("found"))
+                except Exception as e:
+                    self.log(f"  （回查出错：{str(e)[:60]}）")
+                if found:
+                    self.log("  ✓ 验证通过，回查发现评论已经发出去了")
+                    return {"ok": True, "status_code": 0, "verified": True}
+                # 没发出去 → 补发一次
+                self.log("  ↻ 验证通过了，但评论没发出去，补发一次")
+                continue
+        return {"ok": False, "status_code": -1, "msg": "验证后仍没能发出评论"}
+
     def _handle_one(self, dy: Douyin, lead: dict, summary: dict) -> None:
         """处理一条线索：找人 → 挑作品 → 生成话术 → 发送 → 回查"""
         o = self.cfg.outreach
@@ -785,7 +841,7 @@ class OutreachWorker:
             return
 
         # d. 发送
-        res = dy.post_comment(work["aweme_id"], text)
+        res = self._post_with_human_help(dy, work["aweme_id"], text, lead)
         if not res.get("ok"):
             raise DouyinError(f"发送失败：{res.get('msg')}（code={res.get('status_code')}）")
 

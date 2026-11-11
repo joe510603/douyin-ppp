@@ -21,6 +21,41 @@ from playwright.sync_api import Page, Response
 
 DOUYIN = "https://www.douyin.com"
 
+# ================================================================
+# 风控 / 验证信号
+# ================================================================
+# 「要人来验证」→ 停下叫人
+# 「账号被限制」→ 直接停，扫码没用
+#
+# 踩过的坑（2026-11-11 实测）：抖音发评论时会弹**「接收短信验证码」**对话框
+# 「为确保是本人操作抖音账号，请输入当前手机号 xxx 收到的短信验证码」。
+# 这个弹窗**不在**常见的验证码关键词里 → 之前完全没被识别，
+# 于是流程一路走下去，最后被误判成「账号被限流（软风控）」。
+#
+# 教训：抖音要「本人操作验证」时可能用**短信**而不是图形验证码，
+# 关键词必须覆盖弹窗的**实际文案**，不能只认「安全验证」四个字。
+VERIFY_TEXTS = (
+    "请完成安全验证",
+    "安全验证",
+    "验证码控件",
+    "接收短信验证码",
+    "为确保是本人操作",
+    "请输入验证码",
+    "获取验证码",
+    "短信验证码",
+)
+
+# 账号被限制的信号——这些不是「人来验证一下」能解决的
+LIMIT_TEXTS = (
+    "操作频繁",
+    "访问频繁",
+    "账号存在异常",
+    "请稍后再试",
+    "环境异常",
+)
+
+RISK_TEXTS = VERIFY_TEXTS + LIMIT_TEXTS
+
 
 class DouyinError(Exception):
     pass
@@ -31,7 +66,19 @@ class NotLoggedIn(DouyinError):
 
 
 class RiskControl(DouyinError):
-    """验证码 / 操作频繁 / 账号异常：必须停下来，不能硬刚。"""
+    """验证码 / 操作频繁 / 账号异常：必须停下来，不能硬刚。
+
+    ``kind`` 决定怎么处理：
+    - ``verify``：要人工验证（短信验证码 / 图形验证码）→ 叫人，停下等他
+    - ``limit``：账号被限制 → 直接停，扫码没用
+
+    把它放在异常里而不是靠调用方重新匹配关键词，
+    是为了**只有一套判据**——两处判据迟早会漂。
+    """
+
+    def __init__(self, message: str, kind: str = "limit"):
+        super().__init__(message)
+        self.kind = kind
 
 
 class NoWorks(DouyinError):
@@ -46,6 +93,43 @@ class Douyin:
         self.shot_dir = pathlib.Path(shot_dir) if shot_dir else None
         if self.shot_dir:
             self.shot_dir.mkdir(parents=True, exist_ok=True)
+        # 抖音的风控裁决（来自 passport/safe/query_decision/）
+        #   account_flow = "verify" → 要本人验证（短信/扫码），不是被限流
+        #   account_flow = "block"  → 账号被限制
+        # 这是平台自己给的结论，比我们猜页面文案准得多。
+        self.verify_flow = ""
+        self.verify_ways: list[str] = []
+        try:
+            page.on("response", self._on_decision)
+        except Exception:
+            pass
+
+    def _on_decision(self, r: Response) -> None:
+        """盯抖音的风控裁决接口
+
+        实测（2026-11-11）：发评论时抖音返回
+            account_flow = "verify"
+            verify_ways = [mobile_sms_verify, qr_code_verify]
+        也就是「要证明是本人操作」，**不是**账号被限流。
+        之前没看这个接口，只靠页面文案猜，才误判成限流。
+        """
+        try:
+            if "safe/query_decision" not in (r.url or ""):
+                return
+            j = json.loads(r.text())
+        except Exception:
+            return
+        d = j.get("data") or {}
+        flow = str(d.get("account_flow") or "")
+        if flow:
+            self.verify_flow = flow
+        ways = []
+        for w in (d.get("verify_ways") or []):
+            v = w.get("verify_way") or ""
+            if v:
+                ways.append(v)
+        if ways:
+            self.verify_ways = ways
 
     # ------------------------------------------------------------------ 基础
     def _shot(self, tag: str) -> str | None:
@@ -69,12 +153,24 @@ class Douyin:
         url = self.page.url or ""
         if "/verify" in url or "captcha" in url:
             self._shot("risk_captcha")
-            raise RiskControl("跳转到安全验证页")
+            raise RiskControl("跳转到安全验证页", kind="verify")
+        # 平台自己的裁决最准：account_flow=verify 就是「要本人验证」
+        if getattr(self, "verify_flow", "") == "verify":
+            self._shot("risk_verify")
+            ways = "、".join(self.verify_ways) if self.verify_ways else ""
+            raise RiskControl(
+                "抖音要求验证本人操作才能发评论"
+                + (f"（可用的验证方式：{ways}）" if ways else ""),
+                kind="verify")
         txt = self._body_text()
-        for kw in ("请完成安全验证", "操作频繁", "访问频繁", "账号存在异常", "请稍后再试", "环境异常"):
+        for kw in VERIFY_TEXTS:
+            if kw in txt:
+                self._shot("risk_verify")
+                raise RiskControl(f"页面要求人工验证（{kw}）", kind="verify")
+        for kw in LIMIT_TEXTS:
             if kw in txt:
                 self._shot("risk_text")
-                raise RiskControl(f"页面提示：{kw}")
+                raise RiskControl(f"页面提示：{kw}", kind="limit")
         # 抖音页面常驻一个空的 #captcha_container 壳子，count>0 不代表真有验证码。
         # 只有「占位够大 + 里面有文字」才算真验证码。
         try:
@@ -693,11 +789,15 @@ class Douyin:
 
         data: list = []
         for attempt in (1, 2):
-            data = self._capture("/comment/publish/", send_once, timeout=9000,
+            data = self._capture("/comment/publish", send_once, timeout=9000,
                                  expect=lambda j: "status_code" in j)
-            self.check_risk()
             if data:
+                # 拿到明确回执就以回执为准，别被页面上的弹窗带偏
                 break
+            # 没有回执：先判断平台是不是要人工验证 / 限流。
+            # （顺序很重要：以前这里先 check_risk，导致
+            #   「抖音要求验证」的信号把「其实已发出去」的情况也误伤了。）
+            self.check_risk()
             # 没有 publish 响应：先看这条评论是不是其实已经出现了
             if self._comment_appeared(text, timeout=4000):
                 self.log("  ✓ 没抓到响应，但评论已出现在页面")
@@ -730,8 +830,14 @@ class Douyin:
                 cid = c.get("cid") or c.get("comment_id")
                 break
         ok = status_code == 0
-        shot = None if ok else self._shot("comment_fail")
-        return {"ok": ok, "status_code": status_code, "msg": msg, "comment_id": cid, "shot": shot}
+        if not ok:
+            # 被拒了：看看是不是「要人工验证」——那种情况人是可以解决的，
+            # 必须叫人来，不能当成「发不出去」然后误判成账号限流。
+            self.check_risk()
+            shot = self._shot("comment_fail")
+            return {"ok": False, "status_code": status_code, "msg": msg,
+                    "comment_id": cid, "shot": shot}
+        return {"ok": True, "status_code": status_code, "msg": msg, "comment_id": cid}
 
     def _comment_appeared(self, text: str, timeout: float = 8000) -> bool:
         """在页面/评论区里找刚发出的那段文字，找到才算真发出去。"""
