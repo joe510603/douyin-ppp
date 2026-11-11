@@ -174,7 +174,10 @@ def create_outreach_page():
             outreach_log.push(line)
 
         if result.get("need_login"):
-            ui.notify("需要登录：请先扫码登录触达专用浏览器", type="warning")
+            ui.notify("需要登录：请点「扫码登录」扫码", type="negative")
+        elif result.get("error"):
+            # 冷却中 / 撞风控 → 说清楚为什么，别只丢一句「失败」
+            ui.notify(str(result["error"])[:120], type="negative")
         elif failed:
             ui.notify(msg, type="warning")
         else:
@@ -234,6 +237,25 @@ def create_outreach_page():
                     )
 
                 outreach_status = ui.label("").classes("text-caption")
+
+                # ---- 停手横幅：触达被风控/登录挡住时，必须一眼看到 + 知道怎么办 ----
+                # 之前这些情况只有一行日志，网页上一片安静，
+                # 用户既不知道发生了什么，也不知道该干什么（以为要扫码，其实不用）。
+                with ui.element("div").classes("w-full q-mt-sm q-pa-md").style(
+                    "background:#fdecec; border:1px solid #e05252; border-radius:8px;"
+                ) as stop_box:
+                    stop_box.set_visibility(False)
+                    with ui.row().classes("w-full items-center q-gutter-sm"):
+                        stop_text = ui.label("").classes("col")
+                        ui.space()
+                        stop_login_btn = ui.button("扫码登录", on_click=_do_login).props(
+                            "unelevated color=negative"
+                        )
+                        stop_login_btn.set_visibility(False)
+                        stop_dismiss = ui.button("知道了", on_click=lambda: stop_box.set_visibility(False)).props(
+                            "flat dense"
+                        )
+                        stop_dismiss.set_visibility(False)
 
                 # ---- 话术预览（不发任何东西，先看要说什么）----
                 with ui.expansion("将要发出去的话术（预览）", value=True).classes("w-full"):
@@ -360,6 +382,42 @@ def create_outreach_page():
                             "（点「我验证好了，继续」也行；超过 "
                             f"{captcha_wait_minutes} 分钟没人管就结束本轮）"
                         )
+
+                    # ---- 停手横幅（限流 / 登录失效）----
+                    # 这两种不是「等一下就好」，必须说清楚到底怎么了、该干什么。
+                    stop = p.get("risk_stop") or {}
+                    kind = stop.get("kind") or ""
+                    show_stop = kind in ("limit", "login", "captcha") and not p.get("running")
+                    stop_box.set_visibility(show_stop)
+                    if show_stop:
+                        stop_login_btn.set_visibility(kind == "login")
+                        stop_dismiss.set_visibility(True)
+                        reason = stop.get("reason") or ""
+                        if kind == "login":
+                            stop_text.text = (
+                                "🔑 登录态失效，触达跑不动了（搜不到人也发不了评论）。\n"
+                                f"原因：{reason}\n"
+                                "点右边「扫码登录」→ 用抖音 App 扫一下 → 回来再点「开始触达」。"
+                            )
+                        elif kind == "captcha":
+                            stop_text.text = (
+                                "⏸ 撞上验证码，但这次没人处理，本轮已经结束了。\n"
+                                f"原因：{reason}\n"
+                                "重新点「开始触达」，撞上验证码时在下面的橙色条里点"
+                                "「打开浏览器窗口」，自己把验证过掉。"
+                            )
+                        else:
+                            stop_text.text = (
+                                "🛑 账号被限流（软风控），已停手。\n"
+                                f"原因：{reason}\n"
+                                "评论发出去了、也没报错，但页面上看不到——抖音把它静默吞了。\n"
+                                "扫码没用，这不是登录问题。怎么办：\n"
+                                "1. 冷却期内别再发（还剩 "
+                                f"{cooldown} 分钟）\n"
+                                "2. 用抖音 App 手动发一条试试：能发出去 = 等冷却完再跑；"
+                                "也发不出去 = 账号确实被限流，等抖音解封（几小时到一天）\n"
+                                "3. 还是不行就换个抖音号"
+                            )
 
                     console_bar.value = min(1.0, done / total) if total else 0
 

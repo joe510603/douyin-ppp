@@ -60,6 +60,9 @@ class OutreachRunner:
         self._show_window = threading.Event()
         self._waiting_human = False
         self._captcha_reason = ""
+        # 最近一次「触达停手」的情况：{"kind": "limit"/"captcha"/"login", "reason": ...}
+        # 网页上要显示醒目横幅 + 行动指引，不能只留一行日志
+        self._risk_stop: dict = {}
 
     @property
     def is_running(self) -> bool:
@@ -127,6 +130,7 @@ class OutreachRunner:
         p["cooldown"] = self.risk_cooldown_left()
         p["waiting_human"] = self._waiting_human
         p["captcha_reason"] = self._captcha_reason
+        p["risk_stop"] = self.last_risk_stop()
         return p
 
     def _append_log(self, msg: str) -> None:
@@ -181,6 +185,35 @@ class OutreachRunner:
                 return int(left)
         return 0
 
+    def last_risk_stop(self) -> dict:
+        """最近一次「触达停手」的情况
+
+        内存里的状态重启就没了，但停手这件事记在 ``outreach_runs.note`` 里，
+        页面刷新、服务重启之后都该继续显示横幅——
+        用户不一定记得十分钟前跑过一次，不能让他对着空气猜。
+        """
+        if self._risk_stop:
+            return dict(self._risk_stop)
+        try:
+            st = OutreachStore(self._db_path())
+            try:
+                runs = st.recent_runs(limit=5)
+            finally:
+                st.close()
+        except Exception:
+            return {}
+        for r in runs:
+            note = str(r.get("note") or "")
+            if not note:
+                continue
+            if "限流" in note or "软风控" in note:
+                return {"kind": "limit", "reason": note}
+            if "验证码" in note:
+                return {"kind": "captcha", "reason": note}
+            if "登录" in note:
+                return {"kind": "login", "reason": note}
+        return {}
+
     def _db_path(self) -> str:
         db = get_db()
         path = getattr(db, "db_path", None)
@@ -226,6 +259,8 @@ class OutreachRunner:
 
         self._running = True
         self._logs = []
+        # 新一轮开始：清掉上一轮的停手横幅
+        self._risk_stop = {}
         started = datetime.now().strftime("%H:%M:%S")
         self._append_log(f"▶ [{started}] 触达任务开始"
                           f"{'（干跑）' if (o.dry_run if dry_run is None else dry_run) else ''}")
@@ -322,9 +357,21 @@ class OutreachRunner:
                 self._progress[key] = int(self._progress.get(key) or 0) + 1
                 self._progress["current"] = ""
         if t == "need_login":
+            self._risk_stop = {"kind": "login", "reason": "触达浏览器没有登录态"}
             self._append_log("⚠️ 需要登录：请先扫码登录触达专用浏览器")
         elif t == "risk":
-            self._append_log(f"🛑 风控：{event.get('error')}")
+            kind = str(event.get("kind") or "limit")
+            self._risk_stop = {"kind": kind, "reason": str(event.get("error") or "")}
+            if kind == "login":
+                self._append_log(f"🔑 登录态失效：{event.get('error')}　→ 请扫码登录")
+            elif kind == "captcha":
+                self._append_log(f"⏸ 撞上验证码：{event.get('error')}　→ 已在下方等你验证")
+            else:
+                self._append_log(
+                    f"🛑 账号被限流（软风控）：{event.get('error')}\n"
+                    "   扫码没用——是账号被限流了，冷却 "
+                    f"{self.risk_cooldown_left()} 分钟内别再发"
+                )
         elif t == "sent":
             self._append_log(f"✅ 已留言：{event.get('text', '')[:40]}")
         elif t == "captcha_wait":

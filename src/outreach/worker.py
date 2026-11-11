@@ -183,23 +183,37 @@ class OutreachWorker:
     # ================================================================
 
     @staticmethod
-    def _is_captcha(reason: str) -> bool:
-        """这次风控是「要人工验证」还是「账号被限流」
+    def _risk_kind(reason: str) -> str:
+        """风控分三类，处理方式完全不同
 
-        两者的处理完全不同：
-        - 验证码（短信/拖拽图形）：平台要你证明你是人 → 叫人、停下等他验证
-        - 限流（操作频繁/环境异常）：平台不给过了 → 硬刚只会把号搞废，直接停
+        - ``captcha``：要人工验证（短信/拖拽图形）→ 叫人、停下等
+        - ``login``：登录态没了 → 叫人扫码
+        - ``limit``：账号被限流 → 直接停，扫码没用
 
-        ``douyin_api.check_risk`` 抛的异常文本里带上了来源，这里按关键词分。
+        分类必须准：验证码当限流处理，人不在电脑前就白跑一轮；
+        限流当验证码处理，会停在那儿等一个永远不会来的人。
+
+        （以前这里还有个 ``_is_captcha``，只分「验证码 / 其他」。
+        现在统一成三类，**只有一套判据**——两套判据迟早会漂。）
         """
         r = str(reason or "").lower()
-        return any(h in r for h in ("验证码", "安全验证", "captcha", "verify"))
+        if any(h in r for h in ("验证码", "安全验证", "captcha", "verify")):
+            return "captcha"
+        if any(h in r for h in ("登录", "login", "sessionid", "未登录", "扫码")):
+            return "login"
+        return "limit"
 
-    def _notify_captcha(self, reason: str, lead: Optional[dict] = None) -> bool:
-        """撞到验证码 → 飞书私聊通知你
+    def _notify_risk(self, kind: str, reason: str, lead: Optional[dict] = None) -> bool:
+        """触达停手了 → 飞书私聊通知你
 
-        验证码需要人工过，人又多半不在电脑前，
-        所以必须主动推一条消息过去（飞书手机端有推送）。
+        **任何**让触达停下来的情况都要通知，不能只有验证码才发。
+        之前软风控停了却一声不吭，用户在网页上只看到一行日志，
+        既不知道发生了什么，也不知道该干什么。
+
+        三种情况给三种指引：
+        - captcha：要人工验证 → 叫人 + 停下等
+        - login：登录态没了 → 叫人扫码
+        - limit：账号被限流 → 扫码没用，得等解封
         """
         n = self.cfg.notify
         if not getattr(n, "lark_im_enabled", False):
@@ -216,19 +230,51 @@ class OutreachWorker:
             self.log("  （没配 lark_im_open_id，发不出去）")
             return False
 
+        wait_min = int(getattr(self.cfg.outreach, "captcha_wait_minutes", 15) or 15)
+        cool_min = int(getattr(self.cfg.outreach, "risk_cooldown_minutes", 120) or 120)
+
+        if kind == "captcha":
+            title = "⚠️ 抖音触达撞上验证码，已暂停等你验证"
+            steps = (
+                "1. 回到网页「抖音触达」点橙色提示条里的「打开浏览器窗口」\n"
+                "   （窗口平时藏在屏幕外，点一下才会跳到屏幕中间）\n"
+                "2. 在那个窗口里把短信/拖拽图形验证过掉\n"
+                "3. 验证完**自动接着跑**，不用再点「继续」\n\n"
+                f"（{wait_min} 分钟内没人管就结束本轮）"
+            )
+        elif kind == "login":
+            title = "🔑 抖音触达登录态失效了，需要你扫码"
+            steps = (
+                "1. 回到网页「抖音触达」点「扫码登录」\n"
+                "2. 用抖音 App 扫那个窗口里的二维码\n"
+                "3. 扫完回来再点「开始触达」\n\n"
+                "（不扫码的话触达跑不了：搜不到人也发不了评论）"
+            )
+        else:
+            title = "🛑 抖音触达撞上账号限流，已停手"
+            steps = (
+                "**这不是验证码，扫码也没用**——是账号被限流了：\n"
+                "评论发出去不报错，但页面上看不到，抖音把它静默吞了。\n\n"
+                "怎么办：\n"
+                "1. 立刻别再发评论（系统已经自动停了，冷却 "
+                f"{cool_min} 分钟）\n"
+                "2. 用抖音 App **手动**发一条评论试试：\n"
+                "   · 能发出去 = 触达这边还有点问题，冷却完再试\n"
+                "   · 也发不出去/看不到 = 账号确实被限流了，\n"
+                "     只能等抖音自己解封（通常几小时到一天）\n"
+                "3. 冷却结束后再跑，先开「干跑」看话术再开真发\n"
+                "4. 还是不行就换个抖音号\n"
+            )
+
         who = ""
         if lead:
             who = f"抖音号 {lead.get('display_id') or ''}"
         text = (
-            "⚠️ 抖音触达撞上验证码，已暂停等你验证\n\n"
+            f"{title}\n\n"
             f"原因：{reason}\n"
             + (f"卡在：{who}\n" if who else "")
-            + "\n处理办法：\n"
-            "1. 回到网页「抖音触达」页面，点橙色提示条里的「打开浏览器窗口」\n"
-            "   （它平时藏在屏幕外，点一下才会跳到屏幕中间）\n"
-            "2. 在那个窗口里把短信/拖拽图形验证过掉\n"
-            "3. 验证完**自动接着跑**，不用再点「继续」\n\n"
-            f"（{int(getattr(self.cfg.outreach, 'captcha_wait_minutes', 15) or 15)} 分钟内没人管就结束本轮）"
+            + "\n"
+            + steps
         )
         try:
             ok, err = _run_coro_blocking(notifier.send_text(text), timeout=30)
@@ -568,16 +614,17 @@ class OutreachWorker:
                         self._handle_one(dy, lead, summary)
                         consecutive_errors = 0
                     except RiskControl as e:
+                        kind = self._risk_kind(str(e))
                         self.stop_reason = f"触发风控：{e}"
                         self.log(f"🛑 {self.stop_reason}，立即停止")
-                        self._emit(type="risk", lead=lead, error=str(e))
+                        self._emit(type="risk", lead=lead, error=str(e), kind=kind)
 
                         # 验证码要人工过：叫人 + 把窗口叫回来 + 停下等他。
                         # 注意这跟「账号被限流」是两回事：
                         # 限流是平台不给过了，验证码是平台要你证明你是人。
-                        if self._is_captcha(str(e)):
+                        if kind == "captcha":
                             self._bring_window_back()
-                            self._notify_captcha(str(e), lead)
+                            self._notify_risk("captcha", str(e), lead)
                             if self._wait_for_human(str(e)):
                                 # 人工验证完了：这条线索退回待触达，重新来
                                 self._set_status(lead, STATUS_PENDING, "验证码已人工处理，重新排队")
@@ -586,13 +633,20 @@ class OutreachWorker:
                                 continue
                             self.stop_reason = f"验证码未人工处理：{e}"
                         else:
-                            # 限流之类：这条线索算失败
+                            # 限流/软风控：直接停，而且**必须通知人**。
+                            # 以前只有验证码分支发飞书，软风控停了却一声不吭，
+                            # 用户在网页上只看到一行日志，既不知道发生了什么，
+                            # 也不知道该怎么办（扫码也没用，限流不是登录问题）。
+                            self._notify_risk(kind, str(e), lead)
                             self._set_status(lead, STATUS_FAILED, str(e))
                             summary["failed"] += 1
                         break
                     except NotLoggedIn as e:
+                        # 登录态没了 → 叫人扫码（这个是能解决的！）
                         self.stop_reason = f"登录失效：{e}"
                         self.log(f"🛑 {self.stop_reason}")
+                        self._emit(type="risk", lead=lead, error=str(e), kind="login")
+                        self._notify_risk("login", str(e), lead)
                         self._set_status(lead, STATUS_FAILED, str(e))
                         summary.update({"ok": False, "need_login": True})
                         break

@@ -27,19 +27,16 @@ from src.outreach.worker import OutreachWorker
 
 
 # ============================================================
-# 区分：验证码 vs 限流
+# 区分：验证码 vs 限流 vs 登录失效
 # ============================================================
 
-def test_验证码被识别出来():
+def test_三种停手分类正确():
     for msg in ("跳转到安全验证页", "出现验证码控件", "页面提示：请完成安全验证"):
-        assert OutreachWorker._is_captcha(msg), msg
+        assert OutreachWorker._risk_kind(msg) == "captcha", msg
 
-
-def test_限流不算验证码():
-    """限流要直接停，等人来处理没有意义"""
     for msg in ("页面提示：操作频繁", "页面提示：账号存在异常",
                 "页面提示：环境异常", "页面提示：访问频繁"):
-        assert not OutreachWorker._is_captcha(msg), msg
+        assert OutreachWorker._risk_kind(msg) == "limit", msg
 
 
 # ============================================================
@@ -128,7 +125,7 @@ def test_通知失败不影响流程(tmp_path, monkeypatch):
     w, ev = _worker(tmp_path)
     cfg = w.cfg
     cfg.notify.lark_im_enabled = False
-    assert w._notify_captcha("出现验证码控件") is False
+    assert w._notify_risk("captcha", "出现验证码控件") is False
     # 没开通知时也要正常往下走
     assert w._wait_for_human("出现验证码控件") in (True, False)
 
@@ -143,8 +140,67 @@ def test_通知开关关着就不发(tmp_path, monkeypatch):
         lambda *a, **k: type("N", (), {"is_configured": True,
                                        "send_text": lambda self, t: sent.append(t)})(),
     )
-    assert w._notify_captcha("出现验证码控件") is False
+    assert w._notify_risk("captcha", "出现验证码控件") is False
     assert sent == [], "通知开关关着就不该发"
+
+
+# ============================================================
+# 三种停手：都要通知，而且指引不一样
+# ============================================================
+
+def test_三种停手都能分类():
+    assert OutreachWorker._risk_kind("出现验证码控件") == "captcha"
+    assert OutreachWorker._risk_kind("跳转到安全验证页") == "captcha"
+    assert OutreachWorker._risk_kind("没有登录态（cookie 里没有 sessionid）") == "login"
+    assert OutreachWorker._risk_kind("登录失效") == "login"
+    # 软风控那段话里没有「验证码」「登录」，应该归到 limit
+    assert OutreachWorker._risk_kind(
+        "连续 2 条评论发出去但页面看不到，判定账号被限流（软风控），已停手。"
+    ) == "limit"
+    assert OutreachWorker._risk_kind("页面提示：操作频繁") == "limit"
+    assert OutreachWorker._risk_kind("页面提示：环境异常") == "limit"
+
+
+def _capture_notify(tmp_path, monkeypatch, kind, reason):
+    """跑一次通知，把发出去的文本抓回来"""
+    w, ev = _worker(tmp_path)
+    w.cfg.notify.lark_im_enabled = True
+    sent = []
+    monkeypatch.setattr(
+        "src.notify.lark_im.get_im_notifier",
+        lambda *a, **k: type("N", (), {"is_configured": True,
+                                       "send_text": lambda self, t: sent.append(t) or (True, "")})(),
+    )
+    w._notify_risk(kind, reason, {"display_id": "123456"})
+    return sent[0] if sent else ""
+
+
+def test_限流的通知要说清扫码没用(tmp_path, monkeypatch):
+    """用户最容易误会的一点：限流不是登录问题，扫码没用"""
+    text = _capture_notify(tmp_path, monkeypatch, "limit", "账号被限流（软风控）")
+    assert "限流" in text
+    assert "扫码" in text and "没用" in text, "得说清扫码没用（用户最容易误会成登录问题）"
+    assert "抖音 App" in text, "得告诉用户怎么自己判断是不是真被限流"
+    assert "冷却" in text
+
+
+def test_登录失效的通知要提示扫码(tmp_path, monkeypatch):
+    text = _capture_notify(tmp_path, monkeypatch, "login", "没有登录态")
+    assert "扫码" in text
+    assert "登录" in text
+
+
+def test_验证码的通知要说清怎么验(tmp_path, monkeypatch):
+    text = _capture_notify(tmp_path, monkeypatch, "captcha", "出现验证码控件")
+    assert "验证码" in text
+    assert "打开浏览器窗口" in text, "得告诉他窗口平时是藏着的"
+
+
+def test_三种通知内容互不相同(tmp_path, monkeypatch):
+    a = _capture_notify(tmp_path, monkeypatch, "limit", "x")
+    b = _capture_notify(tmp_path, monkeypatch, "login", "x")
+    c = _capture_notify(tmp_path, monkeypatch, "captcha", "x")
+    assert len({a, b, c}) == 3, "三种情况的指引不能一样"
 
 
 # ============================================================
