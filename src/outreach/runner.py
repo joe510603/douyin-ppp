@@ -157,8 +157,18 @@ class OutreachRunner:
     def risk_cooldown_left(self) -> int:
         """风控冷却还剩多少分钟（0 = 可以跑）
 
-        抖音软风控（评论发出去但页面看不到）一旦触发，
-        继续发只会把号搞废——冷却期内直接拒绝启动。
+        **只有真的限流才冷却。**
+
+        「抖音要求验证本人操作」不是限流 —— 那是平台要你证明你是人，
+        验证完该继续就继续，不该把人锁在冷却里干等两小时。
+
+        之前这里只看 note 里有没有「风控」「限流」两个字，
+        结果「触发风控：抖音要求验证本人操作才能发评论…」这种文案
+        也被当成限流 → 凭空把人卡住 120 分钟。
+        （2026-11-11 实测：#10 那轮要的是验证，却被判成限流；
+        11:35 + 120 分 = 13:35，用户 13:10 想跑被拦住，
+        提示「账号疑似被限流（软风控），冷却中，还剩 25 分钟」——
+        数字精确吻合，就是这一条干的。）
         """
         try:
             st = OutreachStore(self._db_path())
@@ -173,9 +183,15 @@ class OutreachRunner:
         if minutes <= 0:
             return 0
         for r in runs:
-            note = str(r.get("note") or "")
-            if "风控" not in note and "限流" not in note:
-                continue
+            kind = str(r.get("kind") or "").strip().lower()
+            if kind:
+                # 新记录：直接看存下来的种类，只有 limit 才冷却
+                if kind != KIND_LIMIT:
+                    continue
+            else:
+                # 老记录没有 kind 列：退回按文案判断（只认真的限流）
+                if self._kind_from_note(str(r.get("note") or "")) != KIND_LIMIT:
+                    continue
             started = str(r.get("started_at") or "")
             try:
                 t = datetime.strptime(started, "%Y-%m-%d %H:%M:%S")
@@ -235,7 +251,7 @@ class OutreachRunner:
                                  "账号存在异常", "环境异常")):
             return KIND_LIMIT
         if any(k in n for k in ("验证码", "验证本人", "要求验证", "安全验证",
-                                 "人工验证", "本人操作")):
+                                 "人工验证", "本人操作", "身份验证")):
             return KIND_VERIFY
         if any(k in n for k in ("登录", "sessionid", "未登录", "扫码登录")):
             return KIND_LOGIN

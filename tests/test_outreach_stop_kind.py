@@ -131,6 +131,62 @@ def test_内存里的状态优先于数据库(tmp_path):
 
 
 # ============================================================
+# 冷却：只有真限流才锁人
+# ============================================================
+
+def test_要本人验证不该触发冷却(tmp_path):
+    """验证 ≠ 限流，不该把人锁在冷却里干等两小时
+
+    2026-11-11 实测踩到：#10 那轮要的是「本人操作验证」，
+    但冷却逻辑只看 note 里有没有「风控」「限流」两个字 →
+    「触发风控：抖音要求验证本人操作才能发评论…」也被当成限流，
+    凭空卡了 120 分钟（用户 13:10 想跑，提示「还剩 25 分钟」，
+    11:35 + 120 = 13:35，数字精确吻合）。
+    """
+    db = tmp_path / "t.db"
+    _写一轮(db, "触发风控：抖音要求验证本人操作才能发评论"
+                "（可用的验证方式：mobile_sms_verify、qr_code_verify）",
+            kind="verify")
+    r = _runner_with_db(db)
+    assert r.risk_cooldown_left() == 0, "要验证不是限流，不该冷却"
+
+
+def test_老记录里要验证的也不该冷却(tmp_path):
+    """老记录没有 kind 列，靠文案判断也不能误判成限流"""
+    db = tmp_path / "t.db"
+    _写一轮(db, "触发风控：抖音要求验证本人操作才能发评论"
+                "（可用的验证方式：qr_code_verify）")
+    r = _runner_with_db(db)
+    assert r.risk_cooldown_left() == 0
+
+
+def test_真的限流还是要冷却(tmp_path):
+    """限流保护不能丢——真被限流了还是要拦住"""
+    db = tmp_path / "t.db"
+    _写一轮(db, "触发风控：连续 2 条评论发出去但页面看不到，"
+                "判定账号被限流（软风控），已停手。冷却 120 分钟后再试",
+            kind="limit")
+    r = _runner_with_db(db)
+    left = r.risk_cooldown_left()
+    assert left > 0, "真限流必须冷却"
+    assert left <= 120
+
+
+def test_老记录里真限流的还是要冷却(tmp_path):
+    db = tmp_path / "t.db"
+    _写一轮(db, "触发风控：页面提示：操作频繁")
+    r = _runner_with_db(db)
+    assert r.risk_cooldown_left() > 0
+
+
+def test_干跑记录不触发冷却(tmp_path):
+    db = tmp_path / "t.db"
+    _写一轮(db, "干跑", kind="")
+    r = _runner_with_db(db)
+    assert r.risk_cooldown_left() == 0
+
+
+# ============================================================
 # 前后端词汇必须一致
 # ============================================================
 

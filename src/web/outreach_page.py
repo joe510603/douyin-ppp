@@ -390,7 +390,8 @@ def create_outreach_page():
                         if mode:
                             bits.append(f"模式 {mode}")
                     if cooldown:
-                        bits.append(f"🛑 风控冷却剩 {cooldown} 分钟")
+                        # 只有真限流才会 >0（要本人验证不算限流）
+                        bits.append(f"🛑 账号限流冷却剩 {cooldown} 分钟")
                     if p.get("waiting_human"):
                         bits.append("⏸ 等你人工验证")
                     if p.get("sent"):

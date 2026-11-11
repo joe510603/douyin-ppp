@@ -46,11 +46,15 @@ VERIFY_TEXTS = (
 )
 
 # 账号被限制的信号——这些不是「人来验证一下」能解决的
+#
+# ⚠️ 这里的词要**明确表示限制**。「请稍后再试」原来也在表里，
+# 但它太泛了——网络抖一下、页面加载慢，页面都可能写这句，
+# 判成限流会直接锁 120 分钟 + 发一条「扫码没用」的错误通知。
+# 误判「限流」的代价太大，宁可漏判也不能乱判。
 LIMIT_TEXTS = (
     "操作频繁",
     "访问频繁",
     "账号存在异常",
-    "请稍后再试",
     "环境异常",
 )
 
@@ -242,7 +246,11 @@ class Douyin:
             real_captcha = False
         if real_captcha:
             self._shot("risk_captcha_dom")
-            raise RiskControl("出现验证码控件")
+            # ⚠️ 必须带 kind：验证码是「要人来验一下」，
+            # 不是「账号被限流」。不带 kind 的话，
+            # post_comment 的重试逻辑会把它当限流直接抛掉，
+            # 走不到「叫人 + 等人工验证 + 回查」那套流程。
+            raise RiskControl("出现验证码控件", kind=KIND_VERIFY)
 
     def cookies_ok(self) -> bool:
         try:
