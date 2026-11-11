@@ -241,6 +241,11 @@ class OutreachConfig(BaseModel):
     intent_levels: list[str] = []
     # 只触达这些门店（空 = 全部）
     stores: list[str] = []
+    # 触达排序：recent = 最近抓到的优先（默认）/ intent = 高意向优先
+    #
+    # recent 为什么是默认：直播间里刚问完价的人是最"热乎"的，
+    # 他可能人就在直播间等着回复——先给他留言，转化最高。
+    sort_by: str = "recent"
 
     # ---- 浏览器 ----
     # 专用浏览器 profile 目录（扫码一次，长期复用）

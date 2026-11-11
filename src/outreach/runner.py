@@ -271,6 +271,7 @@ class OutreachRunner:
         only: Optional[list[str]] = None,
         delay_min: Optional[float] = None,
         delay_max: Optional[float] = None,
+        sort_by: Optional[str] = None,
     ) -> dict:
         """跑一轮触达任务
 
@@ -280,6 +281,7 @@ class OutreachRunner:
             only: 只处理指定的抖音号
             delay_min / delay_max: 本轮的两条之间间隔（秒），
                 留空就用配置里的 min_delay / max_delay
+            sort_by: 本轮排序（recent / intent），留空用配置里的
 
         Returns:
             {"ok", "total", "sent", "failed", "skipped", "dry", "stopped"}
@@ -318,7 +320,7 @@ class OutreachRunner:
             result = await loop.run_in_executor(
                 None,
                 self._run_in_thread,
-                limit, dry_run, only, delay_min, delay_max,
+                limit, dry_run, only, delay_min, delay_max, sort_by,
             )
         except Exception as e:
             log.error(f"触达任务异常: {e}", exc_info=True)
@@ -340,7 +342,8 @@ class OutreachRunner:
         log.info(f"[触达] 任务结束：{summary}")
         return result
 
-    def _run_in_thread(self, limit, dry_run, only, delay_min=None, delay_max=None) -> dict:
+    def _run_in_thread(self, limit, dry_run, only, delay_min=None, delay_max=None,
+                       sort_by=None) -> dict:
         """在线程里跑 worker（同步）"""
         from .worker import OutreachWorker
 
@@ -355,7 +358,8 @@ class OutreachRunner:
         )
         try:
             return worker.run(limit=limit, dry_run=dry_run, only=only,
-                              delay_min=delay_min, delay_max=delay_max)
+                              delay_min=delay_min, delay_max=delay_max,
+                              sort_by=sort_by)
         finally:
             try:
                 worker.st.close()

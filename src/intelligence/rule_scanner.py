@@ -12,7 +12,7 @@ import json
 from datetime import datetime, timedelta
 from typing import Optional
 
-from ..models.lead import Lead, IntentLevel, INTENT_LEVEL_ORDER
+from ..models.lead import Lead, IntentLevel, INTENT_LEVEL_ORDER, fmt_dt
 from ..storage.db_storage import get_db
 from ..utils.logger import get_logger
 from .contact_extractor import extract_contacts
@@ -110,6 +110,9 @@ async def scan_by_rules(
             evidence=json.dumps(g["messages"][:3], ensure_ascii=False),
             evidence_count=min(3, len(g["messages"])),
             comment_count=g["count"],
+            # 最后一次抓到的时间 = 这个用户最后一条弹幕的时间
+            # （触达排序按它倒序：「最近抓到的线索先留言」）
+            last_hit_at=fmt_dt(g.get("last_at")),
             source="rule",
         )
         leads.append(lead)

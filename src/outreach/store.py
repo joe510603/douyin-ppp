@@ -112,6 +112,7 @@ class OutreachStore:
         intent_levels: Optional[list[str]] = None,
         stores: Optional[list[str]] = None,
         min_score: float = 0.0,
+        sort_by: str = "recent",
     ) -> list[dict]:
         """取待触达的线索
 
@@ -120,12 +121,19 @@ class OutreachStore:
         - 有抖音号（display_id 不为空）——没号没法搜人
         - 意向等级 / 门店 / 意向分下限可过滤
 
-        排序：高意向 → 中意向 → 低意向，同级按意向分倒序。
+        排序：
+        - ``recent``（默认）：**最近抓到的优先**（用户要求）。
+          先按 ``last_hit_at`` 倒序（这条线索最后一次被看到的时间），
+          同时间再按意向分倒序。
+          为什么不按 created_at：created_at 是**首次**抓到的时间，
+          一个人隔几天又在直播间问了一次，他其实是最"热乎"的，
+          应该排在前面，不是被压到一堆老线索后面。
+        - ``intent``：老的排序（高意向优先），留着方便对照/回退。
         """
         sql = [
             "SELECT id, lead_key, display_id, nickname, car_model, store, ",
             "intent_level, intent_score, intent_reason, evidence, monitor_name, ",
-            "bitable_record_id, outreach_status ",
+            "bitable_record_id, outreach_status, created_at, last_hit_at ",
             "FROM leads WHERE outreach_status = ? AND display_id != ''"
         ]
         params: list[Any] = [STATUS_PENDING]
@@ -142,7 +150,15 @@ class OutreachStore:
             sql.append(" AND intent_score >= ?")
             params.append(float(min_score))
 
-        sql.append(" ORDER BY intent_score DESC, id DESC")
+        if sort_by == "intent":
+            sql.append(" ORDER BY intent_score DESC, id DESC")
+        else:
+            # last_hit_at 为空的老数据（回填失败的那些）排到最后，
+            # 用 created_at 兜底比较——格式统一过，字符串比较是安全的。
+            sql.append(
+                " ORDER BY COALESCE(NULLIF(last_hit_at, ''), created_at) DESC, "
+                "intent_score DESC, id DESC"
+            )
         rows = self._conn.execute("".join(sql), params).fetchall()
         return [dict(r) for r in rows]
 

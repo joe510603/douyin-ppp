@@ -44,6 +44,26 @@ class OutreachStatus(str, Enum):
     SKIPPED = "skipped"    # 已跳过（超上限/无抖音号等）
 
 
+def fmt_dt(dt) -> str:
+    """时间统一成 "YYYY-MM-DD HH:MM:SS"
+
+    为什么必须统一：leads.created_at / last_hit_at 都用这个格式，
+    而排序是**字符串比较**——
+    live_comments.create_time 是 ISO 格式（"2026-11-11T16:35:25"），
+    里面的 "T"(0x54) 比空格(0x20) 大，混在一起排序结果会完全错乱。
+    """
+    if isinstance(dt, datetime):
+        return dt.strftime("%Y-%m-%d %H:%M:%S")
+    if isinstance(dt, str) and dt:
+        try:
+            return datetime.fromisoformat(dt.replace("T", " ")).strftime(
+                "%Y-%m-%d %H:%M:%S"
+            )
+        except ValueError:
+            return dt[:19]
+    return ""
+
+
 # 意向等级排序（数值越大越优先）
 INTENT_LEVEL_ORDER: dict[str, int] = {
     IntentLevel.NONE.value: 0,
@@ -88,6 +108,14 @@ class Lead(BaseModel):
     evidence: str = Field(default="", description="触发线索的弹幕 JSON 数组")
     evidence_count: int = Field(default=0, description="触发弹幕条数")
     comment_count: int = Field(default=0, description="该用户累计弹幕数")
+
+    # 最后一次被抓到（命中）的时间，格式 "YYYY-MM-DD HH:MM:SS"
+    #
+    # 为什么不能直接用 created_at：created_at 是**首次**抓到这条线索的时间。
+    # 同一个人隔几天又在直播间问了一次，created_at 还停在老时间，
+    # 但他其实是最"热乎"的（可能人就在直播间里等着回复）。
+    # 触达排序按这个字段倒序 → 最新的线索先留言。
+    last_hit_at: str = Field(default="", description="最后一次抓到该线索的时间")
 
     # 处理状态
     status: str = Field(default=LeadStatus.NEW.value, description="new/pushed/contacted/ignored")

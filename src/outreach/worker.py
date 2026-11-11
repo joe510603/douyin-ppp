@@ -541,6 +541,7 @@ class OutreachWorker:
         use_session: bool = True,
         delay_min: Optional[float] = None,
         delay_max: Optional[float] = None,
+        sort_by: Optional[str] = None,
     ) -> dict:
         """跑一轮触达
 
@@ -550,6 +551,8 @@ class OutreachWorker:
             only: 只处理指定的抖音号
             use_session: 复用常驻浏览器（省掉每次重开窗口的十几秒）
             delay_min / delay_max: 本轮的两条之间间隔（秒），留空用配置里的
+            sort_by: 本轮排序（recent=最近抓到优先 / intent=高意向优先），
+                留空用配置里的
         """
         o = self.cfg.outreach
         dry = bool(o.dry_run if dry_run is None else dry_run)
@@ -576,6 +579,8 @@ class OutreachWorker:
             intent_levels=list(o.intent_levels or []),
             stores=list(o.stores or []),
             min_score=float(o.min_score if hasattr(o, "min_score") else 0),
+            # 本轮临时覆盖排序方式，留空用配置里的
+            sort_by=str(sort_by or o.sort_by or "recent"),
         )
         dedupe_days = int(o.dedupe_days or 30)
 

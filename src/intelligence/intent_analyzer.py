@@ -19,7 +19,7 @@ from datetime import datetime, timedelta
 from typing import Optional
 
 from ..config import get_config
-from ..models.lead import Lead, IntentLevel, INTENT_LEVEL_ORDER
+from ..models.lead import Lead, IntentLevel, INTENT_LEVEL_ORDER, fmt_dt
 from ..storage.db_storage import get_db
 from ..utils.llm_client import LLMClient
 from ..utils.logger import get_logger
@@ -359,6 +359,7 @@ class IntentAnalyzer:
             evidence=json.dumps(evidence, ensure_ascii=False),
             evidence_count=len(evidence),
             comment_count=len(item.get("messages") or []),
+            last_hit_at=fmt_dt(item.get("last_at")),
         )
 
 

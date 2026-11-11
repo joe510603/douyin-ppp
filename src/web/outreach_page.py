@@ -166,7 +166,8 @@ def create_outreach_page():
         outreach_log.clear()
         try:
             result = await runner.run(limit=limit, dry_run=dry,
-                                      delay_min=delay_min, delay_max=delay_max)
+                                      delay_min=delay_min, delay_max=delay_max,
+                                      sort_by=str(outreach_sort_by.value or "recent"))
         except Exception as e:
             log.error(f"触达任务失败: {e}", exc_info=True)
             outreach_status.text = f"触达失败: {e}"
@@ -248,6 +249,17 @@ def create_outreach_page():
                     outreach_delay_max = ui.number(
                         "最大间隔(秒)", value=None, min=0, max=3600, step=5
                     ).props("dense outlined").classes("col-6 col-sm-2 app-input")
+
+                    # 排序：默认「最近抓到优先」
+                    # （直播间里刚问完价的人最热乎，可能人就在直播间等着回复）
+                    outreach_sort_by = ui.select(
+                        options={
+                            "recent": "最近抓到优先",
+                            "intent": "高意向优先",
+                        },
+                        value=str(config.outreach.sort_by or "recent"),
+                    ).props("dense outlined").classes("col-6 col-sm-2 app-input")
+                    outreach_sort_by.label = "排序"
 
                     dry_switch = ui.switch(
                         "干跑（只生成话术，不发送）",

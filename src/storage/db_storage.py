@@ -142,6 +142,7 @@ CREATE TABLE IF NOT EXISTS leads (
     evidence TEXT DEFAULT '[]',
     evidence_count INTEGER DEFAULT 0,
     comment_count INTEGER DEFAULT 0,
+    last_hit_at TEXT DEFAULT '',
     status TEXT DEFAULT 'new',
     pushed_at TEXT DEFAULT '',
     outreach_status TEXT DEFAULT 'pending',
@@ -353,6 +354,27 @@ class DBStorage:
         except aiosqlite.OperationalError:
             pass
 
+        # 迁移：老库补 last_hit_at（最后一次抓到该线索的时间）
+        #
+        # 触达排序要用它："最近抓到的线索先留言"（用户要求）。
+        # 老数据先回填成 created_at —— 至少有值，
+        # 精确回填（从 live_comments 关联）用 scripts/backfill_lead_last_hit.py。
+        try:
+            await self._db.execute(
+                "ALTER TABLE leads ADD COLUMN last_hit_at TEXT DEFAULT ''"
+            )
+            await self._db.commit()
+        except aiosqlite.OperationalError:
+            pass
+        try:
+            await self._db.execute(
+                "UPDATE leads SET last_hit_at = created_at "
+                "WHERE last_hit_at IS NULL OR last_hit_at = ''"
+            )
+            await self._db.commit()
+        except aiosqlite.OperationalError:
+            pass
+
         # 回填 store（老数据是空的）
         try:
             from ..notify.bitable import normalize_store
@@ -455,16 +477,17 @@ class DBStorage:
                     room_id, monitor_name, live_room, store,
                     intent_level, intent_score, intent_reason, car_model,
                     contact_type, contact_value,
-                    evidence, evidence_count, comment_count,
+                    evidence, evidence_count, comment_count, last_hit_at,
                     status, pushed_at, outreach_status, outreach_at, outreach_note,
                     source, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 [
                     lead.lead_key, lead.user_id, lead.display_id, lead.nickname, lead.avatar,
                     lead.room_id, lead.monitor_name, lead.live_room, store,
                     lead.intent_level, lead.intent_score, lead.intent_reason, lead.car_model,
                     lead.contact_type, lead.contact_value,
                     lead.evidence, lead.evidence_count, lead.comment_count,
+                    (lead.last_hit_at or now),
                     lead.status, lead.pushed_at, lead.outreach_status, lead.outreach_at, lead.outreach_note,
                     lead.source or "rule", now, now,
                 ],
@@ -509,6 +532,7 @@ class DBStorage:
                 intent_level = ?, intent_score = ?, intent_reason = ?, car_model = ?,
                 contact_type = ?, contact_value = ?,
                 evidence = ?, evidence_count = ?, comment_count = ?,
+                last_hit_at = COALESCE(NULLIF(?, ''), last_hit_at),
                 updated_at = ?
             WHERE lead_key = ?""",
             [
@@ -518,7 +542,7 @@ class DBStorage:
                 new_contact_type, new_contact_value,
                 lead.evidence, old_evidence_count + lead.evidence_count,
                 old_comment_count + lead.comment_count,
-                now, lead.lead_key,
+                lead.last_hit_at, now, lead.lead_key,
             ],
         )
         if commit:
@@ -797,6 +821,7 @@ class DBStorage:
                    MAX(room_id) AS room_id,
                    MAX(monitor_name) AS monitor_name,
                    COUNT(*) AS cnt,
+                   MAX(create_time) AS last_at,
                    GROUP_CONCAT(content, '|||') AS msgs
                FROM live_comments
                WHERE message_type = ?
@@ -824,6 +849,8 @@ class DBStorage:
                 "monitor_name": r["monitor_name"] or "",
                 "count": r["cnt"],
                 "messages": messages,
+                # 这个用户最后一次发言的时间（用来排「最近抓取优先」）
+                "last_at": r["last_at"] or "",
             })
         return results
 

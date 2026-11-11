@@ -5,6 +5,41 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.25] - 2026-11-11
+
+### Added
+- **触达排序改成「最近抓到的线索优先」**（用户要求：
+  「能不能优先给日期最近的发消息？发布消息的排序要以最近抓取的优先」）。
+
+  1. **`leads` 表新增 `last_hit_at`** —— 这条线索**最后一次被看到**的时间。
+     为什么不直接用 `created_at`：created_at 是**首次**抓到的时间。
+     一个人隔几天又在直播间问了一次，created_at 还停在老时间，
+     但他其实是最"热乎"的（可能人就在直播间等着回复），
+     不该被压在一堆老线索后面。
+  2. **三个写入路径都会维护它**：实时弹幕（`lead_service`）、
+     规则回扫（`rule_scanner`）、LLM 精排（`intent_analyzer`）。
+     回扫的来源是 `live_comments` 里该用户最后一条弹幕的时间
+     （`query_user_activity` 新增 `MAX(create_time)`）。
+  3. **历史线索回填**：`scripts/backfill_lead_last_hit.py` 从 19 万条弹幕里
+     关联出真实的最后互动时间。实测 **322 条关联到弹幕，
+     271 条比「首次抓到」更新** —— 这些人确实在更近的时间里还在直播间。
+  4. **触达页多了「排序」下拉框**，当场可切：
+     「最近抓到优先」（默认）/「高意向优先」（老排序，留着方便对照回退）。
+     老的排序方式也保留在代码里（`sort_by="intent"`）。
+
+### Fixed
+- **时间格式统一** —— `live_comments.create_time` 是 ISO 格式（带 `T`），
+  `leads.created_at` 是空格分隔。排序是**字符串比较**，
+  而 `"T"`(0x54) > `" "`(0x20)，混着排结果会完全错乱。
+  现在统一走 `models/lead.py` 的 `fmt_dt()` 转换。
+
+### Testing
+- 测试 299（+7）
+- 新增用例：最近抓到排前面、可切回高意向优先、同时间按意向分、
+  最后互动时间优于首次抓到、老数据空值兜底、时间格式统一
+
+---
+
 ## [2.0.24] - 2026-11-11
 
 ### Fixed
