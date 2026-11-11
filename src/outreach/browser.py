@@ -86,6 +86,12 @@ _CAPTCHA_WINDOW = {"left": 120, "top": 80, "width": 1200, "height": 880}
 # 实测这样窗口完全不可见，但浏览器照常跑（不是 headless）。
 _OFFSCREEN_BOUNDS = {"left": -2000, "top": 0, "width": 1200, "height": 800}
 
+# 窗口模式（outreach.window_mode）
+# - background：窗口**看得见**，摆在屏幕右侧，但**不抢焦点、不置顶**（默认）
+# - offscreen：完全藏到屏幕外
+# - visible：正常显示并置前（扫码登录用）
+WINDOW_MODES = ("background", "offscreen", "visible")
+
 
 def _set_window_bounds(ctx: Any, page: Any, bounds: dict) -> bool:
     """用 CDP 移动/改变浏览器窗口"""
@@ -148,6 +154,25 @@ def activate_app(name: str) -> bool:
         return False
 
 
+# 触达期间「用户自己的前台应用」。
+# 浏览器启动时会抢前台，我们要记住原来是谁，把它还给用户；
+# 撞验证码时我们主动把浏览器叫到前台，处理完之后再还回去——
+# 不然浏览器就一直占着前台了。
+_user_app = ""
+
+
+def set_user_app(name: str) -> None:
+    global _user_app
+    _user_app = (name or "").strip()
+
+
+def release_focus() -> bool:
+    """把前台还给用户（撞验证码处理完之后用）"""
+    if not _user_app:
+        return False
+    return activate_app(_user_app)
+
+
 def _chrome_app_name(pw: Any) -> str:
     """从 Playwright 的浏览器可执行文件推出 macOS 上的 app 名
 
@@ -162,6 +187,81 @@ def _chrome_app_name(pw: Any) -> str:
     except Exception:
         pass
     return "Google Chrome"
+
+
+def _get_window_bounds(ctx: Any, page: Any) -> dict:
+    """读窗口当前坐标"""
+    session = None
+    try:
+        session = ctx.new_cdp_session(page)
+        wid = session.send("Browser.getWindowForTarget").get("windowId")
+        if wid is None:
+            return {}
+        return session.send("Browser.getWindowBounds", {"windowId": wid}).get("bounds") or {}
+    except Exception:
+        return {}
+    finally:
+        try:
+            if session is not None:
+                session.detach()
+        except Exception:
+            pass
+
+
+def screen_bounds() -> tuple[int, int, int, int]:
+    """主屏幕可用区域 (left, top, width, height)
+
+    用 Finder 的 desktop 窗口 bounds——它就是主显示器的工作区。
+    拿不到就按 1440x900 估。
+    """
+    try:
+        out = subprocess.run(
+            ["osascript", "-e",
+             "tell application \"Finder\" to get bounds of window of desktop"],
+            capture_output=True, text=True, timeout=8)
+        nums = [int(float(x)) for x in (out.stdout or "").strip().split(",")]
+        if len(nums) == 4:
+            return nums[0], nums[1], nums[2] - nums[0], nums[3] - nums[1]
+    except Exception:
+        pass
+    return 0, 0, 1440, 900
+
+
+def background_bounds() -> dict:
+    """「看得见但不挡事」的窗口位置：摆在主屏幕右侧
+
+    用户需求：「chrome 的网页可以让我能看到，不用隐藏，
+    只是让它不在所有窗口最前面也能运行」
+
+    所以不是藏起来，也不是铺满屏幕，而是**贴在右半边**，
+    像一个副面板：左边照常干活，它在后面自己跑。
+    """
+    l, t, w, h = screen_bounds()
+    # 宽度取屏幕的 42%，最多 1100；高度留出菜单栏和 Dock
+    bw = max(760, min(1100, int(w * 0.42)))
+    bh = max(560, min(860, h - 120))
+    return {"left": l + w - bw - 16, "top": t + 40,
+            "width": bw, "height": bh}
+
+
+def place_in_background(ctx: Any, page: Any) -> bool:
+    """把窗口摆到屏幕右侧（可见，但在后面跑，不抢焦点）
+
+    实测坑：Chrome 偶尔只接受「移动」不接「改尺寸」，
+    所以这里设完要**读回来核对**，不对就再来一次。
+    """
+    target = background_bounds()
+    ok = _set_window_bounds(ctx, page, target)
+    for _ in range(2):
+        cur = _get_window_bounds(ctx, page)
+        if not cur:
+            break
+        # 尺寸差得多就是没生效，再设一次
+        if abs(int(cur.get("width", 0)) - int(target["width"])) > 40:
+            ok = _set_window_bounds(ctx, page, target) or ok
+        else:
+            break
+    return ok
 
 
 def move_offscreen(ctx: Any, page: Any) -> bool:
@@ -221,13 +321,20 @@ class Browser:
     """with Browser(profile_dir, headless=False) as (ctx, page): ..."""
 
     def __init__(self, profile_dir: str | pathlib.Path, headless: bool = False,
-                 slow_mo: int = 0, block_media: bool = False, offscreen: bool = False):
+                 slow_mo: int = 0, block_media: bool = False,
+                 offscreen: bool = False, window_mode: str = ""):
         self.profile_dir = pathlib.Path(profile_dir).expanduser()
         self.profile_dir.mkdir(parents=True, exist_ok=True)
         self.headless = headless
         self.slow_mo = slow_mo
         self.block_media = block_media
-        self.offscreen = offscreen
+        # window_mode 是新接口；offscreen 是老参数，保留兼容。
+        # 两者都给了的话 window_mode 优先。
+        mode = (window_mode or "").strip()
+        if mode not in WINDOW_MODES:
+            mode = "offscreen" if offscreen else "background"
+        self.window_mode = mode
+        self.offscreen = (mode == "offscreen")
         self._pw: Any = None
         self.ctx: BrowserContext | None = None
         self.page: Page | None = None
@@ -235,10 +342,13 @@ class Browser:
         self.app_name: str = ""
 
     def __enter__(self) -> tuple[BrowserContext, Page]:
-        # 启动浏览器会把前台抢走（实测）。先把「谁在前台」记下来，
-        # 等窗口藏好之后原样还回去——不然用户切回自己的窗口，
-        # 打的字会全进了这个看不见的浏览器里。
-        prev_front = frontmost_app() if self.offscreen else ""
+        # 启动浏览器会把前台抢走（实测：Edge → Google Chrome for Testing，
+        # 而且会一直占着前台）。先把「谁在前台」记下来，
+        # 等窗口摆好之后原样还回去——不然用户切回自己的窗口，
+        # 打的字会全进了那个浏览器里。
+        #
+        # visible 模式例外：扫码登录时用户**就是要**看到并操作那个窗口。
+        prev_front = frontmost_app() if self.window_mode != "visible" else ""
 
         self._pw = sync_playwright().start()
         self.ctx = self._pw.chromium.launch_persistent_context(
@@ -273,14 +383,23 @@ class Browser:
             self.ctx.route("**/*", _route)
         self.page = self.ctx.pages[0] if self.ctx.pages else self.ctx.new_page()
         self.page.set_default_timeout(20000)
-        if self.offscreen:
+
+        # ---- 摆窗口 ----
+        if self.window_mode == "offscreen":
             # 启动参数 --window-position 在 macOS 上经常不生效
             # （持久化 profile 会记住上次窗口位置），
             # 所以启动完再主动用 CDP 挪一次——这个是实测可靠的。
             move_offscreen(self.ctx, self.page)
-            # 再把前台还给用户（窗口藏起来，但焦点不还回去 = 打字打进黑洞）
-            if prev_front and prev_front != self.app_name:
-                activate_app(prev_front)
+        elif self.window_mode == "background":
+            # 摆在屏幕右侧：看得见，但在后面自己跑
+            place_in_background(self.ctx, self.page)
+
+        # ---- 把前台还给用户 ----
+        # 窗口藏起来或者摆在旁边都还不够：焦点不还回去的话，
+        # 用户切回自己的窗口继续干活，打的字会全进了这个浏览器里。
+        if prev_front and prev_front != self.app_name:
+            set_user_app(prev_front)
+            activate_app(prev_front)
         return self.ctx, self.page
 
     def __exit__(self, *exc: Any) -> None:

@@ -70,7 +70,12 @@ def main() -> int:
     print(f"  模式      : {'真发（会公开留言）' if args.real else '干跑（不发送、不改状态）'}")
     print(f"  待发上限  : 每日 {o.daily_limit} 条 / 本轮 {args.limit} 条")
     print(f"  限速      : 两条之间 {int(o.min_delay)}~{int(o.max_delay)} 秒")
-    print(f"  窗口      : {'屏幕外（看不见）' if o.hide_window and not o.headless else '可见'}")
+    mode_label = {
+        "background": "看得见（摆在屏幕右侧，不抢焦点）",
+        "offscreen": "屏幕外（看不见）",
+        "visible": "可见并置前",
+    }.get(o.window_mode, o.window_mode)
+    print(f"  窗口      : {mode_label}")
     print(f"  风控冷却  : {o.risk_cooldown_minutes} 分钟", flush=True)
 
     if args.real and not o.enabled:

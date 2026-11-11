@@ -5,6 +5,43 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.21] - 2026-11-11
+
+### Changed
+- **触达浏览器窗口默认改成「看得见，但不抢焦点」**（用户反馈
+  「chrome 的网页可以让我能看到，可以不用隐藏，只是让它不在所有窗口最前面也能运行，
+  并且不要一直弹到最前面」）。
+
+  新的 `outreach.window_mode`（配置页 →「抖音触达 → 触达浏览器窗口」）：
+
+  | 模式 | 窗口位置 | 能看见吗 | 抢焦点吗 |
+  |---|---|---|---|
+  | **background**（默认） | 摆在**屏幕右半边**（宽约 42%，最多 1100px） | **能** | **不抢** |
+  | offscreen | 完全在屏幕外（`left=-1160`） | 不能 | 不抢 |
+  | visible | 正常显示并置前 | 能 | 会（扫码登录用） |
+
+  老的 `hide_window` 布尔参数已换成 `window_mode`（config 里多出来的旧键会被忽略）。
+
+- 撞验证码验证完之后，**把前台焦点还回给用户**。
+  之前我们主动把浏览器叫到前面让人验证，验证完浏览器就一直占着前台了——
+  用户切回自己的窗口继续干活，打的字却进了浏览器。
+
+- 触达控制台脚本（`scripts/outreach_console.py`）显示新的窗口模式。
+
+### Fixed
+- Chrome 偶尔**只接受「移动」不接「改尺寸」**：窗口摆到屏幕右侧后宽度没变，
+  还是铺满屏幕。`place_in_background` 现在设完会**读回来核对**，不对就再设一次。
+
+### Testing
+- 测试 260（+11）
+- 新增 `scripts/check_focus_realpath.py`：跑**真实触达路径**
+  （搜索 → 开主页 → 开作品 → 找评论框，只读动作不发评论），
+  每一步查前台是谁。实测全程 `Microsoft Edge` 保持前台，抢前台的动作：**无**。
+- 新增 `tests/test_outreach_window.py`：窗口模式解析 / 背景位置在右半边 /
+  焦点归还 / 验证码处理完还焦点
+
+---
+
 ## [2.0.20] - 2026-11-11
 
 ### Fixed

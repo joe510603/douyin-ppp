@@ -674,6 +674,18 @@ def create_config_page():
             ).props("dense outlined").classes("col-12 col-sm-6 app-input")
 
         with ui.row().classes("w-full items-end q-col-gutter-sm q-mt-sm"):
+            outreach_window_mode = ui.select(
+                {
+                    "background": "看得见（摆在屏幕右侧，不抢焦点）",
+                    "offscreen": "藏到屏幕外（什么都看不见）",
+                    "visible": "正常显示并置前（扫码登录用）",
+                },
+                label="触达浏览器窗口",
+                value=config.outreach.window_mode
+                if config.outreach.window_mode in ("background", "offscreen", "visible")
+                else "background",
+            ).props("dense outlined options-dense").classes("col-12 col-sm-4 app-input")
+
             outreach_headless_switch = ui.switch(
                 "无头模式（服务器上跑用；有头更稳）",
                 value=config.outreach.headless,
@@ -683,7 +695,7 @@ def create_config_page():
                 "话术库路径（留空用内置）",
                 value=config.outreach.templates_file,
                 placeholder="src/outreach/templates.yaml",
-            ).props("dense outlined clearable").classes("col-12 col-sm-9 app-input")
+            ).props("dense outlined clearable").classes("col-12 col-sm-5 app-input")
 
         def save_outreach_config():
             config.outreach.enabled = outreach_enabled_switch.value
@@ -699,6 +711,7 @@ def create_config_page():
             config.outreach.verify_after_post = bool(outreach_verify_switch.value)
             config.outreach.allow_contact_words = bool(outreach_contact_switch.value)
             config.outreach.headless = bool(outreach_headless_switch.value)
+            config.outreach.window_mode = str(outreach_window_mode.value or "background")
             config.outreach.salutation = (outreach_salutation.value or "老板").strip()
             pool_raw = (outreach_salutation_pool.value or "").strip()
             config.outreach.salutation_pool = [

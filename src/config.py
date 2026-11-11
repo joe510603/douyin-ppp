@@ -250,7 +250,13 @@ class OutreachConfig(BaseModel):
     # 浏览器窗口摆到屏幕外：看不见、但不挡你干活。
     # ⚠️ 别直接开 headless——抖音对无头浏览器的检测更严，风控风险明显更高。
     #    「看不见窗口」用有头 + 屏幕外实现就够了。
-    hide_window: bool = True
+    #
+    # window_mode 决定窗口长什么样：
+    # - background（默认）：窗口**看得见**，摆在屏幕右侧，在后面自己跑，
+    #   不抢焦点、不弹到最前面。你能看见它在干什么，但不影响你干活。
+    # - offscreen：完全藏到屏幕外，什么都看不见。
+    # - visible：正常显示并置前（扫码登录用）。
+    window_mode: str = "background"
     # 拦掉视频/音频的**网络请求**（省流量省 CPU）。
     # 注意：静音本身不靠它——静音由 JS 强制兜底（见 browser.py 的 _MUTE_AUDIO），
     # 这里只管「别下载视频」。关掉的话功能不受影响，只是多耗点资源。

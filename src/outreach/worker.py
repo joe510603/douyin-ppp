@@ -309,6 +309,23 @@ class OutreachWorker:
             self.log(f"  （窗口挪不动：{e}）")
             return False
 
+    def _release_focus(self) -> None:
+        """把前台还给用户
+
+        撞验证码时我们把浏览器叫到了前面，用户验证完之后如果不管，
+        浏览器就会一直占着前台——他切回自己的窗口继续干活，
+        打的字却进了浏览器里。
+
+        所以恢复之后必须把焦点还回去。
+        """
+        try:
+            from .browser import release_focus
+
+            if release_focus():
+                self.log("  🖥 前台已还给你的窗口")
+        except Exception:
+            pass
+
     def _captcha_cleared(self) -> bool:
         """看看验证码是不是已经自己过了
 
@@ -378,6 +395,7 @@ class OutreachWorker:
                     self.waiting_human = False
                     self._emit(type="captcha_resumed")
                     self.log("▶ 收到「继续」信号，接着跑")
+                    self._release_focus()
                     return True
 
                 # 自动检测：验证码是不是已经自己过了 → 直接接着跑
@@ -387,6 +405,7 @@ class OutreachWorker:
                         self.waiting_human = False
                         self._emit(type="captcha_resumed", auto=True)
                         self.log("🔎 检测到验证码已经过了，自动接着跑")
+                        self._release_focus()
                         return True
             self.waiting_human = False
             self._emit(type="captcha_timeout")
@@ -845,8 +864,10 @@ class OutreachWorker:
         """拿一个可用的页面：有常驻浏览器就复用，没有就自己开一个"""
         from contextlib import contextmanager
 
-        # 窗口摆屏幕外：看不见但不是 headless（抖音对无头检测更严，风控风险高）
-        offscreen = bool(getattr(self.cfg.outreach, "hide_window", True))
+        # 窗口模式：background（看得见但在后面跑）/ offscreen（藏起来）/ visible
+        mode = str(getattr(self.cfg.outreach, "window_mode", "background") or "background").strip()
+        if mode not in ("background", "offscreen", "visible"):
+            mode = "background"
         # 别下载视频（省流量省 CPU）。静音另有 JS 兜底，不依赖这一项。
         block_media = bool(getattr(self.cfg.outreach, "block_media", True))
 
@@ -862,7 +883,7 @@ class OutreachWorker:
                 yield page
                 return
             with Browser(profile_dir, headless=headless, slow_mo=120,
-                         offscreen=offscreen,
+                         window_mode=mode,
                          block_media=block_media) as (_c, page):
                 yield page
 
