@@ -195,23 +195,12 @@ CREATE_OUTREACH_INDEXES_SQL = [
 ]
 
 # 每轮触达任务的摘要（看板展示 + 排障）
-CREATE_TABLE_OUTREACH_RUNS_SQL = """
-CREATE TABLE IF NOT EXISTS outreach_runs (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    dry_run INTEGER DEFAULT 0,
-    total INTEGER DEFAULT 0,
-    sent INTEGER DEFAULT 0,
-    failed INTEGER DEFAULT 0,
-    skipped INTEGER DEFAULT 0,
-    note TEXT DEFAULT '',
-    started_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
-    finished_at TEXT DEFAULT ''
-);
-"""
-
-CREATE_OUTREACH_RUNS_INDEXES_SQL = [
-    "CREATE INDEX IF NOT EXISTS idx_outreach_runs_started ON outreach_runs(started_at);",
-]
+# ⚠️ 建表 SQL 的真相来源在 src/outreach/store.py ——
+# 这个表是触达线程写的，表归它管；store 那边还会自己补列（老库迁移）。
+from ..outreach.store import (  # noqa: E402
+    CREATE_OUTREACH_RUNS_INDEXES_SQL,
+    CREATE_TABLE_OUTREACH_RUNS_SQL,
+)
 
 
 class DBStorage:

@@ -29,6 +29,12 @@ LEVEL_LABELS = {
     "low": "低意向",
 }
 
+# 停手横幅要显示哪几种情况。
+# ⚠️ 词汇必须跟后端一致（verify / limit / login）。
+# 以前这里写的是 "captcha"，后端发的是 "verify" → 撞验证时横幅压根不显示，
+# 用户只看到一行日志，不知道发生了什么、也不知道该干什么。
+STOP_KINDS = ("limit", "login", "verify")
+
 OUTREACH_LABELS = {
     "pending": "待触达",
     "searching": "搜索中",
@@ -135,6 +141,18 @@ def create_outreach_page():
         limit = int(outreach_limit.value or config.outreach.max_per_run)
         dry = bool(dry_switch.value)
 
+        # 本轮临时间隔（留空 = 用配置里的）
+        def _num(v):
+            try:
+                return float(v) if v not in (None, "") else None
+            except Exception:
+                return None
+
+        delay_min = _num(outreach_delay_min.value)
+        delay_max = _num(outreach_delay_max.value)
+        if delay_min is not None and delay_max is not None and delay_max < delay_min:
+            delay_min, delay_max = delay_max, delay_min
+
         if not dry and not config.outreach.enabled:
             ui.notify("触达功能未启用，请先到「配置管理 → 抖音触达」打开", type="warning")
             return
@@ -147,7 +165,8 @@ def create_outreach_page():
         outreach_status.text = "触达任务运行中…（可继续用页面其它功能）"
         outreach_log.clear()
         try:
-            result = await runner.run(limit=limit, dry_run=dry)
+            result = await runner.run(limit=limit, dry_run=dry,
+                                      delay_min=delay_min, delay_max=delay_max)
         except Exception as e:
             log.error(f"触达任务失败: {e}", exc_info=True)
             outreach_status.text = f"触达失败: {e}"
@@ -221,6 +240,15 @@ def create_outreach_page():
                         "本轮最多处理", value=config.outreach.max_per_run, min=1, max=50
                     ).props("dense outlined").classes("col-6 col-sm-2 app-input")
 
+                    # 两条之间的间隔：在这儿当场调，不用每次去配置页。
+                    # 留空 = 用配置里的 min_delay / max_delay。
+                    outreach_delay_min = ui.number(
+                        "最小间隔(秒)", value=None, min=0, max=3600, step=5
+                    ).props("dense outlined").classes("col-6 col-sm-2 app-input")
+                    outreach_delay_max = ui.number(
+                        "最大间隔(秒)", value=None, min=0, max=3600, step=5
+                    ).props("dense outlined").classes("col-6 col-sm-2 app-input")
+
                     dry_switch = ui.switch(
                         "干跑（只生成话术，不发送）",
                         value=config.outreach.dry_run,
@@ -235,6 +263,11 @@ def create_outreach_page():
                     ui.button("刷新队列", on_click=_refresh_outreach_info).classes("col-6 col-sm-2").props(
                         "flat dense icon=refresh"
                     )
+
+                ui.label(
+                    f"间隔留空 = 用配置里的 {int(config.outreach.min_delay)}-{int(config.outreach.max_delay)} 秒；"
+                    "调小跑得快，但抖音更容易要求验证。"
+                ).classes("text-caption text-grey-7 q-mt-xs")
 
                 outreach_status = ui.label("").classes("text-caption")
 
@@ -383,11 +416,13 @@ def create_outreach_page():
                             f"{captcha_wait_minutes} 分钟没人管就结束本轮）"
                         )
 
-                    # ---- 停手横幅（限流 / 登录失效）----
-                    # 这两种不是「等一下就好」，必须说清楚到底怎么了、该干什么。
+                    # ---- 停手横幅（限流 / 要验证 / 登录失效）----
+                    # 这三种不是「等一下就好」，必须说清楚到底怎么了、该干什么。
                     stop = p.get("risk_stop") or {}
                     kind = stop.get("kind") or ""
-                    show_stop = kind in ("limit", "login", "captcha") and not p.get("running")
+                    # ⚠️ 词汇统一成 verify / limit / login（以前这里写的是 "captcha"，
+                    # 跟后端对不上 → verify 停手时横幅压根不显示）
+                    show_stop = kind in STOP_KINDS and not p.get("running")
                     stop_box.set_visibility(show_stop)
                     if show_stop:
                         stop_login_btn.set_visibility(kind == "login")
@@ -399,12 +434,15 @@ def create_outreach_page():
                                 f"原因：{reason}\n"
                                 "点右边「扫码登录」→ 用抖音 App 扫一下 → 回来再点「开始触达」。"
                             )
-                        elif kind == "captcha":
+                        elif kind == "verify":
                             stop_text.text = (
-                                "⏸ 撞上验证码，但这次没人处理，本轮已经结束了。\n"
+                                "⏸ 抖音要求验证本人操作，但这次没人处理，本轮已经结束了。\n"
                                 f"原因：{reason}\n"
-                                "重新点「开始触达」，撞上验证码时在下面的橙色条里点"
-                                "「打开浏览器窗口」，自己把验证过掉。"
+                                "这不是账号被限流（账号是好的），验证一下就能继续：\n"
+                                "1. 重新点「开始触达」\n"
+                                "2. 撞上验证时，点「打开浏览器窗口」把它叫到屏幕中间\n"
+                                "3. 用抖音 App 收短信 / 扫码把验证过掉，"
+                                "过完它会自动接着跑"
                             )
                         else:
                             stop_text.text = (

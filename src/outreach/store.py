@@ -32,6 +32,33 @@ STATUS_FAILED = "failed"
 STATUS_SKIPPED = "skipped"
 
 
+# ================================================================
+# 建表 SQL（唯一真相来源）
+# ================================================================
+# 放在 store.py 而不是 db_storage.py：
+# 这个表是**触达线程**写的（OutreachStore 用同步 sqlite3），
+# 表归它管才合理；而且 store 自己建表 → 不依赖主进程先跑 init_db，
+# 避免「worker 先起来、表还没建」的竞态。
+CREATE_TABLE_OUTREACH_RUNS_SQL = """
+CREATE TABLE IF NOT EXISTS outreach_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    dry_run INTEGER DEFAULT 0,
+    total INTEGER DEFAULT 0,
+    sent INTEGER DEFAULT 0,
+    failed INTEGER DEFAULT 0,
+    skipped INTEGER DEFAULT 0,
+    note TEXT DEFAULT '',
+    kind TEXT DEFAULT '',
+    started_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
+    finished_at TEXT DEFAULT ''
+);
+"""
+
+CREATE_OUTREACH_RUNS_INDEXES_SQL = [
+    "CREATE INDEX IF NOT EXISTS idx_outreach_runs_started ON outreach_runs(started_at);",
+]
+
+
 class OutreachStore:
     """触达任务的本地存储"""
 
@@ -43,6 +70,32 @@ class OutreachStore:
         # 写锁最多等 15 秒再报 "database is locked"——主进程可能正在写线索
         self._conn.execute("PRAGMA busy_timeout=15000")
         self._conn.execute("PRAGMA journal_mode=WAL")
+        self._ensure_schema()
+
+    def _ensure_schema(self) -> None:
+        """自己保证表结构能用（建表 + 补列）
+
+        两件事：
+        1. 建表 —— 触达线程可能比主进程的 init_db 先跑
+        2. 补列 —— 老库里没有 ``kind`` 列，直接写会报 no such column
+
+        老库补列是必须的：``kind`` 是 v2.0.23 才加的，
+        线上库已经有一堆历史记录，不补列的话 finish_run 直接炸。
+        """
+        try:
+            self._conn.executescript(CREATE_TABLE_OUTREACH_RUNS_SQL)
+            for sql in CREATE_OUTREACH_RUNS_INDEXES_SQL:
+                self._conn.execute(sql)
+            cols = {r[1] for r in
+                    self._conn.execute("PRAGMA table_info(outreach_runs)")}
+            if "kind" not in cols:
+                self._conn.execute(
+                    "ALTER TABLE outreach_runs ADD COLUMN kind TEXT DEFAULT ''"
+                )
+            self._conn.commit()
+        except sqlite3.OperationalError:
+            # 表被别的进程锁着 / 已经有别的结构 → 交给上层报错，别在这里崩
+            pass
 
     def close(self) -> None:
         try:
@@ -236,12 +289,21 @@ class OutreachStore:
         return int(cur.lastrowid)
 
     def finish_run(
-        self, run_id: int, sent: int = 0, failed: int = 0, skipped: int = 0, note: str = ""
+        self, run_id: int, sent: int = 0, failed: int = 0, skipped: int = 0,
+        note: str = "", kind: str = ""
     ) -> None:
+        """收尾一轮触达
+
+        kind = 这一轮是因为什么停手的：verify / limit / login / 空
+        （空 = 正常跑完，或者自己撞到连续异常主动停手）
+
+        单独存一列而不是塞进 note：note 是给人看的文案，
+        kind 是给机器读的判断依据，混在一起早晚对不上。
+        """
         self._conn.execute(
             "UPDATE outreach_runs SET sent = ?, failed = ?, skipped = ?, note = ?, "
-            "finished_at = datetime('now','localtime') WHERE id = ?",
-            [sent, failed, skipped, (note or "")[:300], run_id],
+            "kind = ?, finished_at = datetime('now','localtime') WHERE id = ?",
+            [sent, failed, skipped, (note or "")[:300], (kind or "")[:20], run_id],
         )
         self._conn.commit()
 

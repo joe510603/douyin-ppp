@@ -31,6 +31,7 @@ from typing import Callable, Optional
 from ..config import get_config
 from ..storage.db_storage import get_db
 from ..utils.logger import get_logger
+from .douyin_api import KIND_LIMIT, KIND_LOGIN, KIND_VERIFY, normalize_kind
 from .store import OutreachStore
 
 log = get_logger("outreach_runner")
@@ -60,7 +61,7 @@ class OutreachRunner:
         self._show_window = threading.Event()
         self._waiting_human = False
         self._captcha_reason = ""
-        # 最近一次「触达停手」的情况：{"kind": "limit"/"captcha"/"login", "reason": ...}
+        # 最近一次「触达停手」的情况：{"kind": "verify"/"limit"/"login", "reason": ...}
         # 网页上要显示醒目横幅 + 行动指引，不能只留一行日志
         self._risk_stop: dict = {}
 
@@ -188,9 +189,12 @@ class OutreachRunner:
     def last_risk_stop(self) -> dict:
         """最近一次「触达停手」的情况
 
-        内存里的状态重启就没了，但停手这件事记在 ``outreach_runs.note`` 里，
+        内存里的状态重启就没了，但停手这件事记在 ``outreach_runs`` 里，
         页面刷新、服务重启之后都该继续显示横幅——
         用户不一定记得十分钟前跑过一次，不能让他对着空气猜。
+
+        优先读 ``outreach_runs.kind``（结构化的停手种类），
+        老记录没有这一列，才退回按 note 文案猜。
         """
         if self._risk_stop:
             return dict(self._risk_stop)
@@ -206,13 +210,36 @@ class OutreachRunner:
             note = str(r.get("note") or "")
             if not note:
                 continue
-            if "限流" in note or "软风控" in note:
-                return {"kind": "limit", "reason": note}
-            if "验证码" in note:
-                return {"kind": "captcha", "reason": note}
-            if "登录" in note:
-                return {"kind": "login", "reason": note}
+            # 新记录：直接用存好的种类，不用猜
+            kind = str(r.get("kind") or "").strip().lower()
+            if kind in (KIND_VERIFY, KIND_LIMIT, KIND_LOGIN):
+                return {"kind": kind, "reason": note}
+            # 老记录（没有 kind 列）：按文案猜
+            guessed = self._kind_from_note(note)
+            if guessed:
+                return {"kind": guessed, "reason": note}
         return {}
+
+    @staticmethod
+    def _kind_from_note(note: str) -> str:
+        """从 note 文案猜停手种类（只给老记录用）
+
+        关键词必须跟 worker 实际写进去的文案对齐：
+        - verify：「触发风控：抖音要求验证本人操作才能发评论…」
+          —— **不含**「验证码」三个字
+        - limit：「触发风控：页面提示：操作频繁」
+          —— **不含**「限流」两个字
+        """
+        n = str(note or "")
+        if any(k in n for k in ("限流", "软风控", "操作频繁", "访问频繁",
+                                 "账号存在异常", "环境异常")):
+            return KIND_LIMIT
+        if any(k in n for k in ("验证码", "验证本人", "要求验证", "安全验证",
+                                 "人工验证", "本人操作")):
+            return KIND_VERIFY
+        if any(k in n for k in ("登录", "sessionid", "未登录", "扫码登录")):
+            return KIND_LOGIN
+        return ""
 
     def _db_path(self) -> str:
         db = get_db()
@@ -226,6 +253,8 @@ class OutreachRunner:
         limit: Optional[int] = None,
         dry_run: Optional[bool] = None,
         only: Optional[list[str]] = None,
+        delay_min: Optional[float] = None,
+        delay_max: Optional[float] = None,
     ) -> dict:
         """跑一轮触达任务
 
@@ -233,6 +262,8 @@ class OutreachRunner:
             limit: 本轮最多处理几条
             dry_run: 干跑（不发送、不回写状态）
             only: 只处理指定的抖音号
+            delay_min / delay_max: 本轮的两条之间间隔（秒），
+                留空就用配置里的 min_delay / max_delay
 
         Returns:
             {"ok", "total", "sent", "failed", "skipped", "dry", "stopped"}
@@ -271,7 +302,7 @@ class OutreachRunner:
             result = await loop.run_in_executor(
                 None,
                 self._run_in_thread,
-                limit, dry_run, only,
+                limit, dry_run, only, delay_min, delay_max,
             )
         except Exception as e:
             log.error(f"触达任务异常: {e}", exc_info=True)
@@ -293,7 +324,7 @@ class OutreachRunner:
         log.info(f"[触达] 任务结束：{summary}")
         return result
 
-    def _run_in_thread(self, limit, dry_run, only) -> dict:
+    def _run_in_thread(self, limit, dry_run, only, delay_min=None, delay_max=None) -> dict:
         """在线程里跑 worker（同步）"""
         from .worker import OutreachWorker
 
@@ -307,7 +338,8 @@ class OutreachRunner:
             show_window_event=self._show_window,
         )
         try:
-            return worker.run(limit=limit, dry_run=dry_run, only=only)
+            return worker.run(limit=limit, dry_run=dry_run, only=only,
+                              delay_min=delay_min, delay_max=delay_max)
         finally:
             try:
                 worker.st.close()
@@ -360,12 +392,15 @@ class OutreachRunner:
             self._risk_stop = {"kind": "login", "reason": "触达浏览器没有登录态"}
             self._append_log("⚠️ 需要登录：请先扫码登录触达专用浏览器")
         elif t == "risk":
-            kind = str(event.get("kind") or "limit")
+            kind = normalize_kind(str(event.get("kind") or ""))
             self._risk_stop = {"kind": kind, "reason": str(event.get("error") or "")}
             if kind == "login":
                 self._append_log(f"🔑 登录态失效：{event.get('error')}　→ 请扫码登录")
-            elif kind == "captcha":
-                self._append_log(f"⏸ 撞上验证码：{event.get('error')}　→ 已在下方等你验证")
+            elif kind == "verify":
+                self._append_log(
+                    f"⏸ 抖音要求验证本人操作：{event.get('error')}\n"
+                    "   → 这**不是**账号被限流，验证一下就能继续（下方有按钮）"
+                )
             else:
                 self._append_log(
                     f"🛑 账号被限流（软风控）：{event.get('error')}\n"

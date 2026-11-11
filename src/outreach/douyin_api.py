@@ -56,6 +56,30 @@ LIMIT_TEXTS = (
 
 RISK_TEXTS = VERIFY_TEXTS + LIMIT_TEXTS
 
+# ================================================================
+# 停手的三种类型（统一词汇表）
+# ================================================================
+#   verify：平台要人工验证（短信/扫码/图形）→ 叫人，停下等他
+#   limit ：账号被限制 → 直接停，扫码没用
+#   login ：登录态没了 → 叫人扫码
+#
+# 之前 worker 用「captcha」、异常用「verify」，两套词 → 日志里出现过
+# 「触发风控：抖音要求验证本人操作」紧跟着「账号被限流（软风控）」这种自相矛盾。
+# 现在统一成一种写法。
+KIND_VERIFY = "verify"
+KIND_LIMIT = "limit"
+KIND_LOGIN = "login"
+
+
+def normalize_kind(kind: str) -> str:
+    """把各种写法统一成 verify / limit / login"""
+    k = (kind or "").strip().lower()
+    if k in ("verify", "captcha", "验证码", "验证"):
+        return KIND_VERIFY
+    if k in ("login", "登录"):
+        return KIND_LOGIN
+    return KIND_LIMIT
+
 
 class DouyinError(Exception):
     pass
@@ -97,12 +121,36 @@ class Douyin:
         #   account_flow = "verify" → 要本人验证（短信/扫码），不是被限流
         #   account_flow = "block"  → 账号被限制
         # 这是平台自己给的结论，比我们猜页面文案准得多。
+        #
+        # ⚠️ 必须带时间戳：这个状态是「粘」的——
+        # 人工验证通过之后如果不清掉，下一条线索会在**搜索阶段**
+        # 就被自己的旧状态拦死（实测 2026-11-11：验证完第一条，第二条直接停）。
         self.verify_flow = ""
+        self.verify_flow_at = 0.0
         self.verify_ways: list[str] = []
         try:
             page.on("response", self._on_decision)
         except Exception:
             pass
+
+    def clear_verify(self) -> None:
+        """人工验证通过后调用：清掉「要验证」状态
+
+        不清的话，这个状态会一直挂着，下一条线索刚开跑就被拦死。
+        """
+        self.verify_flow = ""
+        self.verify_flow_at = 0.0
+        self.verify_ways = []
+
+    def _verify_pending(self) -> bool:
+        """当前是不是「平台刚判了要验证」
+
+        只认**刚刚**的裁决（60 秒内）——过了这个窗口它就是过期状态，
+        不该再拦后面的动作。
+        """
+        if self.verify_flow != "verify":
+            return False
+        return (time.time() - self.verify_flow_at) < 60
 
     def _on_decision(self, r: Response) -> None:
         """盯抖音的风控裁决接口
@@ -123,6 +171,7 @@ class Douyin:
         flow = str(d.get("account_flow") or "")
         if flow:
             self.verify_flow = flow
+            self.verify_flow_at = time.time()
         ways = []
         for w in (d.get("verify_ways") or []):
             v = w.get("verify_way") or ""
@@ -155,13 +204,14 @@ class Douyin:
             self._shot("risk_captcha")
             raise RiskControl("跳转到安全验证页", kind="verify")
         # 平台自己的裁决最准：account_flow=verify 就是「要本人验证」
-        if getattr(self, "verify_flow", "") == "verify":
+        # 只认刚判的（60 秒内），过期的裁决不该继续拦后面的动作
+        if self._verify_pending():
             self._shot("risk_verify")
             ways = "、".join(self.verify_ways) if self.verify_ways else ""
             raise RiskControl(
                 "抖音要求验证本人操作才能发评论"
                 + (f"（可用的验证方式：{ways}）" if ways else ""),
-                kind="verify")
+                kind=KIND_VERIFY)
         txt = self._body_text()
         for kw in VERIFY_TEXTS:
             if kw in txt:

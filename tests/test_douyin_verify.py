@@ -203,3 +203,96 @@ def test_限流类异常不当作要验证处理(tmp_path):
     except RiskControl as e:
         assert e.kind == "limit"
     assert called == []
+
+
+# ============================================================
+# 验证状态不能「粘」住（2026-11-11 实测踩到）
+# ============================================================
+
+def test_验证通过后要清掉状态():
+    """不清的话，下一条线索刚开跑就被自己的旧状态拦死
+
+    实测（2026-11-11 run #10）：第 1 条验证完发出去了，
+    第 2 条在**搜索阶段**就被 verify_flow=verify 拦停，整轮提前结束。
+    """
+    from src.outreach.douyin_api import Douyin
+
+    dy = Douyin(_FakePage())
+    dy.verify_flow = "verify"
+    dy.verify_flow_at = 9999999999.0
+    dy.verify_ways = ["qr_code_verify"]
+    dy.clear_verify()
+    assert dy.verify_flow == ""
+    assert dy.verify_ways == []
+    assert dy._verify_pending() is False
+
+
+def test_过期的裁决不再拦人():
+    """超过 60 秒的裁决是过期状态，不该继续拦后面的动作"""
+    import time as _t
+
+    from src.outreach.douyin_api import Douyin
+
+    dy = Douyin(_FakePage())
+    dy.verify_flow = "verify"
+    dy.verify_flow_at = _t.time() - 120
+    assert dy._verify_pending() is False
+
+    dy.verify_flow_at = _t.time()
+    assert dy._verify_pending() is True
+
+
+def test_人工验证后worker会清状态(tmp_path):
+    """_post_with_human_help 在验证通过后必须调 clear_verify"""
+    w = _worker(tmp_path)
+    cleared = []
+
+    class _Dy(_FakeDy):
+        def clear_verify(self):
+            cleared.append(1)
+
+    dy = _Dy(found_after_verify=True)
+    w._bring_window_back = lambda: True
+    w._notify_risk = lambda *a, **k: True
+    w._wait_for_human = lambda reason: True
+
+    w._post_with_human_help(dy, "123", "你好", {"id": 1})
+    assert cleared, "验证通过后必须清掉「要验证」状态"
+
+
+# ============================================================
+# kind 词汇统一
+# ============================================================
+
+def test_kind词汇统一():
+    from src.outreach.douyin_api import (
+        KIND_LIMIT, KIND_LOGIN, KIND_VERIFY, normalize_kind,
+    )
+
+    assert normalize_kind("captcha") == KIND_VERIFY
+    assert normalize_kind("verify") == KIND_VERIFY
+    assert normalize_kind("验证码") == KIND_VERIFY
+    assert normalize_kind("login") == KIND_LOGIN
+    assert normalize_kind("limit") == KIND_LIMIT
+    assert normalize_kind("") == KIND_LIMIT
+    assert normalize_kind("瞎写的") == KIND_LIMIT
+
+
+# ============================================================
+# 间隔可以当场调
+# ============================================================
+
+def test_本轮临时间隔覆盖配置(tmp_path):
+    """网页上填的间隔要能覆盖配置里的"""
+    w = _worker(tmp_path)
+    w.cfg.outreach.min_delay = 45
+    w.cfg.outreach.max_delay = 120
+    w._delay_min = 10
+    w._delay_max = 20
+    assert w._delay_min == 10 and w._delay_max == 20
+
+    # 没给覆盖时用配置里的
+    w._delay_min = None
+    w._delay_max = None
+    assert w._delay_min is None and w._delay_max is None
+

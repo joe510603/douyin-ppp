@@ -33,7 +33,8 @@ from typing import Callable, Optional
 from .browser import Browser, Session
 from .copywriter import Copywriter
 from .douyin_api import (
-    Douyin, DouyinError, NoWorks, NotLoggedIn, RiskControl, VERIFY_TEXTS,
+    Douyin, DouyinError, KIND_LIMIT, KIND_LOGIN, KIND_VERIFY, NoWorks,
+    NotLoggedIn, RiskControl, VERIFY_TEXTS, normalize_kind,
 )
 from .store import (
     STATUS_COMMENTED,
@@ -139,6 +140,9 @@ class OutreachWorker:
         # copywriter 吃的是 dict 配置，这里把 OutreachConfig 转成它认的形状
         self.cw = Copywriter(self._copywriter_cfg(), log=self.log)
         self.stop_reason = ""
+        # 这一轮是因为什么停手的：verify / limit / login / 空
+        # 跟 stop_reason 一起落库，服务重启后横幅还能恢复
+        self._stop_kind = ""
         self._dry = True
         # 连续「发出去但回查不到」的次数（软风控信号）
         self._silent_blocks = 0
@@ -149,6 +153,9 @@ class OutreachWorker:
         self.show_window_event = show_window_event
         # 正在等人工验证
         self.waiting_human = False
+        # 本轮临时覆盖的两条之间间隔（秒）；None = 用配置里的
+        self._delay_min: Optional[float] = None
+        self._delay_max: Optional[float] = None
         # 当前页面对象（判断验证码是不是过了要用）
         self._dy = None
 
@@ -188,7 +195,7 @@ class OutreachWorker:
     def _risk_kind(reason: str) -> str:
         """风控分三类，处理方式完全不同
 
-        - ``captcha``：要人工验证（短信/图形验证码）→ 叫人、停下等
+        - ``verify``：要人工验证（短信/图形验证码）→ 叫人、停下等
         - ``login``：登录态没了 → 叫人扫码
         - ``limit``：账号被限流 → 直接停，扫码没用
 
@@ -200,10 +207,10 @@ class OutreachWorker:
         """
         r = str(reason or "").lower()
         if any(h in r for h in ("登录", "login", "sessionid", "未登录", "扫码")):
-            return "login"
+            return KIND_LOGIN
         if any(h in r for h in VERIFY_TEXTS):
-            return "captcha"
-        return "limit"
+            return KIND_VERIFY
+        return KIND_LIMIT
 
     def _notify_risk(self, kind: str, reason: str, lead: Optional[dict] = None) -> bool:
         """触达停手了 → 飞书私聊通知你
@@ -213,10 +220,11 @@ class OutreachWorker:
         既不知道发生了什么，也不知道该干什么。
 
         三种情况给三种指引：
-        - captcha：要人工验证 → 叫人 + 停下等
+        - verify：要人工验证 → 叫人 + 停下等
         - login：登录态没了 → 叫人扫码
         - limit：账号被限流 → 扫码没用，得等解封
         """
+        kind = normalize_kind(kind)
         n = self.cfg.notify
         if not getattr(n, "lark_im_enabled", False):
             self.log("  （没开飞书私聊通知，只在页面上提示）")
@@ -235,7 +243,7 @@ class OutreachWorker:
         wait_min = int(getattr(self.cfg.outreach, "captcha_wait_minutes", 15) or 15)
         cool_min = int(getattr(self.cfg.outreach, "risk_cooldown_minutes", 120) or 120)
 
-        if kind == "captcha":
+        if kind == KIND_VERIFY:
             title = "⚠️ 抖音要求验证本人操作，触达已暂停等你处理"
             steps = (
                 "抖音在发评论时弹了**身份验证**（不是限流，账号是好的）：\n"
@@ -451,8 +459,11 @@ class OutreachWorker:
             self.log(f"  ⏳ 干跑，等 {sec}s 看下一条")
             self._sleep(sec)
             return
-        lo = int(o.min_delay or 45)
-        hi = max(lo, int(o.max_delay or 120))
+        # 本轮临时覆盖（网页上可以当场调），没给就用配置里的
+        lo = int(self._delay_min if self._delay_min is not None
+                 else (o.min_delay or 45))
+        hi = max(lo, int(self._delay_max if self._delay_max is not None
+                         else (o.max_delay or 120)))
         sec = random.randint(lo, hi)
         self.log(f"  ⏳ 等 {sec}s 再找下一个（模拟真人节奏）")
         self._sleep(sec)
@@ -528,6 +539,8 @@ class OutreachWorker:
         dry_run: Optional[bool] = None,
         only: Optional[list[str]] = None,
         use_session: bool = True,
+        delay_min: Optional[float] = None,
+        delay_max: Optional[float] = None,
     ) -> dict:
         """跑一轮触达
 
@@ -536,11 +549,18 @@ class OutreachWorker:
             dry_run: 干跑（默认取配置 dry_run，**默认是 True**）
             only: 只处理指定的抖音号
             use_session: 复用常驻浏览器（省掉每次重开窗口的十几秒）
+            delay_min / delay_max: 本轮的两条之间间隔（秒），留空用配置里的
         """
         o = self.cfg.outreach
         dry = bool(o.dry_run if dry_run is None else dry_run)
         self._dry = dry
         self._silent_blocks = 0
+        # 每轮从头开始（同一个 worker 对象可能被复用跑多轮）
+        self.stop_reason = ""
+        self._stop_kind = ""
+        # 本轮的临时间隔覆盖（网页上当场调，不写回配置）
+        self._delay_min = delay_min
+        self._delay_max = delay_max
         per_run = int(limit or o.max_per_run or 10)
         daily_limit = int(o.daily_limit or 30)
 
@@ -620,8 +640,10 @@ class OutreachWorker:
                 self._dy = dy
                 if not dy.cookies_ok():
                     self.stop_reason = "未登录：浏览器 profile 里没有 sessionid，先扫码登录"
+                    self._stop_kind = KIND_LOGIN
                     self.log(f"❌ {self.stop_reason}")
-                    self.st.finish_run(run_id, note=self.stop_reason)
+                    self.st.finish_run(run_id, note=self.stop_reason,
+                                       kind=self._stop_kind)
                     summary.update({"ok": False, "stopped": self.stop_reason, "need_login": True})
                     self._emit(type="need_login")
                     return summary
@@ -642,21 +664,24 @@ class OutreachWorker:
                     except RiskControl as e:
                         # 优先用异常自带的类型（只有一套判据），
                         # 老异常没有 kind 时再退回关键词判断。
-                        kind = getattr(e, "kind", "") or self._risk_kind(str(e))
+                        kind = normalize_kind(getattr(e, "kind", "")
+                                              or self._risk_kind(str(e)))
                         self.stop_reason = f"触发风控：{e}"
+                        self._stop_kind = kind
                         self.log(f"🛑 {self.stop_reason}，立即停止")
                         self._emit(type="risk", lead=lead, error=str(e), kind=kind)
 
                         # 验证码要人工过：叫人 + 把窗口叫回来 + 停下等他。
                         # 注意这跟「账号被限流」是两回事：
                         # 限流是平台不给过了，验证码是平台要你证明你是人。
-                        if kind == "captcha":
+                        if kind == KIND_VERIFY:
                             self._bring_window_back()
-                            self._notify_risk("captcha", str(e), lead)
+                            self._notify_risk(KIND_VERIFY, str(e), lead)
                             if self._wait_for_human(str(e)):
                                 # 人工验证完了：这条线索退回待触达，重新来
                                 self._set_status(lead, STATUS_PENDING, "验证码已人工处理，重新排队")
                                 self.stop_reason = ""
+                                self._stop_kind = ""
                                 self.log("↩ 继续处理队列")
                                 continue
                             self.stop_reason = f"验证码未人工处理：{e}"
@@ -672,8 +697,9 @@ class OutreachWorker:
                     except NotLoggedIn as e:
                         # 登录态没了 → 叫人扫码（这个是能解决的！）
                         self.stop_reason = f"登录失效：{e}"
+                        self._stop_kind = KIND_LOGIN
                         self.log(f"🛑 {self.stop_reason}")
-                        self._emit(type="risk", lead=lead, error=str(e), kind="login")
+                        self._emit(type="risk", lead=lead, error=str(e), kind=KIND_LOGIN)
                         self._notify_risk("login", str(e), lead)
                         self._set_status(lead, STATUS_FAILED, str(e))
                         summary.update({"ok": False, "need_login": True})
@@ -729,7 +755,7 @@ class OutreachWorker:
         note = self.stop_reason or ("干跑" if dry else "")
         self.st.finish_run(
             run_id, sent=summary["sent"], failed=summary["failed"],
-            skipped=summary["skipped"], note=note,
+            skipped=summary["skipped"], note=note, kind=self._stop_kind,
         )
         summary["stopped"] = self.stop_reason
         self.log(
@@ -764,17 +790,27 @@ class OutreachWorker:
             try:
                 return dy.post_comment(aweme_id, text)
             except RiskControl as e:
-                if getattr(e, "kind", "") != "verify":
+                if normalize_kind(getattr(e, "kind", "")) != KIND_VERIFY:
                     raise
                 # 要人工验证 → 叫人
                 self.stop_reason = f"触发风控：{e}"
+                self._stop_kind = KIND_VERIFY
                 self.log(f"🛑 {self.stop_reason}")
-                self._emit(type="risk", lead=lead, error=str(e), kind="verify")
+                self._emit(type="risk", lead=lead, error=str(e), kind=KIND_VERIFY)
                 self._bring_window_back()
-                self._notify_risk("captcha", str(e), lead)
+                self._notify_risk(KIND_VERIFY, str(e), lead)
                 if not self._wait_for_human(str(e)):
                     raise DouyinError(f"验证码未人工处理：{e}") from e
                 self.stop_reason = ""
+                self._stop_kind = ""
+
+                # ⚠️ 必须清掉「要验证」状态！
+                # 不清的话它会一直挂着，下一条线索**刚开跑就被拦死**
+                # （实测 2026-11-11：验证完第 1 条，第 2 条在搜索阶段就停了）。
+                try:
+                    dy.clear_verify()
+                except Exception:
+                    pass
 
                 # 验证完了：这条评论到底发出去了没有？
                 found = False
