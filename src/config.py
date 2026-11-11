@@ -210,6 +210,16 @@ class OutreachConfig(BaseModel):
     enabled: bool = False
     # 全自动模式（关闭时需在页面上手动触发）
     auto_mode: bool = False
+    # 自动模式每隔多少分钟跑一轮
+    auto_interval_minutes: int = 60
+    # 自动模式每轮最多处理几条
+    auto_max_per_run: int = 10
+    # 自动模式默认**干跑**（只生成话术不发送）
+    #
+    # 为什么默认干跑：自动 = 无人值守。无人值守时真发评论，
+    # 一旦撞风控人不在电脑前就白跑一轮，还可能把号搞废。
+    # 要「自动真发」必须在页面上显式关掉这个开关。
+    auto_dry_run: bool = True
     # 每日留言上限（防风控）
     daily_limit: int = 30
     # 两次留言之间的随机延时区间（秒）

@@ -455,7 +455,11 @@ class OutreachWorker:
         self._recycle_page()
         o = self.cfg.outreach
         if self._dry:
-            sec = random.randint(3, 6)
+            # 干跑的间隔也不能太短！
+            # 干跑虽然不发评论，但**照样要搜索用户** ——
+            # 3-8 秒一次搜索，10 条下来就是 1 分钟内 10 次搜索，
+            # 抖音的搜索风控扛不住（2026-11-11 实测：干跑那轮 10 条全部搜不到）。
+            sec = random.randint(15, 25)
             self.log(f"  ⏳ 干跑，等 {sec}s 看下一条")
             self._sleep(sec)
             return

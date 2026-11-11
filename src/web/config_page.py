@@ -663,6 +663,31 @@ def create_config_page():
             ).props("dense outlined").classes("col-6 col-sm-3 app-input")
 
         with ui.row().classes("w-full items-end q-col-gutter-sm q-mt-sm"):
+            # ---- 自动触达 ----
+            # 触达页也有同样的开关，那边改更方便；这里留着方便一次性配好。
+            outreach_auto_switch = ui.switch(
+                "自动触达（定时自动跑，不用手动点）",
+                value=config.outreach.auto_mode,
+            ).classes("col-6 col-sm-3")
+
+            outreach_auto_dry_switch = ui.switch(
+                "自动模式默认干跑（推荐）",
+                value=config.outreach.auto_dry_run,
+            ).classes("col-6 col-sm-3")
+
+            outreach_auto_interval = ui.number(
+                "自动每隔(分钟)",
+                value=config.outreach.auto_interval_minutes,
+                min=5, max=1440, step=5,
+            ).props("dense outlined").classes("col-6 col-sm-3 app-input")
+
+            outreach_auto_max_run = ui.number(
+                "自动每轮最多",
+                value=config.outreach.auto_max_per_run,
+                min=1, max=50, step=1,
+            ).props("dense outlined").classes("col-6 col-sm-3 app-input")
+
+        with ui.row().classes("w-full items-end q-col-gutter-sm q-mt-sm"):
             outreach_salutation_pool = ui.input(
                 "称呼变体（逗号分隔，和模板变体组合能降低重复率）",
                 value=",".join(config.outreach.salutation_pool or []),
@@ -708,6 +733,12 @@ def create_config_page():
             config.outreach.recent_days = int(outreach_recent.value or 120)
             config.outreach.max_chars = int(outreach_max_chars.value or 60)
             config.outreach.dry_run = bool(outreach_dry_switch.value)
+            config.outreach.auto_mode = bool(outreach_auto_switch.value)
+            config.outreach.auto_dry_run = bool(outreach_auto_dry_switch.value)
+            config.outreach.auto_interval_minutes = int(
+                outreach_auto_interval.value or 60
+            )
+            config.outreach.auto_max_per_run = int(outreach_auto_max_run.value or 10)
             config.outreach.verify_after_post = bool(outreach_verify_switch.value)
             config.outreach.allow_contact_words = bool(outreach_contact_switch.value)
             config.outreach.headless = bool(outreach_headless_switch.value)

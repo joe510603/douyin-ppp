@@ -82,6 +82,8 @@ class AppState:
         self._scheduler_task: asyncio.Task | None = None
         self._flush_task: asyncio.Task | None = None
         self._bitable_pull_task: asyncio.Task | None = None
+        # 自动触达调度（定时自动跑，不用人守着点按钮）
+        self._outreach_auto_task: asyncio.Task | None = None
 
 
 state = AppState()
@@ -791,6 +793,19 @@ async def on_startup():
     state._scheduler_task = loop.create_task(_listen_detection_results(), name="detection-listener")
     log.info(f"调度任务已启动（检测线程 TID={t.ident}，独立线程）✅")
 
+    # 自动触达调度器：定时自动跑触达
+    # （循环本身每 30 秒检查一次该不该跑，开关没开就什么都不做）
+    from src.outreach.auto_scheduler import get_auto_scheduler
+    state._outreach_auto_task = loop.create_task(
+        get_auto_scheduler().loop(), name="outreach-auto-loop"
+    )
+    if get_config().outreach.auto_mode:
+        mode = "干跑" if get_config().outreach.auto_dry_run else "真发"
+        log.info(
+            f"🤖 自动触达已开启：每 {get_config().outreach.auto_interval_minutes} 分钟一轮，"
+            f"模式 {mode}"
+        )
+
 
 async def on_shutdown():
     """NiceGUI 关闭前回调 — 清理资源"""
@@ -809,6 +824,13 @@ async def on_shutdown():
 
     if state._bitable_pull_task and not state._bitable_pull_task.done():
         state._bitable_pull_task.cancel()
+
+    if state._outreach_auto_task and not state._outreach_auto_task.done():
+        state._outreach_auto_task.cancel()
+        try:
+            await state._outreach_auto_task
+        except asyncio.CancelledError:
+            pass
 
     # 停止检测线程（daemon 线程，主进程退出时自动终止）
     if hasattr(state, '_detection_thread') and state._detection_thread:

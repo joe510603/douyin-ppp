@@ -14,7 +14,7 @@ import json
 import pathlib
 import random
 import time
-from typing import Any, Callable
+from typing import Any, Callable, Optional
 
 
 from playwright.sync_api import Page, Response
@@ -263,8 +263,27 @@ class Douyin:
         if not self.cookies_ok():
             raise NotLoggedIn("没有登录态（cookie 里没有 sessionid），先跑 `python -m dtouch login` 扫码")
 
-    def _goto(self, url: str, wait: str = "domcontentloaded", timeout: int = 45000) -> None:
-        self.page.goto(url, wait_until=wait, timeout=timeout)
+    def _goto(self, url: str, wait: str = "domcontentloaded", timeout: int = 45000,
+              retries: int = 2) -> None:
+        """跳页面，失败重试
+
+        为什么要重试：抖音偶尔会返回 net::ERR_NETWORK_CHANGED
+        （本地网络抖动 / 采集器的 WebSocket 太多时更容易碰上）。
+        一次失败就放弃的话，整条线索就白跑了。
+        """
+        last: Exception | None = None
+        for attempt in range(retries + 1):
+            try:
+                self.page.goto(url, wait_until=wait, timeout=timeout)
+                return
+            except Exception as e:
+                last = e
+                if attempt >= retries:
+                    break
+                self.log(f"  （页面打不开，重试 {attempt + 1}/{retries}）")
+                self.page.wait_for_timeout(2000)
+        if last is not None:
+            raise last
 
     @staticmethod
     def _parse_jsonish(raw: str) -> list[dict]:
@@ -290,8 +309,16 @@ class Douyin:
         return out
 
     # 抓响应：先挂监听 → 执行动作 → 边等边解析，直到某条响应满足 expect
-    def _capture(self, url_part: str, action: Callable[[], None], timeout: int = 9000,
-                 expect: Callable[[dict], bool] | None = None, settle: int = 600) -> list[dict]:
+    def _capture(self, url_part, action: Callable[[], None], timeout: int = 9000,
+                 expect: Callable[[dict], bool] | None = None, settle: int = 600,
+                 mid_hook: Optional[Callable[[], None]] = None) -> list[dict]:
+        """执行 action，同时抓指定接口的响应
+
+        url_part: 匹配 URL 的子串，也可以传一组子串（任一命中就算）
+        mid_hook: action 之后、开始等待响应之前执行的回调
+                  （用来做「等页面稳定 → 点某个 tab」这类事）
+        """
+        parts = (url_part,) if isinstance(url_part, str) else tuple(url_part)
         hits: list[Response] = []
         parsed: list[dict] = []
         done: list[bool] = [False]
@@ -299,7 +326,7 @@ class Douyin:
 
         def on_resp(r: Response) -> None:
             try:
-                if url_part in r.url:
+                if any(p in r.url for p in parts):
                     hits.append(r)
             except Exception:
                 pass
@@ -318,6 +345,12 @@ class Douyin:
         self.page.on("response", on_resp)
         try:
             action()
+            # 预热钩子：比如「等搜索结果页出来 → 点『用户』tab」
+            if mid_hook:
+                try:
+                    mid_hook()
+                except Exception as e:
+                    self.log(f"  （预热动作没成功：{str(e).splitlines()[0][:50]}）")
             end = time.time() + timeout / 1000
             while time.time() < end:
                 self.page.wait_for_timeout(250)
@@ -334,12 +367,66 @@ class Douyin:
                 pass
 
     # ------------------------------------------------------------ 找人（抖音号）
+    def _click_user_tab(self, timeout: int = 12000) -> bool:
+        """点搜索结果页的「用户」tab
+
+        为什么必须点（2026-11-11 实测踩到）：
+
+        抖音搜索框按回车后，默认落在「**综合**」tab，返回的是**视频结果**：
+        - 请求 general/search/stream（响应体是空的，读不到）
+        - 请求 general/search/single?search_channel=aweme_general（214KB，但里面没有 user_list）
+
+        用户列表要**点一下「用户」tab**才会发另一个请求：
+            /aweme/v1/web/discover/search/?search_channel=aweme_user_web
+        那个接口的响应里**顶层就有 user_list**，才是我们要的东西。
+
+        不点 tab → 一个用户都搜不到，日志全是「搜索无用户结果」。
+        （当时 10 条线索全部搜不到，看起来像账号被限流，其实是 tab 没点。）
+
+        tab 的 class 是哈希化的（每次构建都会变），所以只能靠**精确文字 + 可见**来定位。
+        """
+        end = time.time() + timeout / 1000
+        while time.time() < end:
+            try:
+                clicked = self.page.evaluate(
+                    """() => {
+                      // 优先用抖音自己的 tab class（'semi-tabs-tab' 是稳定的）
+                      const named = document.querySelectorAll(
+                        '[class*="semi-tabs-tab"], [class*="search-tab"], [class*="tab-item"]');
+                      for (const el of named) {
+                        if ((el.innerText || '').trim() === '用户') { el.click(); return true; }
+                      }
+                      // 兜底：精确文本 + 没有子元素 + 可见
+                      for (const el of document.querySelectorAll('div,span,a,li')) {
+                        if ((el.innerText || '').trim() !== '用户') continue;
+                        if (el.children.length !== 0) continue;
+                        const r = el.getBoundingClientRect();
+                        if (r.width < 1 || r.height < 1) continue;
+                        el.click();
+                        return true;
+                      }
+                      return false;
+                    }"""
+                )
+            except Exception:
+                clicked = False
+            if clicked:
+                return True
+            self.page.wait_for_timeout(400)
+        return False
+
     def _search(self, q: str) -> list[dict]:
         """像真人一样用搜索框搜。
 
         实测（2026-11）：直接 goto /search/{q}?type=user 页面是空的（SPA 路由不认），
         只有在首页搜索框里输入并回车，跳到 /jingxuan/search/{q} 才会出结果。
-        用户卡片来自 general/search/stream 的 type=4 user_list。
+
+        ⚠️ 抖音搜索默认落在「综合」tab（返回视频），
+        用户列表**必须点一下「用户」tab**才会请求
+            /aweme/v1/web/discover/search/?search_channel=aweme_user_web
+        那个接口的响应里顶层就有 ``user_list``。
+        （2026-11-11 实测：不点 → 10 条线索全部「搜索无用户结果」，
+        看着像账号被限流，其实是 tab 没点、接口对不上。）
         """
         def do_search() -> None:
             self._goto(f"{DOUYIN}/")
@@ -356,9 +443,14 @@ class Douyin:
             return any(str(u.get("unique_id") or "") == q or str(u.get("short_id") or "") == q
                        for u in self._extract_users([j]))
 
-        data = self._capture("general/search", do_search, timeout=15000,
-                             expect=hit, settle=1500)
-        # 首屏没命中时再多等一会儿（stream 是分几段推过来的）
+        # discover/search = 用户 tab 的接口（user_list 在顶层）
+        # general/search  = 综合 tab 的接口（兜底，偶尔也能捞到 user_info）
+        data = self._capture(
+            ("discover/search", "general/search"),
+            do_search, timeout=20000, expect=hit, settle=1500,
+            mid_hook=self._click_user_tab,
+        )
+        # 首屏没命中时再多等一会儿（分几段推过来的）
         if not self._extract_users(data):
             self.page.wait_for_timeout(2500)
         return data

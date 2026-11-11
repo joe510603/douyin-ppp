@@ -234,6 +234,129 @@ def create_outreach_page():
                     except Exception as e:
                         outreach_info.text = f"（读取触达状态失败：{e}）"
 
+                # ---- 自动触达：不守着也能跑 ----
+                # 用户要求「能自动取做触达，不用我在手动跑了，有可以设置自动」。
+                # 开关、间隔、干跑/真发都在这儿当场调，不用去配置页。
+                with ui.element("div").classes("w-full q-mt-sm q-pa-md").style(
+                    "background:#f0f7ff; border:1px solid #7aa7e0; border-radius:8px;"
+                ) as auto_box:
+                    with ui.row().classes("w-full items-center q-gutter-sm"):
+                        ui.label("🤖 自动触达").classes("text-body2 font-weight-bold")
+
+                        auto_switch = ui.switch(
+                            "开启",
+                            value=bool(config.outreach.auto_mode),
+                        )
+
+                        auto_interval = ui.number(
+                            "每隔(分钟)",
+                            value=int(config.outreach.auto_interval_minutes or 60),
+                            min=5, max=1440, step=5,
+                        ).props("dense outlined").classes("col-4 col-sm-2 app-input")
+
+                        auto_max_run = ui.number(
+                            "每轮最多",
+                            value=int(config.outreach.auto_max_per_run or 10),
+                            min=1, max=50, step=1,
+                        ).props("dense outlined").classes("col-4 col-sm-2 app-input")
+
+                        auto_dry_switch = ui.switch(
+                            "干跑（不真发）",
+                            value=bool(config.outreach.auto_dry_run),
+                        )
+
+                    auto_status = ui.label("").classes("text-caption text-grey-7 q-mt-xs")
+
+                    ui.label(
+                        "⚠️ 自动真发 = 没人值守。抖音随时可能要求「本人操作验证」，"
+                        "撞上了会飞书叫你、停下来等你验证（不会自动发出去）。"
+                        "另外：多台机器都开自动触达会**重复留言**——去重只看本机记录，"
+                        "看不见另一台机器发过什么。"
+                    ).classes("text-caption text-grey-7 q-mt-xs").style("line-height:1.7;")
+
+                def _refresh_auto_status():
+                    """刷新自动触达状态（上次/下次/在等什么）"""
+                    from ..outreach.auto_scheduler import get_auto_scheduler
+
+                    try:
+                        st = get_auto_scheduler().status()
+                    except Exception as e:
+                        auto_status.text = f"（读取自动触达状态失败：{e}）"
+                        return
+
+                    if not st["configured"]:
+                        auto_status.text = "自动触达：未开启"
+                        return
+                    if not st["enabled"]:
+                        auto_status.text = (
+                            "自动触达：已打开开关，但「启用抖音触达」没开 → 不会跑"
+                        )
+                        return
+
+                    mode = "干跑" if st["dry_run"] else "真发"
+                    if st["running"]:
+                        # 正在跑的时候 last_run_at 还是上一轮的，
+                        # 直接说「还没跑过」会让人以为开关没生效
+                        bits = [f"自动触达：⏳ 正在跑本轮（{mode}）"]
+                    else:
+                        bits = [f"自动触达：运行中（{mode}）"]
+                    if st["last_run_at"]:
+                        r = st.get("last_result") or {}
+                        detail = (
+                            f"发 {r.get('sent', 0)}　干跑 {r.get('dry', 0)}　"
+                            f"失败 {r.get('failed', 0)}"
+                        )
+                        bits.append(f"上次 {st['last_run_at']}（{detail}）")
+                    elif not st["running"]:
+                        bits.append("还没跑过")
+                    if st["next_run_at"]:
+                        bits.append(f"下次 {st['next_run_at']}")
+                    if st["cooldown"]:
+                        bits.append(f"⚠️ 限流冷却中，还剩 {st['cooldown']} 分钟，等冷却完再跑")
+                    elif st["last_error"]:
+                        bits.append(f"（{st['last_error']}）")
+                    auto_status.text = "　".join(bits)
+
+                def _save_auto_settings():
+                    """保存自动触达设置"""
+                    from ..config import get_config, save_config, reload_config
+
+                    cfg = get_config()
+                    cfg.outreach.auto_mode = bool(auto_switch.value)
+                    cfg.outreach.auto_dry_run = bool(auto_dry_switch.value)
+                    try:
+                        cfg.outreach.auto_interval_minutes = int(
+                            auto_interval.value or 60
+                        )
+                    except Exception:
+                        pass
+                    try:
+                        cfg.outreach.auto_max_per_run = int(auto_max_run.value or 10)
+                    except Exception:
+                        pass
+                    save_config(cfg)
+                    reload_config()
+                    _refresh_auto_status()
+
+                def _toggle_auto():
+                    """开关变化：开着就立刻跑一轮，别让人干等一个周期"""
+                    from ..outreach.auto_scheduler import get_auto_scheduler
+
+                    _save_auto_settings()
+                    if auto_switch.value:
+                        get_auto_scheduler().trigger_now()
+                        ui.notify("自动触达已开启，马上跑第一轮", type="positive")
+                    else:
+                        ui.notify("自动触达已关闭", type="info")
+                    _refresh_auto_status()
+
+                auto_switch.on_value_change(_toggle_auto)
+                auto_dry_switch.on_value_change(_save_auto_settings)
+                auto_interval.on_value_change(_save_auto_settings)
+                auto_max_run.on_value_change(_save_auto_settings)
+                _refresh_auto_status()
+
+                # 现在两个刷新函数都定义好了，统一刷一次
                 _refresh_outreach_info()
 
                 with ui.row().classes("w-full items-end q-col-gutter-sm"):
@@ -552,6 +675,7 @@ def create_outreach_page():
                         log.warning(f"加载触达记录失败: {e}")
 
                     _refresh_outreach_info()
+                    _refresh_auto_status()
 
                 # 页面打开时加载一次
                 ui.timer(0.6, _load_outreach_views, once=True)
