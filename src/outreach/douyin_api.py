@@ -701,16 +701,73 @@ class Douyin:
         """抖音号/短 ID → {sec_uid, nickname, unique_id, aweme_count, signature}。
 
         搜不到抖音号时（改名/只填了昵称/号本身失效），用表格里的昵称再试一次，
-        但只认**昵称完全一致**的候选，避免抓错人。
+        但**认人必须靠抖音号**——昵称只能用来扩大搜索池。
+        （详见 ``_resolve_once`` 里那段注释。）
         """
-        info = self._resolve_once(unique_id)
-        if info or not (nickname or "").strip():
+        dy_id = str(unique_id or "").strip().lstrip("@")
+        info = self._resolve_once(dy_id)
+        if info:
             return info
-        nick = str(nickname).strip()
-        self.log(f"  ↪ 抖音号没搜到，改用昵称再搜一次：{nick}")
-        return self._resolve_once(nick, by_nickname=True)
 
-    def _resolve_once(self, unique_id: str, by_nickname: bool = False) -> dict | None:
+        nick = self._clean_nickname(nickname)
+        if not nick:
+            return None
+        self.log(f"  ↪ 抖音号没搜到，改用昵称再搜一次：{nick}")
+        info = self._resolve_once(nick, by_nickname=True, want_dy=dy_id)
+        if info:
+            return info
+
+        # 两条路都没找到 → 再用抖音号搜一次
+        #
+        # 为什么（2026-11-12 实测）：抖音的搜索结果是**概率性**的。
+        # 同一条线索、同一个抖音号 198785742：
+        #   18:36 生产跑 → 搜不到（判成「这个人没了」）
+        #   18:50 探针跑 → 搜到了（sec_uid 一模一样）
+        # 同一个号连着搜两次可能一次成功一次为空。
+        # 漏掉一条线索就是少一次转化机会，重试一次值得那几十秒。
+        if self._search_retry_enabled():
+            self.log("  ↪ 昵称也没搜到，用抖音号再搜一次（抖音搜索结果不稳定）")
+            return self._resolve_once(dy_id)
+        return None
+
+    # 抖音的昵称字段本身可能就是**截断显示**的（"候鸟…"）。
+    _NICK_ELLIPSIS = ("...", "…", "..")
+
+    @classmethod
+    def _clean_nickname(cls, nickname: str | None) -> str:
+        """把昵称末尾的省略号去掉
+
+        为什么（2026-11-12 实测）：
+        抖音给的是**截断昵称**（"候鸟…"，3 个字符）。
+        拿它去搜索等于搜「候鸟…」这个带省略号的词 —— 永远搜不到，
+        实测就是这么被判成「这个人搜不到」的。
+        去掉省略号后搜「候鸟」，抖音的模糊匹配能命中「候鸟在迁徙」。
+
+        ⚠ 但去掉省略号之后，昵称**不再唯一**——
+        不同的人会撞同一个截断昵称。所以昵称只能用来「扩大搜索池」，
+        认人还得靠抖音号（见 ``_resolve_once``）。
+        """
+        s = str(nickname or "").strip()
+        changed = True
+        while changed:
+            changed = False
+            for tail in cls._NICK_ELLIPSIS:
+                if s.endswith(tail):
+                    s = s[: -len(tail)].strip()
+                    changed = True
+        return s
+
+    def _search_retry_enabled(self) -> bool:
+        """抖音号搜索失败后要不要重试一次（抖音的结果是概率性的）"""
+        try:
+            from ..config import get_config
+
+            return bool(getattr(get_config().outreach, "search_retry", True))
+        except Exception:
+            return True
+
+    def _resolve_once(self, unique_id: str, by_nickname: bool = False,
+                      want_dy: str = "") -> dict | None:
         self.ensure_login()
         q = str(unique_id or "").strip().lstrip("@")
         if not q:
@@ -760,16 +817,44 @@ class Douyin:
 
         ql = q.lower()
         hit_user = None
+
+        def _ids_of(u: dict) -> set[str]:
+            """这个人的抖音号（unique_id 是自定义号，short_id 是自动号，两个都算）"""
+            return {str(u.get("unique_id") or "").lower(),
+                    str(u.get("short_id") or "").lower()}
+
+        # 1) 直接按搜索词匹配抖音号（抖音号搜索走这条路）
         for u in users:
-            ids = {str(u.get("unique_id") or "").lower(), str(u.get("short_id") or "").lower()}
-            if ql in ids:
+            if ql and ql in _ids_of(u):
                 hit_user = u
                 break
-        if not hit_user:
-            for u in users:
-                if str(u.get("nickname") or "").strip() == q:
-                    hit_user = u
-                    break
+
+        # 2) 昵称搜索：搜索词是昵称，但**认人得靠抖音号**
+        #
+        # 为什么不能只认昵称（2026-11-12 实测）：
+        # 抖音给的是**截断昵称**（"候鸟…"，3 个字符），不同的人会撞同一个昵称。
+        # 实测搜「候鸟…」返回了一个 unique_id=17996686 的人，
+        # 而我们要找的是 unique_id=198785742 —— **认错人了**。
+        # 认错人 = 拿客户的号给陌生人发广告，比跳过还糟。
+        if not hit_user and by_nickname:
+            want = str(want_dy or "").strip().lower()
+            if want:
+                for u in users:
+                    if want in _ids_of(u):
+                        hit_user = u
+                        break
+                if not hit_user:
+                    self.log(
+                        f"  ⚠️ 昵称搜到 {len(users)} 个候选，"
+                        f"但没有一个的抖音号对得上 {want_dy}"
+                        f"（不乱认人，跳过）"
+                    )
+            else:
+                # 没有抖音号可对（纯昵称线索），只能认昵称
+                for u in users:
+                    if str(u.get("nickname") or "").strip() == q:
+                        hit_user = u
+                        break
         if not hit_user:
             if by_nickname:
                 self.log(f"  ⚠️ 昵称也没搜到：{q}")
@@ -780,6 +865,13 @@ class Douyin:
         if not hit_user.get("sec_uid"):
             self.log("  ⚠️ 搜到用户但没有 sec_uid，跳过")
             return None
+        # 昵称搜索命中时，务必记一下到底是靠哪个号对上的——
+        # 事后翻日志要能确认「认的人是不是那个人」。
+        if by_nickname and want_dy:
+            self.log(
+                f"  ✓ 昵称搜索里找到抖音号对得上的人："
+                f"{hit_user.get('unique_id') or hit_user.get('short_id')}"
+            )
         return {
             "sec_uid": hit_user.get("sec_uid"),
             "nickname": hit_user.get("nickname"),
