@@ -317,6 +317,12 @@ class Douyin:
                   // ② 可见的验证码 iframe（跨域，父页面拿不到它的文字）
                   for (const f of document.querySelectorAll('iframe')) {
                     const src = f.getAttribute('src') || '';
+                    // 先排除「无验证码」壳子：抖音页面**常驻**一个
+                    // rc-verifycenter/rmc-nocaptcha 的 iframe（实测 display:none、0x0），
+                    // 它只是验证框架的空壳，不是真的验证码。
+                    // 不排除的话，它哪天被渲染成可见的就会误判成「要验证」，
+                    // 触达会莫名其妙停下来叫人。
+                    if (/nocaptcha/i.test(src)) continue;
                     if (!/verifycenter\\/captcha|captcha\\/v\\d|verify_center|verifycenter/i.test(src)) continue;
                     const r = f.getBoundingClientRect();
                     if (r.width < 60 || r.height < 60) continue;
@@ -550,7 +556,7 @@ class Douyin:
         """
         def do_search() -> None:
             self._goto(f"{DOUYIN}/")
-            self.page.wait_for_timeout(random.randint(1500, 2600))
+            self.page.wait_for_timeout(random.randint(800, 1500))
             box = self.page.locator('input[placeholder*="搜索"]').first
             box.wait_for(state="visible", timeout=15000)
             box.click()
@@ -560,24 +566,49 @@ class Douyin:
             self.page.keyboard.press("Enter")
 
         def hit(j: dict) -> bool:
-            users = self._extract_users([j])
-            if not users:
-                return False
-            if not expect_hit:
+            """响应到了就算数，**不强求「搜到目标」**
+
+            ⚠ 这里原来要求「必须搜到目标」才停，于是两种最常见的情况
+              每次都要白等满 20 秒超时：
+                · 这个人抖音号已经失效（结果里根本没有他）
+                · 搜索接口被限流（user_list 是空的）
+              实测 2026-11-12 干跑：一条线索两次搜索白烧 40 秒，
+              而整条线索的其它部分加起来才 6 秒。
+
+            现在改成：**用户 tab 的响应一回来就停**
+            （那个响应带 user_list 字段，空的就是空结果 —— 那是最终答案），
+            目标在不在里面，等拿到数据之后另外判。
+
+            ⚠ 只认 user_list 这个键（不认其它形状）：
+              免得「综合 tab」那个早到的响应把等待提前截断，
+              反而错过「用户 tab」里真正的结果。
+            """
+            if "user_list" in j:
                 return True
-            return any(str(u.get("unique_id") or "") == q or str(u.get("short_id") or "") == q
-                       for u in users)
+            if not expect_hit:
+                return bool(self._extract_users([j]))
+            return False
 
         # discover/search = 用户 tab 的接口（user_list 在顶层）
         # general/search  = 综合 tab 的接口（兜底，偶尔也能捞到 user_info）
+        #
+        # ⚠ timeout 必须给足余量（2026-11-12 实测）：
+        #   抖音的**用户列表接口响应要 20 秒**（实测：请求 +6.2s 发出，
+        #   响应 +26.2s 才回来；同一次会话里其它搜索接口都是 6 毫秒返回）。
+        #   原来超时正好是 20000ms → 响应在临界点回来，经常**刚好错过**
+        #   → 被判成「搜不到人」。
+        #
+        #   这个代价还不止是慢：搜到人之后会把这一页十几个用户的 sec_uid
+        #   一起缓存下来，后面十几条线索就能直接开主页、完全不用搜。
+        #   搜失败 → 缓存不起来 → 每条每轮都重复付这 20 秒（死循环）。
         data = self._capture(
             ("discover/search", "general/search"),
-            do_search, timeout=20000, expect=hit, settle=1500,
+            do_search, timeout=40000, expect=hit, settle=1500,
             mid_hook=self._click_user_tab,
         )
         # 首屏没命中时再多等一会儿（分几段推过来的）
         if not self._extract_users(data):
-            self.page.wait_for_timeout(2500)
+            self.page.wait_for_timeout(1500)
 
         # ---- 平台自己说「要验证」→ 直接按验证处理，别当成搜不到 ----
         #
@@ -604,6 +635,27 @@ class Douyin:
     # 搜索次数本身就是被限流的资源。
     SEARCH_HEALTH_TTL = 300
 
+    # 「接口被限流」这个结论**过期得更快**。
+    #
+    # 抖音的限流是概率性的：实测同一条线索连着搜两次，
+    # 第一次成功、第二次就空了（2026-11-12）。也就是说它可能几十秒后就恢复，
+    # 没必要为了一次限流就放弃 5 分钟的搜索。
+    SEARCH_UNHEALTHY_TTL = 60
+
+    def _health_ttl(self) -> int:
+        """探针结论的有效期：正常的结论留久一点，被限流的结论过期快"""
+        return self.SEARCH_HEALTH_TTL if self._search_healthy else self.SEARCH_UNHEALTHY_TTL
+
+    def _search_known_throttled(self) -> bool:
+        """已知搜索接口此刻是废的（探针结论还在有效期内）
+
+        用来在**搜索之前**就短路 —— 明知搜了也是白等 20~40 秒，
+        不如直接告诉 worker「搜索被限流了」。
+        """
+        if self._search_healthy or not self._search_health_at:
+            return False
+        return (time.time() - self._search_health_at) < self.SEARCH_UNHEALTHY_TTL
+
     def _probe_search_health(self, force: bool = False) -> bool:
         """探测搜索接口是不是还活着（返回 True=接口正常）
 
@@ -623,7 +675,7 @@ class Douyin:
         ⚠️ 探针结果要缓存：探针自己也是一次搜索，
         每条搜不到的线索都探一次 = 搜索次数翻倍 = 更快撞上限流。
         """
-        if not force and (time.time() - self._search_health_at) < self.SEARCH_HEALTH_TTL:
+        if not force and (time.time() - self._search_health_at) < self._health_ttl():
             return self._search_healthy
         canary = self.SEARCH_CANARY
         try:
@@ -663,6 +715,16 @@ class Douyin:
         q = str(unique_id or "").strip().lstrip("@")
         if not q:
             return None
+        # ---- 已知接口此刻是废的 → 别再搜一次 ----
+        #
+        # 抖音搜索被限流时，**一次搜索要白等 20~40 秒**（实测响应要 20 秒，
+        # 而被限流时可能连响应都不给）。
+        # 探针的结论已经在缓存里了，就别明知是白等还去搜 ——
+        # 直接告诉 worker「搜索被限流」，让它按该停手的方式停手。
+        if self._search_known_throttled():
+            raise SearchUnavailable(
+                f"搜索接口被限流（探针结论还在有效期内，这次不搜了）：{q}"
+            )
         self.log(f"  搜索：{q}")
         data = self._search(q)
         users = self._extract_users(data)
@@ -834,7 +896,7 @@ class Douyin:
 
         def do_open() -> None:
             self._goto(url)
-            self.page.wait_for_timeout(1200)
+            self.page.wait_for_timeout(700)
             if after_open:
                 after_open()
             # 主页作品是懒加载的，滚一下能让接口早点发
@@ -848,16 +910,19 @@ class Douyin:
             do_open,
             timeout=15000,
             expect=lambda j: bool(j.get("aweme_list")),
-            settle=2000,
+            # ⚠ settle 是「响应到了之后再多等一会儿，把迟到的响应也捞进来」。
+            #   原来 2000ms —— 每条线索白等 2 秒。
+            #   作品列表是一次性返回的，等 800ms 足够。
+            settle=800,
         )
         if not any((j.get("aweme_list") or []) for j in data):
             # 再滚一次给它机会（有的号挂载慢）
             data += self._capture(
                 "/aweme/v1/web/aweme/post/",
                 lambda: self.page.mouse.wheel(0, 1800),
-                timeout=8000,
+                timeout=6000,
                 expect=lambda j: bool(j.get("aweme_list")),
-                settle=1200,
+                settle=600,
             )
         self.check_risk()
         works: list[dict] = []
@@ -973,7 +1038,11 @@ class Douyin:
                     return True
             except Exception:
                 stable = 0
-            self.page.wait_for_timeout(700)
+            # ⚠ 轮询间隔 250ms（原来 700ms）：
+            #   评论区通常 1~2 秒就挂出来，700ms 一轮意味着光等它就多花 0.5~1 秒。
+            #   这里只是在轮询「好了没有」，不是模拟人的操作节奏，
+            #   调快不影响「像不像真人」——真人感来自那些随机等待。
+            self.page.wait_for_timeout(250)
         return False
 
     def _has_visible_comment_input(self) -> bool:
@@ -1002,7 +1071,7 @@ class Douyin:
                 if not el.is_visible():
                     continue
                 el.click()
-                self.page.wait_for_timeout(random.randint(800, 1400))
+                self.page.wait_for_timeout(random.randint(500, 900))
                 self.log(f"  展开评论区：click:{sel}")
                 return True
             except Exception:
@@ -1041,14 +1110,14 @@ class Douyin:
                     if not box.is_visible():
                         continue
                     box.click()
-                    self.page.wait_for_timeout(random.randint(500, 900))
+                    self.page.wait_for_timeout(random.randint(350, 650))
                     el = self._scan_input()
                     if el is not None:
                         return el, f"click:{sel}"
                 except Exception:
                     continue
             if time.time() < deadline:
-                self.page.wait_for_timeout(random.randint(900, 1400))
+                self.page.wait_for_timeout(random.randint(600, 1000))
         return None, None
 
     def _send_button_point(self) -> list[float] | None:
@@ -1121,7 +1190,7 @@ class Douyin:
             except Exception:
                 pass
             self._wait_comment_ready(timeout=10000)
-        self.page.wait_for_timeout(random.randint(600, 1200))
+        self.page.wait_for_timeout(random.randint(300, 700))
         self.check_risk()
 
         body = self._body_text()
@@ -1154,7 +1223,7 @@ class Douyin:
         self.page.wait_for_timeout(random.randint(250, 600))
         # 输入（逐字敲，节奏像人）
         self.page.keyboard.type(text, delay=random.randint(25, 55))
-        self.page.wait_for_timeout(random.randint(400, 900))
+        self.page.wait_for_timeout(random.randint(250, 600))
         # 输入框偶尔没抢到焦点，确认一下真进去了，没进去就整段插入
         entered = self._input_text(el)
         if not entered:
@@ -1358,7 +1427,7 @@ class Douyin:
                         break
                 except Exception:
                     continue
-            self.page.wait_for_timeout(random.randint(900, 1400))
+            self.page.wait_for_timeout(random.randint(600, 1000))
             # 滚评论列表，把分页都拉出来
             for _ in range(max(1, scrolls)):
                 try:
@@ -1371,7 +1440,7 @@ class Douyin:
                     )
                 except Exception:
                     pass
-                self.page.wait_for_timeout(random.randint(700, 1100))
+                self.page.wait_for_timeout(random.randint(500, 800))
             for r in got:
                 try:
                     walk(r.json(), rows)

@@ -234,10 +234,29 @@ def create_outreach_page():
                         pending = r.pending_count()
                         sent = r.sent_today()
                         mode = "干跑" if o.dry_run else "真发"
+                        # 间隔显示：自适应模式下要让人一眼看出「现在是快档还是慢档」
+                        if getattr(o, "adaptive_delay", True):
+                            from ..outreach.store import OutreachStore
+                            slow = False
+                            try:
+                                st = OutreachStore(config.app.db_path)
+                                try:
+                                    slow = bool(st.speed_state().get("slow"))
+                                finally:
+                                    st.close()
+                            except Exception:
+                                pass
+                            delay_txt = (
+                                f"间隔 自适应·{'慢档' if slow else '快档'} "
+                                f"{int(o.fast_delay_min)}-{int(o.fast_delay_max)}"
+                                f"/{int(o.slow_delay_min)}-{int(o.slow_delay_max)} 秒"
+                            )
+                        else:
+                            delay_txt = f"间隔 {int(o.min_delay)}-{int(o.max_delay)} 秒"
                         outreach_info.text = (
                             f"待触达 {pending} 条　今日已发 {sent}/{o.daily_limit}　"
                             f"模式：{mode}　"
-                            f"间隔 {int(o.min_delay)}-{int(o.max_delay)} 秒"
+                            f"{delay_txt}"
                         )
                     except Exception as e:
                         outreach_info.text = f"（读取触达状态失败：{e}）"
@@ -408,8 +427,11 @@ def create_outreach_page():
                     )
 
                 ui.label(
-                    f"间隔留空 = 用配置里的 {int(config.outreach.min_delay)}-{int(config.outreach.max_delay)} 秒；"
-                    "调小跑得快，但抖音更容易要求验证。"
+                    f"间隔留空 = 自适应：平时 {int(config.outreach.fast_delay_min)}-"
+                    f"{int(config.outreach.fast_delay_max)} 秒，"
+                    f"撞到验证码/限流自动退到 {int(config.outreach.slow_delay_min)}-"
+                    f"{int(config.outreach.slow_delay_max)} 秒并记住一段时间；"
+                    "在这里填了就用你填的（但慢档期间不会低于慢档下限）。"
                 ).classes("text-caption text-grey-7 q-mt-xs")
 
                 outreach_status = ui.label("").classes("text-caption")

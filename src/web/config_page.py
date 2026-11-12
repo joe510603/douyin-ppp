@@ -616,6 +616,51 @@ def create_config_page():
                 min=1, max=50, step=1,
             ).props("dense outlined").classes("col-6 col-sm-2 app-input")
 
+        # ---- 自适应间隔：平时快，撞风控自动退 ----
+        #
+        # 「最小/最大间隔」上面那两个是**兜底值**（关掉自适应时才用）。
+        # 开着自适应的话，实际用的是下面这四个。
+        ui.label(
+            "⏱ 自适应间隔：平时用「快档」，一旦撞到验证码或软风控，"
+            "自动切到「慢档」并记住一段时间（连续几条干净了才回快档）。"
+        ).classes("text-caption text-grey-7 q-mt-sm q-mb-xs")
+
+        with ui.row().classes("w-full items-end q-col-gutter-sm"):
+            outreach_adaptive_switch = ui.switch(
+                "启用自适应间隔",
+                value=getattr(config.outreach, "adaptive_delay", True),
+            ).classes("col-6 col-sm-2 app-input")
+
+            outreach_fast_min = ui.number(
+                "快档最小（秒）",
+                value=config.outreach.fast_delay_min,
+                min=5, max=300, step=5,
+            ).props("dense outlined").classes("col-6 col-sm-2 app-input")
+
+            outreach_fast_max = ui.number(
+                "快档最大（秒）",
+                value=config.outreach.fast_delay_max,
+                min=5, max=600, step=5,
+            ).props("dense outlined").classes("col-6 col-sm-2 app-input")
+
+            outreach_slow_min = ui.number(
+                "慢档最小（秒）",
+                value=config.outreach.slow_delay_min,
+                min=30, max=600, step=10,
+            ).props("dense outlined").classes("col-6 col-sm-2 app-input")
+
+            outreach_slow_max = ui.number(
+                "慢档最大（秒）",
+                value=config.outreach.slow_delay_max,
+                min=30, max=900, step=10,
+            ).props("dense outlined").classes("col-6 col-sm-2 app-input")
+
+            outreach_slow_minutes = ui.number(
+                "慢档持续（分钟）",
+                value=config.outreach.slow_delay_minutes,
+                min=5, max=1440, step=5,
+            ).props("dense outlined").classes("col-6 col-sm-2 app-input")
+
         with ui.row().classes("w-full items-end q-col-gutter-sm q-mt-sm"):
             outreach_fail_stop = ui.number(
                 "连续失败几次停止",
@@ -727,6 +772,12 @@ def create_config_page():
             config.outreach.daily_limit = int(outreach_daily.value or 30)
             config.outreach.min_delay = float(outreach_min_delay.value or 45)
             config.outreach.max_delay = float(outreach_max_delay.value or 120)
+            config.outreach.adaptive_delay = bool(outreach_adaptive_switch.value)
+            config.outreach.fast_delay_min = float(outreach_fast_min.value or 20)
+            config.outreach.fast_delay_max = float(outreach_fast_max.value or 30)
+            config.outreach.slow_delay_min = float(outreach_slow_min.value or 90)
+            config.outreach.slow_delay_max = float(outreach_slow_max.value or 120)
+            config.outreach.slow_delay_minutes = int(outreach_slow_minutes.value or 60)
             config.outreach.max_per_run = int(outreach_max_run.value or 10)
             config.outreach.fail_stop_threshold = int(outreach_fail_stop.value or 3)
             config.outreach.dedupe_days = int(outreach_dedupe.value or 30)

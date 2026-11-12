@@ -21,6 +21,7 @@ import pathlib
 import sqlite3
 import time
 import uuid
+from datetime import datetime, timedelta
 from typing import Any, Optional
 
 # 触达状态 → leads.outreach_status 的取值
@@ -94,6 +95,21 @@ CREATE_OUTREACH_RECORDS_INDEXES_SQL = [
     "CREATE INDEX IF NOT EXISTS idx_outreach_display ON outreach_records(display_id);",
 ]
 
+# 自适应间隔的状态（只有一行，id=1）
+#
+# 为什么单独一张表而不是塞进 outreach_runs：
+#   outreach_runs.kind 是「这一轮因为什么停手」，有它自己的语义
+#   （限流冷却就靠它判断），往里塞「慢档」会跟那个判断串味。
+#   速度状态是另一回事：跨轮次持续存在，到期自己消失。
+CREATE_TABLE_OUTREACH_SPEED_SQL = """
+CREATE TABLE IF NOT EXISTS outreach_speed (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    slow_until TEXT DEFAULT '',      -- 慢档生效到什么时候（空 = 快档）
+    reason TEXT DEFAULT '',          -- 为什么慢（给人看）
+    updated_at TEXT DEFAULT ''
+);
+"""
+
 
 class OutreachStore:
     """触达任务的本地存储"""
@@ -126,6 +142,8 @@ class OutreachStore:
             self._conn.executescript(CREATE_TABLE_OUTREACH_RECORDS_SQL)
             for sql in CREATE_OUTREACH_RECORDS_INDEXES_SQL:
                 self._conn.execute(sql)
+            # 自适应间隔的状态表（单行）
+            self._conn.executescript(CREATE_TABLE_OUTREACH_SPEED_SQL)
             cols = {r[1] for r in
                     self._conn.execute("PRAGMA table_info(outreach_runs)")}
             if "kind" not in cols:
@@ -462,3 +480,59 @@ class OutreachStore:
             "SELECT * FROM outreach_runs ORDER BY id DESC LIMIT ?", [limit]
         ).fetchall()
         return [dict(r) for r in rows]
+
+    # ============================================================
+    # 自适应间隔的状态
+    # ============================================================
+
+    def speed_state(self) -> dict:
+        """当前的间隔状态：慢档还是快档
+
+        慢档到期自动变回快档 —— 判断放在读取的时候，
+        这样就算服务一直没重启，状态也会自然过期。
+        """
+        try:
+            row = self._conn.execute(
+                "SELECT * FROM outreach_speed WHERE id = 1"
+            ).fetchone()
+        except Exception:
+            return {"slow": False, "until": "", "reason": ""}
+        if not row:
+            return {"slow": False, "until": "", "reason": ""}
+        until = str(row["slow_until"] or "")
+        if not until:
+            return {"slow": False, "until": "", "reason": str(row["reason"] or "")}
+        try:
+            t = datetime.strptime(until, "%Y-%m-%d %H:%M:%S")
+        except Exception:
+            return {"slow": False, "until": "", "reason": ""}
+        slow = t > datetime.now()
+        return {"slow": slow, "until": until if slow else "", "reason": str(row["reason"] or "")}
+
+    def set_slow_delay(self, minutes: int, reason: str = "") -> str:
+        """切到慢档（记到什么时候为止），返回截止时间
+
+        已经在慢档里再撞一次风控 → 顺延（重新从现在开始算）。
+        """
+        until = datetime.now() + timedelta(minutes=max(1, int(minutes or 1)))
+        ts = until.strftime("%Y-%m-%d %H:%M:%S")
+        self._conn.execute(
+            "INSERT INTO outreach_speed (id, slow_until, reason, updated_at) "
+            "VALUES (1, ?, ?, datetime('now','localtime')) "
+            "ON CONFLICT(id) DO UPDATE SET slow_until=excluded.slow_until, "
+            "reason=excluded.reason, updated_at=excluded.updated_at",
+            [ts, (reason or "")[:120]],
+        )
+        self._conn.commit()
+        return ts
+
+    def clear_slow_delay(self) -> None:
+        """撤掉慢档，回到快档"""
+        try:
+            self._conn.execute(
+                "UPDATE outreach_speed SET slow_until='', reason='', "
+                "updated_at=datetime('now','localtime') WHERE id=1"
+            )
+            self._conn.commit()
+        except Exception:
+            pass

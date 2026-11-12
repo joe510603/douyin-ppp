@@ -152,7 +152,12 @@ class OutreachRunner:
         except Exception:
             pass
         try:
-            log.info("[触达] %s", msg)
+            # ⚠ 必须用 loguru 的 {} 占位符。
+            #   本项目的 logger 是 loguru（格式串是 "{message}"），
+            #   它只认 {} —— 写成 log.info("[触达] %s", msg) 会把字面的
+            #   "[触达] %s" 写进文件，触达日志内容全丢，
+            #   事后想查「这一条为什么慢」都无从下手。
+            log.info("[触达] {}", str(msg))
         except Exception:
             pass
 

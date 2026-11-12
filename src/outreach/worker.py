@@ -25,6 +25,7 @@ from __future__ import annotations
 import asyncio
 import json
 import pathlib
+import queue
 import random
 import threading
 import time
@@ -123,6 +124,103 @@ def _run_coro_blocking(coro, timeout: float = 60.0):
     return box.get("ok")
 
 
+class _FeishuStatusPusher:
+    """后台线程写飞书状态，**不阻塞**触达主流程
+
+    为什么必须异步（2026-11-12 实测）：
+    飞书多维表格走的是 lark-cli **子进程**，一次 patch_fields 实测要 **1.4 秒**；
+    而每条线索要回写 3 次状态（searching / found / commented）。
+    同步写 = 每条线索白等 4.2 秒，整个浏览器流程被飞书的网络往返卡着 ——
+    这 4.2 秒跟抖音一点关系都没有，纯粹是在等飞书。
+
+    改成后台线程排队写：
+    - 本地 SQLite 状态照旧**同步**落库（那是本地的，亚毫秒级）
+    - 飞书那边晚几秒无所谓 —— 多机同步本来就是靠**回拉**对齐的，
+      不靠推送的实时性
+    """
+
+    def __init__(self, cfg, log: Callable[[str], None]):
+        self._cfg = cfg
+        self._log = log
+        self._q: "queue.Queue" = queue.Queue()
+        self._lock = threading.Lock()
+        self._pending = 0
+        self._thread: Optional[threading.Thread] = None
+        self._stopping = False
+
+    def _ensure_thread(self) -> None:
+        if self._thread is not None and self._thread.is_alive():
+            return
+        self._thread = threading.Thread(
+            target=self._loop, name="feishu-status", daemon=True)
+        self._thread.start()
+
+    def push(self, record_id: str, fields: dict) -> None:
+        """排队写一条状态，立刻返回，不等网络"""
+        if not record_id or not fields:
+            return
+        # ⚠ 顺序很重要：**先入队、再起线程**。
+        #   反过来的话，写入器初始化失败的分支会先 drain 掉队列
+        #   （那时队列还是空的，什么都没 drain 到），
+        #   随后这里才 put → 那个待写项永远留在队列里，
+        #   _pending 也永远差 1，flush 会一直等到超时。
+        with self._lock:
+            self._pending += 1
+        self._q.put((record_id, dict(fields)))
+        self._ensure_thread()
+
+    def _loop(self) -> None:
+        from ..notify.bitable import get_bitable_writer
+        try:
+            writer = get_bitable_writer(self._cfg)
+        except Exception as e:
+            self._log(f"  ⚠️ 飞书写入器初始化失败，状态只写本地：{str(e)[:80]}")
+            self._drain()
+            return
+        while True:
+            try:
+                item = self._q.get(timeout=0.3)
+            except queue.Empty:
+                if self._stopping:
+                    return
+                continue
+            record_id, fields = item
+            try:
+                _run_coro_blocking(writer.patch_fields(record_id, fields), timeout=90)
+            except Exception as e:
+                self._log(f"  ⚠️ 飞书状态回写失败（不影响触达）：{str(e)[:80]}")
+            finally:
+                with self._lock:
+                    self._pending -= 1
+                try:
+                    self._q.task_done()
+                except Exception:
+                    pass
+
+    def _drain(self) -> None:
+        """写入器起不来时把队列清掉，别让 _pending 永远挂着"""
+        while True:
+            try:
+                self._q.get_nowait()
+            except queue.Empty:
+                break
+            with self._lock:
+                self._pending -= 1
+
+    def flush(self, timeout: float = 30.0) -> bool:
+        """等队列排空（轮次结束时调用，别让状态丢在半路）"""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            with self._lock:
+                if self._pending <= 0:
+                    return True
+            time.sleep(0.05)
+        return False
+
+    def close(self) -> None:
+        self._stopping = True
+
+
 class OutreachWorker:
     """触达任务执行器（同步，跑在专用线程）"""
     def __init__(
@@ -157,6 +255,10 @@ class OutreachWorker:
         # 本轮临时覆盖的两条之间间隔（秒）；None = 用配置里的
         self._delay_min: Optional[float] = None
         self._delay_max: Optional[float] = None
+        # 连续「干干净净」的条数（用来把慢档撤掉，回到快档）
+        self._clean_streak = 0
+        # 飞书状态回写：后台线程写，不阻塞触达（见 _FeishuStatusPusher）
+        self._feishu = _FeishuStatusPusher(self.cfg, self.log)
         # 当前页面对象（判断验证码是不是过了要用）
         self._dy = None
 
@@ -479,14 +581,85 @@ class OutreachWorker:
             self.log(f"  ⏳ 干跑，等 {sec}s 看下一条")
             self._sleep(sec)
             return
-        # 本轮临时覆盖（网页上可以当场调），没给就用配置里的
-        lo = int(self._delay_min if self._delay_min is not None
-                 else (o.min_delay or 45))
-        hi = max(lo, int(self._delay_max if self._delay_max is not None
-                         else (o.max_delay or 120)))
+        lo, hi, why = self._pick_delay()
         sec = random.randint(lo, hi)
-        self.log(f"  ⏳ 等 {sec}s 再找下一个（模拟真人节奏）")
+        self.log(f"  ⏳ 等 {sec}s 再找下一个（{why}）")
         self._sleep(sec)
+
+    # ================================================================
+    # 自适应间隔：平时快，撞风控自动退
+    # ================================================================
+
+    def _is_slow_mode(self) -> bool:
+        """现在是不是「慢档」（撞过风控、还在退避期里）"""
+        try:
+            return bool(self.st.speed_state().get("slow"))
+        except Exception:
+            return False
+
+    def _enter_slow_mode(self, reason: str) -> None:
+        """撞了风控 → 切到慢档并记住一段时间
+
+        为什么撞了风控反而要**变慢**：
+        抖音开始要验证，说明频率已经踩线了。这时候继续快等于加速把号搞废。
+        慢档持续到 slow_delay_minutes 之后（或连续几条都干净了）才回快档。
+        """
+        o = self.cfg.outreach
+        minutes = int(o.slow_delay_minutes or 60)
+        try:
+            until = self.st.set_slow_delay(minutes, reason)
+        except Exception as e:
+            self.log(f"  ⚠️ 记不住慢档状态: {str(e)[:60]}")
+            return
+        self._clean_streak = 0
+        self.log(
+            f"  🐢 间隔切到慢档（{int(o.slow_delay_min or 90)}-{int(o.slow_delay_max or 120)}s），"
+            f"到 {until} 为止"
+        )
+
+    def _maybe_exit_slow_mode(self) -> None:
+        """连续 N 条都干干净净 → 撤掉慢档，回到快档"""
+        o = self.cfg.outreach
+        need = int(o.slow_delay_clear_after or 5)
+        if self._clean_streak < need or not self._is_slow_mode():
+            return
+        try:
+            self.st.clear_slow_delay()
+        except Exception:
+            return
+        self._clean_streak = 0
+        self.log(
+            f"  🐇 连续 {need} 条都干净了，间隔回到快档"
+            f"（{int(o.fast_delay_min or 20)}-{int(o.fast_delay_max or 30)}s）"
+        )
+
+    def _pick_delay(self) -> tuple[int, int, str]:
+        """决定这一条要等多久
+
+        优先级（从高到低）：
+        1. **网页上当场调的间隔** → 用它（用户显式指定，优先级最高）。
+           但当前是慢档时至少不低于慢档下限 —— 用户调快也得被风控兜住。
+        2. **自适应**：
+           · 慢档（刚撞过验证码/软风控）→ slow_delay_*
+           · 否则 → fast_delay_*
+        3. 都不是 → 配置里的 min_delay / max_delay
+        """
+        o = self.cfg.outreach
+        slow = self._is_slow_mode()
+        u_lo, u_hi = self._delay_min, self._delay_max
+        if u_lo is not None and u_hi is not None:
+            lo, hi = int(u_lo), int(u_hi)
+            if slow:
+                lo = max(lo, int(o.slow_delay_min or 90))
+                hi = max(hi, int(o.slow_delay_max or 120))
+            return max(1, lo), max(1, hi), "网页指定的间隔"
+        if getattr(o, "adaptive_delay", True):
+            if slow:
+                return (int(o.slow_delay_min or 90), int(o.slow_delay_max or 120),
+                        "慢档（撞过风控，自动退避）")
+            return (int(o.fast_delay_min or 20), int(o.fast_delay_max or 30),
+                    "快档（自适应）")
+        return int(o.min_delay or 45), int(o.max_delay or 120), "配置里的间隔"
 
     def _pick_work(self, works: list[dict]) -> Optional[dict]:
         """挑一条留言的作品：优先最近 recent_days 天内发的，退而取最新一条"""
@@ -530,24 +703,19 @@ class OutreachWorker:
             self.log(f"  ⚠️ 飞书状态回写失败: {e}")
 
     def _push_feishu_status(self, lead: dict, status: str) -> None:
-        """把「触达状态」写回飞书多维表格
+        """把「触达状态」写回飞书多维表格（**异步**，不阻塞触达）
 
         复用 notify.bitable 的写入器，用 patch_fields 只改这一个字段——
         不能用整体替换（会把销售改过的「处理状态」清掉）。
+
+        ⚠ 为什么不是直接同步调：飞书走 lark-cli 子进程，实测一次 1.4 秒，
+        每条线索要写 3 次 → 每条白等 4.2 秒。改成后台线程排队写。
         """
         record_id = lead.get("bitable_record_id") or ""
         if not record_id:
             return
-        from ..notify.bitable import get_bitable_writer
-
-        writer = get_bitable_writer(self.cfg)
-        if not writer.is_configured:
-            return
         text = FEISHU_STATUS.get(status, status)
-        _run_coro_blocking(
-            writer.patch_fields(record_id, {"触达状态": text}),
-            timeout=90,
-        )
+        self._feishu.push(record_id, {"触达状态": text})
 
     # ================================================================
     # 主流程
@@ -586,6 +754,7 @@ class OutreachWorker:
         self._delay_max = delay_max
         per_run = int(limit or o.max_per_run or 10)
         daily_limit = int(o.daily_limit or 30)
+        t_run = time.time()
 
         sent_today = self.st.sent_today()
         if not dry and sent_today >= daily_limit:
@@ -701,6 +870,11 @@ class OutreachWorker:
                         self._stop_kind = kind
                         self.log(f"🛑 {self.stop_reason}，立即停止")
                         self._emit(type="risk", lead=lead, error=str(e), kind=kind)
+
+                        # 撞过风控 → 间隔切慢档并记住（见 _enter_slow_mode）
+                        # 抖音开始要验证/限流，说明频率踩线了，
+                        # 下一轮继续按快档跑等于加速把号搞废。
+                        self._enter_slow_mode(f"{kind}: {str(e)[:60]}")
 
                         # 验证码要人工过：叫人 + 把窗口叫回来 + 停下等他。
                         # 注意这跟「账号被限流」是两回事：
@@ -836,6 +1010,9 @@ class OutreachWorker:
                     else:
                         if summary.get("sent"):
                             sent_in_run += 1
+                            # 干干净净的一条 → 计数够了就把慢档撤掉
+                            self._clean_streak += 1
+                            self._maybe_exit_slow_mode()
 
                     # 节奏控制
                     if idx < len(picked) and not self.stop_reason:
@@ -850,6 +1027,10 @@ class OutreachWorker:
         finally:
             self._page = None
             self._dy = None
+            # 飞书状态是后台线程写的 → 收尾时等它排空，
+            # 别让「已留言」这种关键状态丢在半路（多机同步要靠它）
+            if not self._feishu.flush(timeout=30.0):
+                self.log("  ⚠️ 飞书状态还有没写完的（不影响本轮结果）")
 
         note = self.stop_reason or ("干跑" if dry else "")
         self.st.finish_run(
@@ -857,10 +1038,16 @@ class OutreachWorker:
             skipped=summary["skipped"], note=note, kind=self._stop_kind,
         )
         summary["stopped"] = self.stop_reason
+        elapsed = time.time() - t_run
+        done = len(picked) or 1
         self.log(
             f"\n本轮结束：发 {summary['sent']}　干跑 {summary['dry']}　"
             f"失败 {summary['failed']}　跳过 {summary['skipped']}"
             + (f"　停止原因：{self.stop_reason}" if self.stop_reason else "")
+        )
+        self.log(
+            f"⏱ 总耗时 {elapsed/60:.1f} 分钟　平均每条 {elapsed/done:.0f} 秒"
+            f"（含条间等待；每条的明细看上面「⏱ 找人/发送/回查」）"
         )
         self._emit(type="done", summary=summary)
         return summary
@@ -973,6 +1160,18 @@ class OutreachWorker:
         o = self.cfg.outreach
         dry = self._dry
 
+        # ---- 逐阶段计时 ----
+        #
+        # 为什么加这个：一轮触达要十几分钟，光看「⏳ 等 62s」这种日志
+        # 根本看不出时间花在哪。以前只能靠翻日志猜，现在每条都直接报出来。
+        t_lead = time.time()
+        _stage = [t_lead]
+
+        def _mark(name: str) -> None:
+            now = time.time()
+            self.log(f"     ⏱ {name} {now - _stage[0]:.1f}s")
+            _stage[0] = now
+
         # a. 找人
         self._set_status(lead, STATUS_SEARCHING)
         known_sec = str(lead.get("sec_uid") or "").strip()
@@ -996,6 +1195,7 @@ class OutreachWorker:
         self.log(f"  ✓ 定位到 {lead['nickname']}（作品 {info.get('aweme_count')} 条）")
         # 顺手把这次搜索拿到的 sec_uid 都存下来（下次不用再搜）
         self._cache_sec_uids(dy, lead)
+        _mark("找人")
 
         # b. 挑作品
         if info.get("aweme_count") == 0:
@@ -1008,6 +1208,7 @@ class OutreachWorker:
         self.log(
             f"  ✓ 选中作品 {work['aweme_id']}　{(work.get('desc') or '')[:24]}"
         )
+        _mark("挑作品")
 
         # c. 生成话术
         c = self.cw.generate(self._as_copywriter_lead(lead))
@@ -1015,6 +1216,7 @@ class OutreachWorker:
             raise DouyinError(f"文案不合格：{c.get('reason')}")
         text = c["text"]
         self.log(f"  ✍️ [{c['template_id']}] {text}")
+        _mark("生成话术")
 
         if dry:
             self.st.add_touch(
@@ -1033,6 +1235,7 @@ class OutreachWorker:
         res = self._post_with_human_help(dy, work["aweme_id"], text, lead)
         if not res.get("ok"):
             raise DouyinError(f"发送失败：{res.get('msg')}（code={res.get('status_code')}）")
+        _mark("发送")
 
         touch_id = self.st.add_touch(
             lead_id=lead["id"], record_id=lead.get("bitable_record_id") or "",
@@ -1055,6 +1258,7 @@ class OutreachWorker:
             except Exception as e:
                 v = {"found": None, "total": 0}
                 self.log(f"  （回查出错，按已发处理：{str(e)[:60]}）")
+            _mark("回查")
 
             if v.get("found") is False:
                 if res.get("comment_id"):
@@ -1095,6 +1299,7 @@ class OutreachWorker:
         self._set_status(lead, STATUS_COMMENTED)
         summary["sent"] += 1
         self._emit(type="sent", lead=lead, text=text, res=res)
+        self.log(f"     ⏱ 本条合计 {time.time() - t_lead:.1f}s")
 
     @staticmethod
     def _as_copywriter_lead(lead: dict) -> dict:
@@ -1127,7 +1332,12 @@ class OutreachWorker:
                     pass
                 yield page
                 return
-            with Browser(profile_dir, headless=headless, slow_mo=120,
+            # ⚠ slow_mo=0：以前是 120ms，也就是**每个** Playwright 动作都硬等
+            #   120 毫秒。一条线索要走 40~60 个动作，光这一项就白等 5~7 秒。
+            #   那个 120 是均匀延迟，既不像真人（真人快慢不均），
+            #   又白白吃掉每条好几秒 —— 真人节奏靠代码里那些随机等待体现，
+            #   不靠这个均匀延迟。
+            with Browser(profile_dir, headless=headless, slow_mo=0,
                          window_mode=mode,
                          block_media=block_media) as (_c, page):
                 yield page
