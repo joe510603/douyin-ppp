@@ -33,8 +33,9 @@ from typing import Callable, Optional
 from .browser import Browser, Session
 from .copywriter import Copywriter
 from .douyin_api import (
-    Douyin, DouyinError, KIND_LIMIT, KIND_LOGIN, KIND_VERIFY, LeadNotFound,
-    NoWorks, NotLoggedIn, RiskControl, VERIFY_TEXTS, normalize_kind,
+    Douyin, DouyinError, KIND_LIMIT, KIND_LOGIN, KIND_SEARCH, KIND_VERIFY,
+    LeadNotFound, NoWorks, NotLoggedIn, RiskControl, SearchUnavailable,
+    VERIFY_TEXTS, normalize_kind,
 )
 from .store import (
     STATUS_COMMENTED,
@@ -246,12 +247,14 @@ class OutreachWorker:
         if kind == KIND_VERIFY:
             title = "⚠️ 抖音要求验证本人操作，触达已暂停等你处理"
             steps = (
-                "抖音在发评论时弹了**身份验证**（不是限流，账号是好的）：\n"
-                "  「为保障账号安全，请先完成身份验证，以确保为本人操作」\n\n"
+                "抖音在**发评论**或**搜索用户**时弹了**身份验证**（不是限流，账号是好的）：\n"
+                "  「为保障账号安全，请先完成身份验证，以确保为本人操作」\n"
+                "  （搜索时触发的话，弹的是一个**拼图滑块**——把拼图拖到缺口上）\n\n"
                 "怎么办：\n"
                 "1. 回到网页「抖音触达」点橙色提示条里的「打开浏览器窗口」\n"
                 "   （窗口平时在屏幕右侧，点一下会跳到屏幕中间）\n"
                 "2. 在那个窗口里按抖音的提示验证：\n"
+                "   · **拼图滑块**——把拼图块拖到缺口上（搜索验证多半是这个）\n"
                 "   · **扫码验证**——弹窗底部有「使用原设备扫码」，用抖音 App 扫\n"
                 "   · 或者**短信验证码**——输入 187****52 收到的数字\n"
                 "3. 验证完**自动接着跑**，不用再点「继续」\n\n"
@@ -264,6 +267,19 @@ class OutreachWorker:
                 "2. 用抖音 App 扫那个窗口里的二维码\n"
                 "3. 扫完回来再点「开始触达」\n\n"
                 "（不扫码的话触达跑不了：搜不到人也发不了评论）"
+            )
+        elif kind == KIND_SEARCH:
+            title = "🔍 抖音网页版搜索被限流了，触达已停手"
+            steps = (
+                "**你的账号没问题，不用扫码。**\n"
+                "抖音**网页版的搜索接口**被限流了：它不报错、不弹提示，\n"
+                "就是给你一个空的搜索结果（首页推荐流、手机 App 都正常）。\n\n"
+                "怎么办：\n"
+                "1. 别反复重试搜索——搜索次数越多越容易被继续限流\n"
+                "2. 等 30 分钟到几小时再跑，搜索接口会自己恢复\n"
+                "3. 系统已经记下了每个线索的抖音 ID，\n"
+                "   下次**不用再搜**，直接开主页留言（所以搜不到也不影响触达）\n"
+                "4. 急着要的话，用抖音 App 手动发一条试试（App 端不受影响）"
             )
         else:
             title = "🛑 抖音触达撞上账号限流，已停手"
@@ -760,6 +776,36 @@ class OutreachWorker:
                             self._emit(type="risk", lead=lead, error=self.stop_reason,
                                        kind="limit")
                             break
+                    except SearchUnavailable as e:
+                        # 搜索接口返回空、而且**没有**「要求验证」的信号
+                        # → 多半是抖音 web 端搜索被限流了。
+                        #
+                        # 注意区分两种「搜索为空」（2026-11-12）：
+                        #   · 接口明说 verify_check（要过拼图验证）
+                        #     → 上面 RiskControl 分支已经接住，叫人过验证、继续跑
+                        #   · 接口啥也没说，探针也空 → 这里，接口真的被限流/故障
+                        #
+                        # 后者必须当真故障处理：连续几次都这样就停手，
+                        # 别再拿搜索次数去撞抖音的风控。
+                        # （账号本身是好的，所以**不触发账号限流冷却**——
+                        #   那种情况扫码也没用，方向完全错。）
+                        consecutive_errors += 1
+                        consecutive_not_found = 0
+                        summary["failed"] += 1
+                        self.log(f"  ❌ {e}")
+                        self._set_status(lead, STATUS_FAILED, str(e))
+                        self._emit(type="failed", lead=lead, error=str(e))
+                        if consecutive_errors >= max_err:
+                            self.stop_reason = (
+                                f"搜索接口连续 {consecutive_errors} 次返回空"
+                                f"（疑似被抖音限流），主动停手"
+                            )
+                            self._stop_kind = KIND_SEARCH
+                            self.log(f"🛑 {self.stop_reason}")
+                            self._emit(type="risk", lead=lead,
+                                       error=self.stop_reason, kind=KIND_SEARCH)
+                            self._notify_risk(KIND_SEARCH, self.stop_reason, lead)
+                            break
                     except DouyinError as e:
                         consecutive_errors += 1
                         # 不是 LeadNotFound → 说明人找到了、搜索是通的
@@ -880,6 +926,48 @@ class OutreachWorker:
                 continue
         return {"ok": False, "status_code": -1, "msg": "验证后仍没能发出评论"}
 
+    def _cache_sec_uids(self, dy: Douyin, lead: dict) -> None:
+        """把定位到的 sec_uid 存下来（下次就不用再搜索了）
+
+        为什么值得专门做（2026-11-12）：
+        抖音 web 端搜索接口会**静默限流**——不报错、不提示，
+        就是给你一个空的 user_list。首页推荐流完全正常，
+        手机 App 也能搜到同一个号，只有 web 端搜索这一条路被掐了。
+
+        搜索次数本身就是被限流的资源，所以能省就省：
+          1. 目标自己的 sec_uid 存下来 → 下次直接开主页
+          2. 这一页里其他用户的 sec_uid 也存下来（抖音一次返回十几个）
+             → 线索池里**同名同号**的那些以后也不用搜了
+
+        存的是「查表用的技术缓存」，不碰 outreach_status，
+        所以干跑时也存（干跑要跑跟真发一样的路径才有参考价值）。
+        """
+        sec_uid = str(lead.get("sec_uid") or "").strip()
+        if sec_uid:
+            try:
+                self.st.set_sec_uid(lead["id"], sec_uid, lead.get("nickname") or "")
+            except Exception as e:
+                self.log(f"  （缓存 sec_uid 失败：{str(e).splitlines()[0][:60]}）")
+        mapping: dict[str, str] = {}
+        for u in (getattr(dy, "last_search_users", None) or []):
+            if not isinstance(u, dict):
+                continue
+            su = str(u.get("sec_uid") or "").strip()
+            if not su:
+                continue
+            for key in (u.get("unique_id"), u.get("short_id")):
+                k = str(key or "").strip()
+                if k:
+                    mapping.setdefault(k, su)
+        if not mapping:
+            return
+        try:
+            n = self.st.cache_sec_uid_map(mapping)
+            if n:
+                self.log(f"  💾 顺手缓存了 {n} 条线索的 sec_uid（以后不用再搜这些号）")
+        except Exception as e:
+            self.log(f"  （批量缓存 sec_uid 失败：{str(e).splitlines()[0][:60]}）")
+
     def _handle_one(self, dy: Douyin, lead: dict, summary: dict) -> None:
         """处理一条线索：找人 → 挑作品 → 生成话术 → 发送 → 回查"""
         o = self.cfg.outreach
@@ -887,18 +975,30 @@ class OutreachWorker:
 
         # a. 找人
         self._set_status(lead, STATUS_SEARCHING)
-        info = dy.resolve(lead["display_id"], nickname=lead.get("nickname"))
+        known_sec = str(lead.get("sec_uid") or "").strip()
+        if known_sec:
+            # 已知 sec_uid → 直接开主页，**跳过搜索**。
+            #
+            # 为什么（2026-11-12）：抖音 web 端搜索接口会静默限流，
+            # 不报错、不提示，就是给你一个空的 user_list；
+            # 但主页 /user/{sec_uid} 完全不受影响。
+            # 搜索次数本身就是被限流的资源，能省就省。
+            info = dy.resolve_by_sec_uid(known_sec)
+        else:
+            info = dy.resolve(lead["display_id"], nickname=lead.get("nickname"))
         dy.check_risk()
         if not info:
             raise LeadNotFound("没搜到这个人（抖音号可能已改名/注销/被平台隐藏）")
 
         lead["nickname"] = info.get("nickname") or lead.get("nickname")
-        lead["sec_uid"] = info.get("sec_uid")
+        lead["sec_uid"] = info.get("sec_uid") or known_sec
         self._set_status(lead, STATUS_FOUND)
         self.log(f"  ✓ 定位到 {lead['nickname']}（作品 {info.get('aweme_count')} 条）")
+        # 顺手把这次搜索拿到的 sec_uid 都存下来（下次不用再搜）
+        self._cache_sec_uids(dy, lead)
 
         # b. 挑作品
-        if not info.get("aweme_count"):
+        if info.get("aweme_count") == 0:
             raise NoWorks("该用户没有公开作品（主页作品数为 0）")
         works = dy.fetch_works(lead["sec_uid"], limit=20)
         dy.check_risk()

@@ -156,6 +156,21 @@ class OutreachStore:
             # 表被别的进程锁着 / 已经有别的结构 → 交给上层报错，别在这里崩
             pass
 
+        # leads 表归 db_storage 管，但触达线程不能干等主进程迁移完才敢用：
+        # ``leads.sec_uid`` 是「已知抖音 sec_uid，跳过搜索」的依据，
+        # 列没有的话 SELECT 直接报 no such column，整轮触达直接瘫。
+        # 所以这里自己补一次（ALTER ADD COLUMN 是幂等的）。
+        try:
+            lead_cols = {r[1] for r in
+                         self._conn.execute("PRAGMA table_info(leads)")}
+            if lead_cols and "sec_uid" not in lead_cols:
+                self._conn.execute(
+                    "ALTER TABLE leads ADD COLUMN sec_uid TEXT DEFAULT ''"
+                )
+                self._conn.commit()
+        except sqlite3.OperationalError:
+            pass
+
     def close(self) -> None:
         try:
             self._conn.close()
@@ -192,7 +207,7 @@ class OutreachStore:
         sql = [
             "SELECT id, lead_key, display_id, nickname, car_model, store, ",
             "intent_level, intent_score, intent_reason, evidence, monitor_name, ",
-            "bitable_record_id, outreach_status, created_at, last_hit_at ",
+            "bitable_record_id, outreach_status, created_at, last_hit_at, sec_uid ",
             "FROM leads WHERE outreach_status = ? AND display_id != ''"
         ]
         params: list[Any] = [STATUS_PENDING]
@@ -218,8 +233,27 @@ class OutreachStore:
                 " ORDER BY COALESCE(NULLIF(last_hit_at, ''), created_at) DESC, "
                 "intent_score DESC, id DESC"
             )
-        rows = self._conn.execute("".join(sql), params).fetchall()
-        return [dict(r) for r in rows]
+        try:
+            rows = self._conn.execute("".join(sql), params).fetchall()
+        except sqlite3.OperationalError as e:
+            # ``sec_uid`` 列补不上时（老库 + ALTER 失败）别让整轮瘫掉：
+            # 退回不带 sec_uid 的查询，少用一次「跳过搜索」而已。
+            if "sec_uid" not in str(e):
+                raise
+            fallback = [s.replace(", sec_uid ", " ") for s in sql]
+            rows = self._conn.execute("".join(fallback), params).fetchall()
+            out = []
+            for r in rows:
+                d = dict(r)
+                d["sec_uid"] = ""
+                out.append(d)
+            return out
+        out = []
+        for r in rows:
+            d = dict(r)
+            d.setdefault("sec_uid", "")
+            out.append(d)
+        return out
 
     def get_lead(self, lead_id: int) -> Optional[dict]:
         row = self._conn.execute(
@@ -244,12 +278,53 @@ class OutreachStore:
         self._conn.commit()
 
     def set_sec_uid(self, lead_id: int, sec_uid: str, nickname: str = "") -> None:
-        """记下定位到的抖音 sec_uid（下次同类任务能省一次搜索）"""
+        """记下定位到的抖音 sec_uid（下次直接开主页，省一次搜索）
+
+        写**独立列**（``leads.sec_uid``），不覆盖 ``outreach_note``——
+        outreach_note 存的是「失败原因」，把它冲掉等于把故障记录弄没了。
+
+        为什么要缓存（2026-11-12）：
+        抖音 web 端搜索接口会静默限流（不报错，就是给你一个空的 user_list），
+        而主页 ``/user/{sec_uid}`` 完全不受影响。
+        记住 sec_uid = 少一次搜索 = 少一次被限流的机会，
+        而且搜索被限流时这条线索照样能触达。
+        """
+        sec_uid = str(sec_uid or "").strip()
+        if not sec_uid:
+            return
         self._conn.execute(
-            "UPDATE leads SET outreach_note = ? WHERE id = ?",
-            [f"sec_uid={sec_uid}" if sec_uid else "", lead_id],
+            "UPDATE leads SET sec_uid = ? "
+            "WHERE id = ? AND (sec_uid IS NULL OR sec_uid = '')",
+            [sec_uid, lead_id],
         )
         self._conn.commit()
+
+    def cache_sec_uid_map(self, mapping: dict[str, str]) -> int:
+        """批量缓存 sec_uid：一次搜索返回一页用户，顺手把它们都存下来
+
+        抖音搜索一次会返回一页（约 10 个）用户，每个都带 sec_uid。
+        只存目标那一个太浪费——顺手把这一页里**我们线索池里也有**的号都存上，
+        后面那些线索就不用再搜索了（搜索次数直接少一截）。
+
+        返回实际更新了多少条。
+        """
+        if not mapping:
+            return 0
+        n = 0
+        for display_id, sec_uid in mapping.items():
+            display_id = str(display_id or "").strip()
+            sec_uid = str(sec_uid or "").strip()
+            if not display_id or not sec_uid:
+                continue
+            cur = self._conn.execute(
+                "UPDATE leads SET sec_uid = ? "
+                "WHERE display_id = ? AND (sec_uid IS NULL OR sec_uid = '')",
+                [sec_uid, display_id],
+            )
+            n += cur.rowcount or 0
+        if n:
+            self._conn.commit()
+        return n
 
     # ================================================================
     # 留言记录

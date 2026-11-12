@@ -61,27 +61,37 @@ LIMIT_TEXTS = (
 RISK_TEXTS = VERIFY_TEXTS + LIMIT_TEXTS
 
 # ================================================================
-# 停手的三种类型（统一词汇表）
+# 停手的类型（统一词汇表）
 # ================================================================
 #   verify：平台要人工验证（短信/扫码/图形）→ 叫人，停下等他
 #   limit ：账号被限制 → 直接停，扫码没用
 #   login ：登录态没了 → 叫人扫码
+#   search：**搜索接口**被限流（账号是好的！）→ 停手，但不用扫码
 #
 # 之前 worker 用「captcha」、异常用「verify」，两套词 → 日志里出现过
 # 「触发风控：抖音要求验证本人操作」紧跟着「账号被限流（软风控）」这种自相矛盾。
 # 现在统一成一种写法。
+#
+# ⚠️ search 必须单独一种，不能塞进 limit（2026-11-12）：
+# 抖音 web 端搜索接口会**静默限流**——不报错、不提示，就是给你一个空的
+# user_list。账号本身完全正常（浏览、发评论都不受影响，手机 App 也能搜到）。
+# 把它当「账号被限流」会锁 120 分钟冷却 + 发一条「扫码没用」的错误通知，
+# 方向完全错：这里该做的是**少搜索、等一等**，不是扫码。
 KIND_VERIFY = "verify"
 KIND_LIMIT = "limit"
 KIND_LOGIN = "login"
+KIND_SEARCH = "search"
 
 
 def normalize_kind(kind: str) -> str:
-    """把各种写法统一成 verify / limit / login"""
+    """把各种写法统一成 verify / limit / login / search"""
     k = (kind or "").strip().lower()
     if k in ("verify", "captcha", "验证码", "验证"):
         return KIND_VERIFY
     if k in ("login", "登录"):
         return KIND_LOGIN
+    if k in ("search", "搜索", "搜索接口"):
+        return KIND_SEARCH
     return KIND_LIMIT
 
 
@@ -126,6 +136,36 @@ class LeadNotFound(DouyinError):
     """
 
 
+class SearchUnavailable(DouyinError):
+    """搜索接口返回不了任何结果 —— 限流或故障。
+
+    跟 ``LeadNotFound`` 的区别（本轮最关键的一处区分，2026-11-12）：
+
+    - ``LeadNotFound``：搜索接口**正常返回了用户**，只是目标不在里面
+      → 说明这个人真的改名/注销了 → 正常业务结果，跳过，不算故障
+    - ``SearchUnavailable``：搜索接口**一个用户都没返回**
+      → 接口坏了 / 被限流 → 真故障，该停手
+
+    ⚠️ 别跟「要求验证」搞混：抖音要你过拼图验证才能搜人时，
+    响应里会带 ``search_nil_info.search_nil_type="verify_check"``，
+    那种情况 ``_search`` 会先抛 ``RiskControl(kind=verify)``
+    （走「叫人过验证码 → 验证完自动接着跑」那条路），
+    根本到不了这个异常。
+
+    为什么还要区分：
+    用户抽查「G1808575996、987714317、53722928132」，说手机上都能搜到。
+    实际上 web 端搜索这边要么被限流、要么被要求验证——
+    抖音不报错、不弹提示，就是给你一个空的 user_list
+    （实测 status_code=0、cursor=10、user_list=[]），首页推荐流完全正常。
+
+    之前这两种情况都当成「搜不到」，于是：
+    - 被限流时，程序以为「这些人都失效了」，接着往下跑 → 纯空转
+    - 真正失效的号，反而混在限流里看不出是哪回事
+
+    所以判断口径是：**接口有没有返回用户**（而不是有没有搜到目标）。
+    """
+
+
 class Douyin:
     def __init__(self, page: Page, shot_dir: str | pathlib.Path | None = None,
                  log: Callable[[str], None] = print):
@@ -145,6 +185,18 @@ class Douyin:
         self.verify_flow = ""
         self.verify_flow_at = 0.0
         self.verify_ways: list[str] = []
+        # ---- 搜索接口的健康状态 ----
+        # 抖音 web 端搜索会**静默限流**：不报错、不提示，就是给你一个空的
+        # user_list（实测 status_code=0、cursor=10、user_list=[]）。
+        # 所以「搜某人返回 0 个用户」有两种完全不同的含义，
+        # 得靠探针（搜一个一定搜得到的词）才能分清。
+        self._search_health_at = 0.0
+        self._search_healthy = True
+        # 最近一次搜索返回的用户（批量缓存 sec_uid 用）
+        self.last_search_users: list[dict] = []
+        # 主页作品缓存（sec_uid → 作品列表）
+        # 已知 sec_uid 时「定位」和「挑作品」合成一次开页面，省一半时间
+        self._works_cache: dict[str, list[dict]] = {}
         try:
             page.on("response", self._on_decision)
         except Exception:
@@ -240,9 +292,19 @@ class Douyin:
                 raise RiskControl(f"页面提示：{kw}", kind="limit")
         # 抖音页面常驻一个空的 #captcha_container 壳子，count>0 不代表真有验证码。
         # 只有「占位够大 + 里面有文字」才算真验证码。
+        #
+        # ⚠️ 但光靠这一条不够（2026-11-12 实测踩到）：
+        # 搜索被要求验证时，验证码本体在**跨域 iframe** 里
+        # （rmc.bytedance.com/verifycenter/captcha/v2），
+        # 父页面的 innerText 是**空的** → 「里面有文字」永远不成立
+        # → 验证码明明弹出来了，程序却说「没有风控信号」，接着往下跑，
+        #    最后把「搜不到人」当成「这些人全失效了」。
+        #
+        # 所以还得看 iframe 元素本身（它在父页面里，看得到 src 和尺寸）。
         try:
             real_captcha = self.page.evaluate(
                 """() => {
+                  // ① 容器里有文字（老规则）
                   const sels = ['#captcha_container','.captcha_verify_container','.captcha-verify-container'];
                   for (const s of sels) {
                     const el = document.querySelector(s);
@@ -251,6 +313,16 @@ class Douyin:
                     const cs = getComputedStyle(el);
                     if (cs.display === 'none' || cs.visibility === 'hidden') continue;
                     if (r.width > 120 && r.height > 60 && (el.innerText || '').trim().length > 0) return true;
+                  }
+                  // ② 可见的验证码 iframe（跨域，父页面拿不到它的文字）
+                  for (const f of document.querySelectorAll('iframe')) {
+                    const src = f.getAttribute('src') || '';
+                    if (!/verifycenter\\/captcha|captcha\\/v\\d|verify_center|verifycenter/i.test(src)) continue;
+                    const r = f.getBoundingClientRect();
+                    if (r.width < 60 || r.height < 60) continue;
+                    const cs = getComputedStyle(f);
+                    if (cs.display === 'none' || cs.visibility === 'hidden') continue;
+                    return true;
                   }
                   return false;
                 }"""
@@ -428,7 +500,39 @@ class Douyin:
             self.page.wait_for_timeout(400)
         return False
 
-    def _search(self, q: str) -> list[dict]:
+    # 抖音在搜索结果里给「为什么搜不到」的结构化说明。
+    #
+    # 2026-11-12 实测（这是本轮最关键的发现）：
+    #   搜索接口不返回用户时，响应里带着
+    #       "search_nil_info": {"search_nil_type": "verify_check", ...}
+    #   verify_check = **抖音要求先完成安全验证（拼图滑块）才能搜人**。
+    #
+    # 也就是说这根本不是「限流」，也不是「这些人全失效了」，
+    # 而是「你得先过个验证码」。页面会弹一个拼图滑块
+    # （rmc.bytedance.com/verifycenter/captcha/v2，跨域 iframe）。
+    #
+    # 为什么之前一直没认出来：
+    #   · 页面正文里没有「安全验证」几个字（验证码在 iframe 里）→ 关键词匹配全落空
+    #   · 接口 status_code=0、不报错 → 看起来像「就是没结果」
+    # 于是程序一路当成「搜不到人」，把整批线索判成失效。
+    #
+    # 用平台自己的裁决，比猜页面文案准得多（同 passport/safe/query_decision 那个道理）。
+    SEARCH_NIL_VERIFY = "verify_check"
+
+    @staticmethod
+    def _search_nil_type(data: list[dict]) -> str:
+        """从搜索响应里读 ``search_nil_info.search_nil_type``"""
+        for j in data or []:
+            if not isinstance(j, dict):
+                continue
+            nil = j.get("search_nil_info")
+            if isinstance(nil, dict):
+                t = str(nil.get("search_nil_type") or "").strip()
+                if t:
+                    return t
+        return ""
+
+    def _search(self, q: str, expect_hit: bool = True) -> list[dict]:
         """像真人一样用搜索框搜。
 
         实测（2026-11）：直接 goto /search/{q}?type=user 页面是空的（SPA 路由不认），
@@ -440,6 +544,9 @@ class Douyin:
         那个接口的响应里顶层就有 ``user_list``。
         （2026-11-11 实测：不点 → 10 条线索全部「搜索无用户结果」，
         看着像账号被限流，其实是 tab 没点、接口对不上。）
+
+        ``expect_hit=False`` 是**探针模式**：不等「搜到目标」，
+        只要接口吐出任何一个用户就算成功（用来判断接口死没死）。
         """
         def do_search() -> None:
             self._goto(f"{DOUYIN}/")
@@ -453,8 +560,13 @@ class Douyin:
             self.page.keyboard.press("Enter")
 
         def hit(j: dict) -> bool:
+            users = self._extract_users([j])
+            if not users:
+                return False
+            if not expect_hit:
+                return True
             return any(str(u.get("unique_id") or "") == q or str(u.get("short_id") or "") == q
-                       for u in self._extract_users([j]))
+                       for u in users)
 
         # discover/search = 用户 tab 的接口（user_list 在顶层）
         # general/search  = 综合 tab 的接口（兜底，偶尔也能捞到 user_info）
@@ -466,7 +578,72 @@ class Douyin:
         # 首屏没命中时再多等一会儿（分几段推过来的）
         if not self._extract_users(data):
             self.page.wait_for_timeout(2500)
+
+        # ---- 平台自己说「要验证」→ 直接按验证处理，别当成搜不到 ----
+        #
+        # 这是 2026-11-12 那个 bug 的根因：
+        # 抖音要求先过拼图验证才能搜人，接口就回一个空 user_list，
+        # 还贴心地在 search_nil_info 里写明「verify_check」。
+        # 以前没人读这个字段 → 程序以为「这些人全失效了」→ 一路空转。
+        nil_type = self._search_nil_type(data)
+        if nil_type == self.SEARCH_NIL_VERIFY:
+            self._shot("search_needs_verify")
+            raise RiskControl(
+                "抖音要求先完成安全验证才能搜索（搜索结果为空是因为触发了验证）",
+                kind=KIND_VERIFY,
+            )
         return data
+
+    # 探测搜索接口用的「金丝雀」关键词。
+    # 必须是一个**一定搜得到用户**的词，而且不会撞上任何一条待触达线索。
+    # 「小米」是汽车经销商场景里最稳的选择（小米SU7/小米汽车/小米之家…）。
+    SEARCH_CANARY = "小米"
+
+    # 探测结果的复用窗口（秒）。
+    # 一次失败别马上又探一次——探针本身也是一次搜索，
+    # 搜索次数本身就是被限流的资源。
+    SEARCH_HEALTH_TTL = 300
+
+    def _probe_search_health(self, force: bool = False) -> bool:
+        """探测搜索接口是不是还活着（返回 True=接口正常）
+
+        为什么需要探针（2026-11-12 用户反馈的关键）：
+        「搜某人 → 返回 0 个用户」有两种完全不同的含义，从单次搜索里**分不出来**：
+
+        a) 这个抖音号真的不存在（改名/注销了）→ 正常业务结果，跳过就行
+        b) 搜索接口被限流了，一个用户都吐不出来 → 真故障，该停手
+
+        抖音被限流时**不报错、不弹提示**，就是静默给一个空的 user_list。
+        所以之前两种情况混在一起，分不清「这批人都失效了」还是「接口坏了」。
+
+        解法：再搜一个**一定搜得到**的词（金丝雀）。
+          · 金丝雀也搜不到 → 接口坏了 → SearchUnavailable（停手）
+          · 金丝雀能搜到   → 接口是好的 → 目标不在结果里 → LeadNotFound（跳过）
+
+        ⚠️ 探针结果要缓存：探针自己也是一次搜索，
+        每条搜不到的线索都探一次 = 搜索次数翻倍 = 更快撞上限流。
+        """
+        if not force and (time.time() - self._search_health_at) < self.SEARCH_HEALTH_TTL:
+            return self._search_healthy
+        canary = self.SEARCH_CANARY
+        try:
+            data = self._search(canary, expect_hit=False)
+            users = self._extract_users(data)
+            healthy = bool(users)
+        except RiskControl:
+            # 探针也撞上「要验证」→ 那是**要人过验证码**，
+            # 不是「接口坏了」。往上抛，走人工验证那条路。
+            raise
+        except Exception as e:
+            self.log(f"  ⚠️ 探测搜索接口失败：{str(e).splitlines()[0][:80]}")
+            healthy = False
+        self._search_health_at = time.time()
+        self._search_healthy = healthy
+        if healthy:
+            self.log(f"  🔎 探测：搜「{canary}」能搜到 {len(users)} 个用户 → 搜索接口正常")
+        else:
+            self.log(f"  🔎 探测：搜「{canary}」也一个用户都没有 → 搜索接口被限流了")
+        return healthy
 
     def resolve(self, unique_id: str, nickname: str | None = None) -> dict | None:
         """抖音号/短 ID → {sec_uid, nickname, unique_id, aweme_count, signature}。
@@ -489,10 +666,35 @@ class Douyin:
         self.log(f"  搜索：{q}")
         data = self._search(q)
         users = self._extract_users(data)
+        # 留着这一页的用户，worker 会顺手把 sec_uid 存下来
+        # （抖音一次搜索返回一页十几个用户，每个都带 sec_uid，
+        #   存下来后面那些线索就不用再搜了）
+        self.last_search_users = users
         text = self._body_text()
         if not users and "登录后即可搜索" in text:
             raise NotLoggedIn("搜索需要登录：页面上是「登录后即可搜索」")
         self.check_risk()
+
+        if not users:
+            # 一个用户都没有 → 先探一下接口死活，再决定是「人不在」还是「接口坏了」
+            #
+            # 这一步是本轮最关键的区分（2026-11-12）：
+            # 抖音 web 端搜索被限流时**不报错**，就是给你一个空的 user_list。
+            # 不探一下就会把「接口被限流」误当成「这些人都失效了」，
+            # 然后一路空转下去；反过来把真失效的号当成限流，
+            # 也会停错手、发错通知。
+            healthy = self._probe_search_health()
+            if not healthy:
+                raise SearchUnavailable(
+                    f"搜索接口返回空（疑似被抖音限流）：搜「{q}」一个用户都没返回，"
+                    f"探针搜「{self.SEARCH_CANARY}」同样为空"
+                )
+            # 接口是好的 → 目标真的不在结果里
+            if by_nickname:
+                self.log(f"  ⚠️ 昵称也没搜到：{q}")
+            else:
+                self.log(f"  ⚠️ 没搜到抖音号 {q}（搜索接口正常，就是没有这个人）")
+            return None
 
         ql = q.lower()
         hit_user = None
@@ -522,6 +724,54 @@ class Douyin:
             "unique_id": hit_user.get("unique_id") or hit_user.get("short_id"),
             "signature": hit_user.get("signature"),
             "aweme_count": hit_user.get("aweme_count"),
+        }
+
+    def resolve_by_sec_uid(self, sec_uid: str) -> dict | None:
+        """已知 sec_uid → 直接开主页（**跳过搜索**）
+
+        为什么值得单独一条路（2026-11-12）：
+        抖音 web 端搜索接口会**静默限流**——不报错、不提示，
+        就是给你一个空的 user_list（实测 status_code=0、cursor=10、user_list=[]）。
+        但主页 ``/user/{sec_uid}`` 一点都不受影响。
+
+        所以「记住上次定位到的 sec_uid」价值很大：
+          · 少一次搜索 = 少一次被限流的机会
+          · 搜索被限流时，这条线索照样能触达
+
+        顺带把主页作品一起抓了（下面挑作品就不用再开一次页面）。
+        """
+        sec_uid = str(sec_uid or "").strip()
+        if not sec_uid:
+            return None
+        self.ensure_login()
+        self.log(f"  已有 sec_uid，跳过搜索，直接开主页：{sec_uid[:20]}…")
+
+        def _check_alive() -> None:
+            """主页一打开就判一下账号还在不在
+
+            早点抛出去，别白等十几秒的接口超时。
+            """
+            body = self._body_text()
+            if any(w in body for w in ("该用户已注销", "账号已注销", "用户不存在",
+                                       "作品不存在", "暂时无法查看")):
+                raise LeadNotFound("抖音号已失效（主页提示用户不存在/已注销）")
+
+        works = self._fetch_works_page(sec_uid, after_open=_check_alive)
+        # 存进缓存：下面挑作品时直接用，不用再开一次主页
+        self._works_cache[sec_uid] = works
+        nickname = ""
+        aweme_count = None
+        for w in works:
+            if not nickname and w.get("author_nickname"):
+                nickname = w["author_nickname"]
+            if aweme_count is None and w.get("author_aweme_count") is not None:
+                aweme_count = w["author_aweme_count"]
+        return {
+            "sec_uid": sec_uid,
+            "nickname": nickname,
+            "unique_id": "",
+            "signature": "",
+            "aweme_count": aweme_count,
         }
 
     @staticmethod
@@ -560,9 +810,24 @@ class Douyin:
     def fetch_works(self, sec_uid: str, limit: int = 20) -> list[dict]:
         """拉某人主页的作品列表。
 
-        主路径：页面自己会调 /aweme/v1/web/aweme/post/，监听响应拿 aweme_list。
+        如果 ``resolve_by_sec_uid`` 已经开过这个主页，作品是现成的，直接用
+        （省一次页面加载）。否则走主路径：页面自己会调
+        /aweme/v1/web/aweme/post/，监听响应拿 aweme_list；
         兜底：接口没出来/为空时，从主页 DOM 的 /video/ 链接里捡
         （必须过滤掉 source=Baiduspider 这类 SEO / 推荐位的噪音链接）。
+        """
+        cached = self._works_cache.get(sec_uid)
+        if cached is not None:
+            return cached[:limit]
+        works = self._fetch_works_page(sec_uid)
+        self._works_cache[sec_uid] = works
+        return works[:limit]
+
+    def _fetch_works_page(self, sec_uid: str, after_open=None) -> list[dict]:
+        """真的去开一次主页抓作品（``fetch_works`` 的底层实现）
+
+        ``after_open``：页面打开后立刻执行的回调（用来判断账号还在不在），
+        在里面抛异常可以**提前中断**，省掉等接口的十几秒。
         """
         self.ensure_login()
         url = f"{DOUYIN}/user/{sec_uid}"
@@ -570,6 +835,8 @@ class Douyin:
         def do_open() -> None:
             self._goto(url)
             self.page.wait_for_timeout(1200)
+            if after_open:
+                after_open()
             # 主页作品是懒加载的，滚一下能让接口早点发
             try:
                 self.page.mouse.wheel(0, 1400)
@@ -597,6 +864,7 @@ class Douyin:
         for j in data:
             for a in (j.get("aweme_list") or []):
                 try:
+                    author = a.get("author") or {}
                     works.append({
                         "aweme_id": a.get("aweme_id"),
                         "desc": (a.get("desc") or "").strip(),
@@ -606,6 +874,10 @@ class Douyin:
                         "comment": (a.get("statistics") or {}).get("comment_count"),
                         "duration": (a.get("video") or {}).get("duration"),
                         "type": a.get("aweme_type"),
+                        # 作者昵称 / 作品总数：已知 sec_uid 直接开主页时，
+                        # 就靠这两个字段把「定位到谁」补齐（不用再搜一次）
+                        "author_nickname": (author.get("nickname") or "").strip(),
+                        "author_aweme_count": author.get("aweme_count"),
                     })
                 except Exception:
                     continue
@@ -617,7 +889,7 @@ class Douyin:
                 uniq.append(w)
         uniq.sort(key=lambda x: x.get("create_time") or 0, reverse=True)
         if uniq:
-            return uniq[:limit]
+            return uniq
 
         # ---- DOM 兜底（接口空 / 没捕获到）----
         # 只认主页自己的作品网格：div[data-e2e="user-post-list"] 里的 ul[scroll-list] > li > a。
@@ -648,7 +920,7 @@ class Douyin:
                 dom.append({"aweme_id": aid, "desc": desc or "", "create_time": 0})
         if dom:
             self.log(f"  接口没给作品，从作品网格拿到 {len(dom)} 个")
-            return dom[:limit]
+            return dom
         return []
 
     # ------------------------------------------------------------ 发留言

@@ -190,16 +190,22 @@ def test_干跑记录不触发冷却(tmp_path):
 # 前后端词汇必须一致
 # ============================================================
 
-def test_网页横幅认得三种停手():
+def test_网页横幅认得全部停手种类():
     """网页上的 kind 集合要跟后端发出来的一致
 
     出过一次这样的事：后端发 "verify"，网页写的是 "captcha"，
     结果撞验证时横幅**完全不显示**——用户只看到一行日志。
+
+    2026-11-12 又加了 ``search``（抖音网页版搜索接口被限流）：
+    账号是好的、扫码没用、不该锁冷却——所以必须是**独立**的一种，
+    混进 limit 就会误锁 120 分钟 + 发错通知。
     """
-    from src.outreach.douyin_api import KIND_LIMIT, KIND_LOGIN, KIND_VERIFY
+    from src.outreach.douyin_api import (
+        KIND_LIMIT, KIND_LOGIN, KIND_SEARCH, KIND_VERIFY,
+    )
     from src.web.outreach_page import STOP_KINDS
 
-    assert set(STOP_KINDS) == {KIND_VERIFY, KIND_LIMIT, KIND_LOGIN}, (
+    assert set(STOP_KINDS) == {KIND_VERIFY, KIND_LIMIT, KIND_LOGIN, KIND_SEARCH}, (
         f"网页横幅的 kind 集合跟后端对不上：{STOP_KINDS}"
     )
 
@@ -209,7 +215,7 @@ def test_网页不再用旧的captcha词汇():
     from src.web.outreach_page import STOP_KINDS
 
     assert "captcha" not in STOP_KINDS
-    assert all(k in ("verify", "limit", "login") for k in STOP_KINDS)
+    assert all(k in ("verify", "limit", "login", "search") for k in STOP_KINDS)
 
 
 # ============================================================

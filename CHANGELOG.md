@@ -5,6 +5,102 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.29] - 2026-11-12
+
+### Fixed
+- **搜索搜不到人，根因找到了：抖音要求先过「拼图验证」才能搜索**
+  （用户反馈「G1808575996、987714317、53722928132 我抽查了几个，
+  用手机都能搜到，你这边是什么情况？」）。
+
+  手机**确实**能搜到——限流/拦截的是抖音 **web 端搜索**，
+  而且抖音在响应里**明说了**：
+
+  ```json
+  {"user_list": [],
+   "search_nil_info": {"search_nil_type": "verify_check", ...}}
+  ```
+
+  `verify_check` = **要你先完成安全验证（拼图滑块）才能搜人**。
+  实测页面会弹 `rmc.bytedance.com/verifycenter/captcha/v2`
+  （`verify.zijieapi.com/captcha/get` 返回 `mode: slide`，就是拼图滑块）。
+
+  为什么一直没认出来（三层都漏了）：
+
+  1. **页面正文里没有验证文案** —— 验证码在**跨域 iframe** 里，
+     父页面 `innerText` 是空的。
+     原来的检测规则是「`#captcha_container` 里有文字」→ 永远不成立。
+  2. **接口不报错** —— `status_code=0`、`has_more=0`、`cursor=10`，
+     看起来就是「没结果」。
+  3. **`search_nil_info` 没人读** —— 平台把原因写在脸上，程序没看。
+
+  于是程序一路当成「这些人都失效了」，
+  把 12 条好线索误标成 skipped（含用户抽查的那三个号）。
+
+  修法：
+
+  1. **读平台自己的裁决**：`search_nil_info.search_nil_type == "verify_check"`
+     → 抛 `RiskControl(kind=verify)`，
+     走**已有**的「叫人过验证码 → 验证完自动接着跑」那条路
+     （把浏览器叫到屏幕中间 + 飞书私聊通知 + 自动检测验证是否通过）。
+  2. **验证码检测补上 iframe 规则**：可见的
+     `verifycenter/captcha` iframe ≥ 60×60 → 判定验证码在。
+     （原来只看容器里的文字，跨域 iframe 永远测不到。）
+  3. 飞书通知文案补上「拼图滑块」和「搜索也会触发」，
+     不再只说「发评论时」。
+
+### Added
+- **区分「接口坏了」和「人真的不在」**（`SearchUnavailable`）。
+
+  「搜某人返回 0 个用户」有两种完全不同的含义，从单次搜索里分不出来：
+
+  | 情况 | 含义 | 处理 |
+  |---|---|---|
+  | `LeadNotFound` | 接口正常返回了用户，只是目标不在 | 跳过，不算故障 |
+  | `SearchUnavailable` | 接口一个用户都没返回（限流/故障） | 真故障，该停手 |
+
+  为了分清，加了**金丝雀探针**：再搜一个一定搜得到的词（`小米`），
+  探针也空 → 接口坏了；探针有 → 人是真的不在。
+  探针结果缓存 5 分钟（探针自己也是一次搜索，不能每条都探）。
+
+- **`search` 是一种独立的停手种类**（前后端词表同步 + 一致性测试）。
+
+  搜索限流**不是**账号限流：账号是好的、扫码没用、不该锁 120 分钟冷却。
+  以前混进 `limit` 会误锁冷却 + 发一条「扫码没用」的错误通知，方向完全错。
+
+- **记住抖音 sec_uid，下次直接开主页、跳过搜索**
+  （`leads.sec_uid` 新列 + 批量缓存）。
+
+  抖音 web 端搜索会被限流，但主页 `/user/{sec_uid}` 完全不受影响。
+  搜索次数本身就是被限流的资源，能省就省：
+
+  - 定位到人之后把 sec_uid 存下来 → 下次直接开主页
+  - 一次搜索返回一页（约 10 个）用户，**顺手把这一页的 sec_uid 都存上**
+    → 线索池里同号的以后都不用搜了
+  - `outreach_records` 里的历史 sec_uid 自动回填（4 条 pending 命中）
+
+### Changed
+- `set_sec_uid()` 改写独立列 `leads.sec_uid`，
+  **不再覆盖 `outreach_note`**——`outreach_note` 存的是失败原因，
+  冲掉等于把故障记录弄没了。
+- `outreach_records` / `leads.sec_uid` 的建表与补列由触达线程自己管
+  （`leads.sec_uid` 由 `OutreachStore._ensure_schema` 兜底补列，
+  不干等主进程迁移）。
+
+### Testing
+- 测试 340（+20）
+- 新增用例：探针能区分「接口坏了」和「人不在」、探针结果有缓存不重复探、
+  `search_nil_info` 读得出来、搜索要求验证时抛验证异常而不是搜不到、
+  普通空结果不误报成验证、已知 sec_uid 跳过搜索、
+  `set_sec_uid` 不冲掉故障记录、批量缓存只更新匹配的行、
+  搜索限流不锁冷却、文案不被误判成账号限流
+
+### Scripts
+- `scripts/check_search_limit.py`：搜索接口体检（探针 + 抽查号码）
+- `scripts/dump_search_payload.py`：把搜索相关响应整个 dump 出来，
+  递归找带 `sec_uid` 的对象——定位「search_nil_info」的 就是它
+
+---
+
 ## [2.0.28] - 2026-11-12
 
 ### Fixed

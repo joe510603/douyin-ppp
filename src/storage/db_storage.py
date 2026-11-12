@@ -152,6 +152,8 @@ CREATE TABLE IF NOT EXISTS leads (
     outreach_status TEXT DEFAULT 'pending',
     outreach_at TEXT DEFAULT '',
     outreach_note TEXT DEFAULT '',
+    -- 抖音 sec_uid（定位到用户后记下来，下次直接开主页，不用再搜索）
+    sec_uid TEXT DEFAULT '',
     source TEXT DEFAULT 'rule',
     bitable_record_id TEXT DEFAULT '',
     created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
@@ -324,6 +326,28 @@ class DBStorage:
         # 配置里同一个门店有多种写法（｜/丨/|/空格），归一化后才能按门店筛选。
         try:
             await self._db.execute("ALTER TABLE leads ADD COLUMN store TEXT DEFAULT ''")
+            await self._db.commit()
+        except aiosqlite.OperationalError:
+            pass
+
+        # 迁移：老库补 sec_uid（抖音 sec_uid）
+        #
+        # 有了它，下次触达同一个线索**不用再搜索**——
+        # 搜索接口容易被抖音限流（静默返回空），
+        # 能直接开主页就少一次被限流的机会。
+        try:
+            await self._db.execute("ALTER TABLE leads ADD COLUMN sec_uid TEXT DEFAULT ''")
+            await self._db.commit()
+        except aiosqlite.OperationalError:
+            pass
+        try:
+            await self._db.execute(
+                "UPDATE leads SET sec_uid = ("
+                "  SELECT r.sec_uid FROM outreach_records r"
+                "  WHERE r.sec_uid != '' AND r.display_id = leads.display_id"
+                "  ORDER BY r.created_at DESC LIMIT 1"
+                ") WHERE (sec_uid IS NULL OR sec_uid = '')"
+            )
             await self._db.commit()
         except aiosqlite.OperationalError:
             pass

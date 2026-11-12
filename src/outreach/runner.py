@@ -31,7 +31,9 @@ from typing import Callable, Optional
 from ..config import get_config
 from ..storage.db_storage import get_db
 from ..utils.logger import get_logger
-from .douyin_api import KIND_LIMIT, KIND_LOGIN, KIND_VERIFY, normalize_kind
+from .douyin_api import (
+    KIND_LIMIT, KIND_LOGIN, KIND_SEARCH, KIND_VERIFY, normalize_kind,
+)
 from .store import OutreachStore
 
 log = get_logger("outreach_runner")
@@ -228,7 +230,7 @@ class OutreachRunner:
                 continue
             # 新记录：直接用存好的种类，不用猜
             kind = str(r.get("kind") or "").strip().lower()
-            if kind in (KIND_VERIFY, KIND_LIMIT, KIND_LOGIN):
+            if kind in (KIND_VERIFY, KIND_LIMIT, KIND_LOGIN, KIND_SEARCH):
                 return {"kind": kind, "reason": note}
             # 老记录（没有 kind 列）：按文案猜
             guessed = self._kind_from_note(note)
@@ -247,6 +249,13 @@ class OutreachRunner:
           —— **不含**「限流」两个字
         """
         n = str(note or "")
+        # ⚠️ search 必须**排在 limit 前面**：
+        # 搜索限流的文案里带了「限流」两个字
+        # （「搜索接口连续 N 次返回空（疑似被抖音限流），主动停手」），
+        # 先判 limit 会把它误当成「账号被限流」→ 锁 120 分钟冷却，
+        # 而实际上账号是好的，扫码也没用。
+        if "搜索接口" in n or "搜索被限流" in n or "网页版搜索" in n:
+            return KIND_SEARCH
         if any(k in n for k in ("限流", "软风控", "操作频繁", "访问频繁",
                                  "账号存在异常", "环境异常")):
             return KIND_LIMIT
@@ -420,6 +429,12 @@ class OutreachRunner:
                 self._append_log(
                     f"⏸ 抖音要求验证本人操作：{event.get('error')}\n"
                     "   → 这**不是**账号被限流，验证一下就能继续（下方有按钮）"
+                )
+            elif kind == KIND_SEARCH:
+                self._append_log(
+                    f"🔍 抖音网页版搜索被限流：{event.get('error')}\n"
+                    "   → 账号是好的、扫码没用；等一会儿它自己会恢复，"
+                    "下次不用再搜这些号（已记住抖音 ID）"
                 )
             else:
                 self._append_log(
