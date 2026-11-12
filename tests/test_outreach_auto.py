@@ -45,7 +45,12 @@ class _FakeRunner:
 
 @pytest.fixture
 def cfg_outreach(monkeypatch):
-    """把 outreach 配置改成可控状态"""
+    """把 outreach 配置改成可控状态
+
+    默认走**老的定时模式**（auto_continuous=False）——
+    连续模式的行为单独一组用例测，两种模式的间隔语义完全不同，
+    混在一起测会互相掩盖。
+    """
     cfg = get_config()
     o = cfg.outreach
     o.enabled = True
@@ -54,9 +59,19 @@ def cfg_outreach(monkeypatch):
     o.auto_interval_minutes = 60
     o.auto_max_per_run = 5
     o.max_per_run = 10
+    o.auto_continuous = False
+    o.auto_round_gap_seconds = 60
+    o.auto_idle_poll_seconds = 30
     yield o
     o.enabled = False
     o.auto_mode = False
+
+
+@pytest.fixture
+def cfg_continuous(cfg_outreach):
+    """连续模式：轮完接下一轮，新线索马上跟上"""
+    cfg_outreach.auto_continuous = True
+    return cfg_outreach
 
 
 # ============================================================
@@ -199,3 +214,153 @@ def test_没开启时状态是未开启(cfg_outreach):
     st = s.status()
     assert st["configured"] is False
     assert st["enabled"] is False
+
+
+# ============================================================
+# 连续模式：打开开关就一直自己跑
+# ============================================================
+
+def test_连续模式不等固定间隔(cfg_continuous):
+    """连续模式的核心：轮完接下一轮，不等那个固定周期
+
+    用户要求「打开自动触达，就会一直自己去触达了」。
+    老逻辑要等 auto_interval_minutes（这里 60 分钟），
+    连续模式只等换手间隙（60 秒）。
+    """
+    cfg_continuous.auto_interval_minutes = 60
+    cfg_continuous.auto_round_gap_seconds = 60
+    r = _FakeRunner()
+    s = AutoScheduler(r)
+    assert asyncio.run(s.maybe_run()) is True
+    # 假装上一轮是 90 秒前（换手间隙已过，但离 60 分钟还早得很）
+    s.last_run_at = datetime.now() - timedelta(seconds=90)
+    assert asyncio.run(s.maybe_run()) is True
+    assert len(r.calls) == 2
+
+
+def test_连续模式换手间隙没过就不跑(cfg_continuous):
+    """刚跑完立刻又来 → 换手间隙没过，不该马上再开一轮"""
+    cfg_continuous.auto_round_gap_seconds = 60
+    r = _FakeRunner()
+    s = AutoScheduler(r)
+    assert asyncio.run(s.maybe_run()) is True
+    assert asyncio.run(s.maybe_run()) is False
+    assert len(r.calls) == 1
+
+
+def test_连续模式队列空了就早点看新线索(cfg_continuous):
+    """队列空的时候要勤看——新进的线索才能马上跟上"""
+    cfg_continuous.auto_round_gap_seconds = 600   # 有活干时等很久
+    cfg_continuous.auto_idle_poll_seconds = 30    # 闲着时勤看
+    r = _FakeRunner()
+    r.result = {"ok": True, "sent": 0, "dry": 0, "failed": 0, "total": 0}
+    s = AutoScheduler(r)
+    assert asyncio.run(s.maybe_run()) is True
+    # 空跑之后，40 秒后应该又去看一眼（不必等 600 秒）
+    s.last_run_at = datetime.now() - timedelta(seconds=40)
+    assert asyncio.run(s.maybe_run()) is True
+    assert len(r.calls) == 2
+
+
+def test_连续模式状态里有连续标记(cfg_continuous):
+    s = AutoScheduler(_FakeRunner())
+    st = s.status()
+    assert st["continuous"] is True
+    assert st["paused"] is False
+
+
+# ============================================================
+# 撞验证：停下来叫人，不硬撞
+# ============================================================
+
+def test_撞验证就暂停不再自动跑(cfg_continuous):
+    """撞了「本人操作验证」必须停下来等人，不能自己又撞一次"""
+    r = _FakeRunner()
+    r.result = {
+        "ok": True, "sent": 0, "dry": 0, "failed": 1, "total": 1,
+        "stopped": "触发风控：抖音要求验证本人操作才能发评论",
+        "stop_kind": "verify",
+    }
+    s = AutoScheduler(r)
+    assert asyncio.run(s.maybe_run()) is True
+    assert s.paused is True
+    assert "验证" in s.last_result.get("stopped", "") or s.paused
+    # 暂停后不该再自动跑
+    s.last_run_at = datetime.now() - timedelta(minutes=10)
+    assert asyncio.run(s.maybe_run()) is False
+    assert len(r.calls) == 1, "撞验证后不该自己又跑一轮"
+
+
+def test_撞验证后手动解除能恢复(cfg_continuous):
+    r = _FakeRunner()
+    r.result = {
+        "ok": True, "sent": 0, "dry": 0, "failed": 1, "total": 1,
+        "stopped": "触发风控：抖音要求验证本人操作",
+        "stop_kind": "verify",
+    }
+    s = AutoScheduler(r)
+    asyncio.run(s.maybe_run())
+    assert s.paused is True
+    assert s.clear_pause("网页上点了解除") is True
+    assert s.paused is False
+    # 解除后马上就能跑
+    assert asyncio.run(s.maybe_run()) is True
+    assert len(r.calls) == 2
+
+
+def test_撞验证后手动触发会解除暂停(cfg_continuous):
+    """手动触发 = 人已经在了 → 顺手把暂停解掉"""
+    r = _FakeRunner()
+    r.result = {
+        "ok": True, "sent": 0, "dry": 0, "failed": 1, "total": 1,
+        "stopped": "触发风控：抖音要求验证本人操作",
+        "stop_kind": "verify",
+    }
+    s = AutoScheduler(r)
+    asyncio.run(s.maybe_run())
+    assert s.paused is True
+    s.trigger_now()
+    assert s.paused is False
+    assert asyncio.run(s.maybe_run()) is True
+    assert len(r.calls) == 2
+
+
+def test_登录失效也会暂停(cfg_continuous):
+    r = _FakeRunner()
+    r.result = {
+        "ok": True, "sent": 0, "dry": 0, "failed": 1, "total": 1,
+        "stopped": "登录失效：没有 sessionid",
+        "stop_kind": "login",
+    }
+    s = AutoScheduler(r)
+    asyncio.run(s.maybe_run())
+    assert s.paused is True
+
+
+def test_今日已发满会暂停到明天(cfg_continuous):
+    """发满了就别每分钟空跑一轮，暂停到明天自动恢复"""
+    r = _FakeRunner()
+    r.result = {
+        "ok": True, "sent": 0, "dry": 0, "failed": 0, "total": 0,
+        "stopped": "今天已发 100 条，达到每日上限 100，收工",
+        "daily_limit_reached": True,
+    }
+    s = AutoScheduler(r)
+    asyncio.run(s.maybe_run())
+    assert s.paused is True
+    st = s.status()
+    assert st["paused"] is True
+    assert "明天" in st["paused_reason"]
+
+
+def test_限流不进暂停状态(cfg_continuous):
+    """限流由冷却计时管，冷却完了自动接着跑，不该永久暂停"""
+    r = _FakeRunner()
+    r.result = {
+        "ok": True, "sent": 0, "dry": 0, "failed": 1, "total": 1,
+        "stopped": "触发风控：页面提示：操作频繁",
+        "stop_kind": "limit",
+    }
+    s = AutoScheduler(r)
+    asyncio.run(s.maybe_run())
+    assert s.paused is False

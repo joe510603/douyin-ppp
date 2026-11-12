@@ -168,6 +168,14 @@ def create_outreach_page():
 
         outreach_status.text = "触达任务运行中…（可继续用页面其它功能）"
         outreach_log.clear()
+        # 人手动跑一轮 = 「我来处理了」→ 顺手解掉自动触达的暂停
+        # （自动触达撞了验证会自己停下等人，这一跑就说明人已经在了）
+        try:
+            from ..outreach.auto_scheduler import get_auto_scheduler
+
+            get_auto_scheduler().clear_pause("手动跑了一轮")
+        except Exception:
+            pass
         try:
             result = await runner.run(limit=limit, dry_run=dry,
                                       delay_min=delay_min, delay_max=delay_max,
@@ -275,6 +283,17 @@ def create_outreach_page():
                             value=bool(config.outreach.auto_mode),
                         )
 
+                        auto_continuous_switch = ui.switch(
+                            "连续跑（轮完接下一轮，新线索马上跟上）",
+                            value=bool(getattr(config.outreach, "auto_continuous", True)),
+                        )
+
+                        auto_dry_switch = ui.switch(
+                            "干跑（不真发）",
+                            value=bool(config.outreach.auto_dry_run),
+                        )
+
+                    with ui.row().classes("w-full items-center q-gutter-sm q-mt-xs"):
                         auto_interval = ui.number(
                             "每隔(分钟)",
                             value=int(config.outreach.auto_interval_minutes or 60),
@@ -287,16 +306,21 @@ def create_outreach_page():
                             min=1, max=50, step=1,
                         ).props("dense outlined").classes("col-4 col-sm-2 app-input")
 
-                        auto_dry_switch = ui.switch(
-                            "干跑（不真发）",
-                            value=bool(config.outreach.auto_dry_run),
-                        )
+                        auto_gap = ui.number(
+                            "两轮间隔(秒)",
+                            value=int(getattr(config.outreach, "auto_round_gap_seconds", 60) or 60),
+                            min=0, max=600, step=10,
+                        ).props("dense outlined").classes("col-4 col-sm-2 app-input")
 
                     auto_status = ui.label("").classes("text-caption text-grey-7 q-mt-xs")
 
+                    # 暂停时（撞了验证/登录失效）才显示，让用户能一键恢复
+                    auto_pause_box = ui.column().classes("w-full q-mt-xs")
+                    auto_pause_box.set_visibility(False)
+
                     ui.label(
                         "⚠️ 自动真发 = 没人值守。抖音随时可能要求「本人操作验证」，"
-                        "撞上了会飞书叫你、停下来等你验证（不会自动发出去）。"
+                        "撞上了会**飞书群机器人 @ 你**、停下来等你验证（不会自动发出去）。"
                         "另外：多台机器都开自动触达会**重复留言**——去重只看本机记录，"
                         "看不见另一台机器发过什么。"
                     ).classes("text-caption text-grey-7 q-mt-xs").style("line-height:1.7;")
@@ -313,20 +337,21 @@ def create_outreach_page():
 
                     if not st["configured"]:
                         auto_status.text = "自动触达：未开启"
+                        auto_pause_box.set_visibility(False)
                         return
                     if not st["enabled"]:
                         auto_status.text = (
                             "自动触达：已打开开关，但「启用抖音触达」没开 → 不会跑"
                         )
+                        auto_pause_box.set_visibility(False)
                         return
 
                     mode = "干跑" if st["dry_run"] else "真发"
+                    how = "连续跑" if st.get("continuous") else "定时跑"
                     if st["running"]:
-                        # 正在跑的时候 last_run_at 还是上一轮的，
-                        # 直接说「还没跑过」会让人以为开关没生效
-                        bits = [f"自动触达：⏳ 正在跑本轮（{mode}）"]
+                        bits = [f"自动触达：⏳ 正在跑本轮（{mode}·{how}）"]
                     else:
-                        bits = [f"自动触达：运行中（{mode}）"]
+                        bits = [f"自动触达：{st.get('state') or '运行中'}（{mode}·{how}）"]
                     if st["last_run_at"]:
                         r = st.get("last_result") or {}
                         detail = (
@@ -344,6 +369,30 @@ def create_outreach_page():
                         bits.append(f"（{st['last_error']}）")
                     auto_status.text = "　".join(bits)
 
+                    # 暂停态：把「解除暂停」按钮摆出来
+                    if st.get("paused"):
+                        auto_pause_box.clear()
+                        with auto_pause_box:
+                            with ui.row().classes("w-full items-center q-gutter-sm"):
+                                ui.label(
+                                    f"⏸ 已暂停：{st.get('paused_reason') or ''}"
+                                ).classes("text-caption").style("color:#c0392b;")
+                                ui.button(
+                                    "解除暂停，继续自动触达",
+                                    on_click=_resume_auto,
+                                ).props("dense unelevated").classes("btn-primary")
+                        auto_pause_box.set_visibility(True)
+                    else:
+                        auto_pause_box.set_visibility(False)
+
+                def _resume_auto():
+                    """解除暂停，立刻接着跑"""
+                    from ..outreach.auto_scheduler import get_auto_scheduler
+
+                    get_auto_scheduler().clear_pause("网页上手动解除")
+                    ui.notify("已解除暂停，自动触达继续跑", type="positive")
+                    _refresh_auto_status()
+
                 def _save_auto_settings():
                     """保存自动触达设置"""
                     from ..config import get_config, save_config, reload_config
@@ -351,6 +400,7 @@ def create_outreach_page():
                     cfg = get_config()
                     cfg.outreach.auto_mode = bool(auto_switch.value)
                     cfg.outreach.auto_dry_run = bool(auto_dry_switch.value)
+                    cfg.outreach.auto_continuous = bool(auto_continuous_switch.value)
                     try:
                         cfg.outreach.auto_interval_minutes = int(
                             auto_interval.value or 60
@@ -359,6 +409,10 @@ def create_outreach_page():
                         pass
                     try:
                         cfg.outreach.auto_max_per_run = int(auto_max_run.value or 10)
+                    except Exception:
+                        pass
+                    try:
+                        cfg.outreach.auto_round_gap_seconds = int(auto_gap.value or 60)
                     except Exception:
                         pass
                     save_config(cfg)
@@ -379,8 +433,10 @@ def create_outreach_page():
 
                 auto_switch.on_value_change(_toggle_auto)
                 auto_dry_switch.on_value_change(_save_auto_settings)
+                auto_continuous_switch.on_value_change(_save_auto_settings)
                 auto_interval.on_value_change(_save_auto_settings)
                 auto_max_run.on_value_change(_save_auto_settings)
+                auto_gap.on_value_change(_save_auto_settings)
                 _refresh_auto_status()
 
                 # 现在两个刷新函数都定义好了，统一刷一次

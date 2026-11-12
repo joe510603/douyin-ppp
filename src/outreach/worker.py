@@ -316,7 +316,7 @@ class OutreachWorker:
         return KIND_LIMIT
 
     def _notify_risk(self, kind: str, reason: str, lead: Optional[dict] = None) -> bool:
-        """触达停手了 → 飞书私聊通知你
+        """触达停手了 → 飞书通知你
 
         **任何**让触达停下来的情况都要通知，不能只有验证码才发。
         之前软风控停了却一声不吭，用户在网页上只看到一行日志，
@@ -326,23 +326,19 @@ class OutreachWorker:
         - verify：要人工验证 → 叫人 + 停下等
         - login：登录态没了 → 叫人扫码
         - limit：账号被限流 → 扫码没用，得等解封
+
+        走哪个通道
+        ----------
+        **群机器人优先，私聊兜底。**
+
+        2026-11-12 实测：lark-cli 私聊消息**发得出去**（返回 ok=true），
+        但飞书私聊会话在手机上**不产生推送**——消息躺在那儿没人知道。
+        群消息才会推，而且 @ 人会触发强提醒。
+        所以「要提醒我」= 群里发一张红卡片 + @你；
+        群机器人没配或发失败时，才退回私聊（总比一声不吭强）。
         """
         kind = normalize_kind(kind)
         n = self.cfg.notify
-        if not getattr(n, "lark_im_enabled", False):
-            self.log("  （没开飞书私聊通知，只在页面上提示）")
-            return False
-        try:
-            from ..notify.lark_im import get_im_notifier
-
-            notifier = get_im_notifier(self.cfg)
-        except Exception as e:
-            self.log(f"  （通知器初始化失败：{e}）")
-            return False
-        if not notifier.is_configured:
-            self.log("  （没配 lark_im_open_id，发不出去）")
-            return False
-
         wait_min = int(getattr(self.cfg.outreach, "captcha_wait_minutes", 15) or 15)
         cool_min = int(getattr(self.cfg.outreach, "risk_cooldown_minutes", 120) or 120)
 
@@ -402,6 +398,49 @@ class OutreachWorker:
         who = ""
         if lead:
             who = f"抖音号 {lead.get('display_id') or ''}"
+
+        # ---- 主通道：飞书群机器人（红卡片 + @人，手机会强提醒）----
+        if getattr(n, "risk_webhook_enabled", False) and (
+                n.risk_webhook_url or "").strip():
+            try:
+                from ..notify.feishu import FeishuNotifier
+
+                notifier = FeishuNotifier(
+                    webhook_url=n.risk_webhook_url,
+                    secret=getattr(n, "risk_webhook_secret", "") or "",
+                )
+                ok, err = _run_coro_blocking(
+                    notifier.send_risk_card(
+                        title=title,
+                        reason=reason,
+                        steps=steps,
+                        at_open_id=(getattr(n, "risk_at_open_id", "") or "").strip(),
+                        who=who,
+                    ),
+                    timeout=30,
+                )
+            except Exception as e:
+                ok, err = False, str(e)
+            if ok:
+                self.log("  📣 已在飞书群里提醒你（红卡片 + @你）")
+                return True
+            self.log(f"  （群机器人没发出去：{err}，改用私聊）")
+
+        # ---- 兜底：飞书私聊 ----
+        if not getattr(n, "lark_im_enabled", False):
+            self.log("  （没配飞书通知渠道，只在页面上提示）")
+            return False
+        try:
+            from ..notify.lark_im import get_im_notifier
+
+            im_notifier = get_im_notifier(self.cfg)
+        except Exception as e:
+            self.log(f"  （通知器初始化失败：{e}）")
+            return False
+        if not im_notifier.is_configured:
+            self.log("  （没配 lark_im_open_id，发不出去）")
+            return False
+
         text = (
             f"{title}\n\n"
             f"原因：{reason}\n"
@@ -410,7 +449,7 @@ class OutreachWorker:
             + steps
         )
         try:
-            ok, err = _run_coro_blocking(notifier.send_text(text), timeout=30)
+            ok, err = _run_coro_blocking(im_notifier.send_text(text), timeout=30)
         except Exception as e:
             self.log(f"  （飞书通知失败：{e}）")
             return False
@@ -760,7 +799,8 @@ class OutreachWorker:
         if not dry and sent_today >= daily_limit:
             msg = f"今天已发 {sent_today} 条，达到每日上限 {daily_limit}，收工"
             self.log(msg)
-            return {"ok": True, "stopped": msg, "total": 0, "sent": 0, "failed": 0, "skipped": 0}
+            return {"ok": True, "stopped": msg, "total": 0, "sent": 0,
+                    "failed": 0, "skipped": 0, "daily_limit_reached": True}
 
         # ---- 1) 取名单 ----
         self.log("① 读取待触达线索…")
@@ -847,9 +887,15 @@ class OutreachWorker:
                     self._emit(type="need_login")
                     return summary
 
-                for idx, lead in enumerate(picked, 1):
+                idx = 0
+                while idx < len(picked):
                     if self.stop_reason:
                         break
+                    # 连续模式：新进来的线索插队（见 _promote_hot_leads）
+                    if getattr(o, "auto_continuous", False):
+                        self._promote_hot_leads(picked, idx)
+                    lead = picked[idx]
+                    idx += 1
                     self.log(
                         f"\n[{idx}/{len(picked)}] {lead['display_id']}　{lead.get('nickname') or ''}"
                         f"　{lead.get('car_model') or '车型未知'}　{lead.get('intent_level') or ''}"
@@ -1038,6 +1084,10 @@ class OutreachWorker:
             skipped=summary["skipped"], note=note, kind=self._stop_kind,
         )
         summary["stopped"] = self.stop_reason
+        # 停手的**种类**要结构化带出去（不是靠文案猜）——
+        # 自动调度器靠它判断「是等人验证」还是「只是这轮跑完了」，
+        # 决定要不要暂停自动触达。靠解析文案迟早会漂。
+        summary["stop_kind"] = self._stop_kind
         elapsed = time.time() - t_run
         done = len(picked) or 1
         self.log(
@@ -1055,6 +1105,70 @@ class OutreachWorker:
     # ================================================================
     # 单条线索
     # ================================================================
+
+    def _promote_hot_leads(self, picked: list[dict], idx: int) -> int:
+        """把「新进来的线索」换到当前这条前面（连续模式）
+
+        为什么需要
+        ----------
+        用户要求（2026-11-12）：「包括有新进的也会自动触达」。
+
+        一轮开始时挑好的名单是个**快照**，而一轮要跑十几分钟。
+        期间新抓到的线索——尤其是刚在直播间问价的那种——
+        要等到下一轮才被处理，转化窗口就过了。
+
+        所以每处理一条之前重新看一眼队列：
+        有**比当前这条更新**、且这轮还没碰过的人，就把他换到最前面先做。
+
+        换下来的那条不丢，排到队尾，本轮照样会处理到（总数不变）。
+
+        代价：每条一次 DB 查询（毫秒级）。
+        换来的是：热线索几分钟内被触达，而不是等一整轮。
+        """
+        o = self.cfg.outreach
+        try:
+            fresh = self.st.pending_leads(
+                intent_levels=list(o.intent_levels or []),
+                stores=list(o.stores or []),
+                min_score=float(getattr(o, "min_score", 0) or 0),
+                sort_by=str(o.sort_by or "recent"),
+            )
+        except Exception as e:
+            # ⚠ 这里不能静默：查询失败 = 插队功能整个失效，
+            # 而外面看起来一切正常（只是新线索没被提前）。
+            # 记一条日志，别让这种问题无声无息。
+            self.log(f"  ⚠️ 插队检查失败（不影响本轮继续）: {str(e)[:80]}")
+            return 0
+
+        current = picked[idx] if idx < len(picked) else {}
+        cur_hit = str(current.get("last_hit_at") or "")
+        in_batch = {str(ld.get("display_id") or "") for ld in picked}
+        dedupe_days = int(o.dedupe_days or 30)
+
+        for ld in fresh:
+            did = str(ld.get("display_id") or "")
+            if not did or did in in_batch:
+                continue
+            # 30 天内真的发出去过的不再打扰
+            try:
+                if self.st.recent_touch_days(did, dedupe_days):
+                    continue
+            except Exception:
+                pass
+            # 只提升「比当前这条更新」的——把老的换上来没意义
+            hit = str(ld.get("last_hit_at") or "")
+            if cur_hit and hit and hit <= cur_hit:
+                continue
+            # 换上去：**总数不变**（轮次上限不能被插队撑破）
+            # 插入到当前这条前面，被挤下来的顺延到本轮后面；
+            # 队尾那条本轮不做（它还是 pending，下轮会被重新挑中）。
+            picked.insert(idx, ld)
+            picked.pop()
+            self.log(
+                f"  ⏫ 新进来的线索插到前面：{did}　{ld.get('nickname') or ''}"
+            )
+            return 1
+        return 0
 
     def _post_with_human_help(self, dy: Douyin, aweme_id: str, text: str,
                               lead: dict) -> dict:

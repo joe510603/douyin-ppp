@@ -117,6 +117,75 @@ class FeishuNotifier:
         """发送交互式卡片"""
         return await self.send({"msg_type": "interactive", "card": card})
 
+    async def send_risk_card(
+        self,
+        title: str,
+        reason: str = "",
+        steps: str = "",
+        at_open_id: str = "",
+        who: str = "",
+    ) -> tuple[bool, str]:
+        """发一张「触达出事了」的告警卡片（红色 + @人）
+
+        为什么用卡片而不是纯文本
+        ----------------------
+        1. **群里会推**：飞书私聊会话**不产生手机推送**（实测消息发得出去，
+           但人在手机上根本不知道），群消息才会推。
+        2. **@ 人才是真提醒**：`<at user_id="ou_xxx">` 会触发飞书的强提醒
+           （红点 + 横幅），只发一条普通群消息很容易被刷过去。
+        3. 卡片有颜色和分区：红头 + 原因 + 怎么办，一眼能看清发生了什么。
+
+        Args:
+            title: 卡片标题（已经带好 emoji）
+            reason: 触发原因（平台的原话）
+            steps: 怎么办（分步文字）
+            at_open_id: 要 @ 的人的 open_id，留空就不 @
+            who: 卡在哪条线索上（可选）
+        """
+        if not self.is_configured:
+            return False, "未配置飞书 webhook"
+
+        elements: list[dict] = []
+        head = []
+        if who:
+            head.append(f"**卡在**：{who}")
+        if reason:
+            head.append(f"**原因**：{reason}")
+        if head:
+            elements.append({
+                "tag": "div",
+                "text": {"tag": "lark_md", "content": "\n".join(head)},
+            })
+        if steps:
+            elements.append({
+                "tag": "div",
+                "text": {"tag": "lark_md", "content": f"**怎么办**\n{steps}"},
+            })
+
+        # @ 人放在最后一行：飞书的强提醒是跟 @ 绑定的
+        if at_open_id:
+            elements.append({"tag": "hr"})
+            elements.append({
+                "tag": "div",
+                "text": {
+                    "tag": "lark_md",
+                    "content": f'<at user_id="{at_open_id}">请处理</at> '
+                               f"—— 触达已经停下来了，等你验证完再继续",
+                },
+            })
+
+        card = {
+            "config": {"wide_screen_mode": True},
+            "header": {
+                "template": "red",
+                "title": {"tag": "plain_text", "content": title},
+            },
+            "elements": elements or [
+                {"tag": "div", "text": {"tag": "lark_md", "content": "无内容"}}
+            ],
+        }
+        return await self.send_card(card)
+
     async def push_leads(
         self,
         leads: list[dict],

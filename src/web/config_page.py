@@ -465,6 +465,89 @@ def create_config_page():
 
         ui.button("保存飞书配置", on_click=save_notify_config).classes("btn-primary q-mt-md").props("unelevated icon=save")
 
+        # ---- 触达告警：飞书群机器人 ----
+        with ui.expansion("触达告警（撞验证时 @你）", value=False).props("dense").classes("w-full q-mt-md"):
+            ui.label(
+                "触达撞上「本人操作验证」或登录失效时，往群里发一张红卡片并 @你，"
+                "手机上会强提醒。\n"
+                "获取 Webhook：飞书群 → 设置 → 群机器人 → 添加机器人 → 自定义机器人 "
+                "→ 复制 Webhook 地址。开了「签名校验」就把密钥一起填进来。\n"
+                "⚠ 为什么不用私聊：飞书私聊会话**不产生推送**（实测消息确实发得出去，"
+                "但手机上没提示，人根本不知道）；群消息才会推，@ 人还会触发强提醒。"
+            ).style("font-size: 12px; color: var(--color-text-tertiary); margin-bottom: 12px; line-height: 1.6;")
+
+            risk_enabled_switch = ui.switch(
+                "启用触达告警", value=config.notify.risk_webhook_enabled
+            ).classes("q-mb-md")
+
+            with ui.row().classes("w-full items-end q-col-gutter-sm"):
+                risk_webhook = ui.input(
+                    "群机器人 Webhook",
+                    value=config.notify.risk_webhook_url,
+                    placeholder="https://open.feishu.cn/open-apis/bot/v2/hook/xxxxxxxx",
+                ).props("dense outlined").classes("col-12 col-sm-6 app-input")
+
+                risk_secret = ui.input(
+                    "签名密钥（可选）",
+                    value=config.notify.risk_webhook_secret,
+                    password=True,
+                ).props("dense outlined").classes("col-12 col-sm-3 app-input")
+
+                risk_at = ui.input(
+                    "@谁的 open_id（可留空）",
+                    value=config.notify.risk_at_open_id,
+                    placeholder="留空就只发卡片不 @ 人",
+                ).props("dense outlined").classes("col-12 col-sm-3 app-input")
+
+            def save_risk_config():
+                config.notify.risk_webhook_enabled = bool(risk_enabled_switch.value)
+                config.notify.risk_webhook_url = (risk_webhook.value or "").strip()
+                config.notify.risk_webhook_secret = (risk_secret.value or "").strip()
+                config.notify.risk_at_open_id = (risk_at.value or "").strip()
+                try:
+                    save_config(config)
+                    reload_config()
+                    ui.notify("触达告警配置已保存", type="positive")
+                except Exception as e:
+                    ui.notify(f"保存失败: {e}", type="negative")
+
+            async def test_risk_alert():
+                """往群里发一张测试卡片，确认通道真的通"""
+                url = (risk_webhook.value or "").strip()
+                if not url:
+                    ui.notify("先把群机器人 Webhook 填上", type="warning")
+                    return
+                # 先存再发：**测通的地址必须和存进去的是同一个**，
+                # 否则会出现「测试过了，真出事时却发不出去」。
+                save_risk_config()
+                try:
+                    from ..notify.feishu import FeishuNotifier
+
+                    n = FeishuNotifier(
+                        webhook_url=url,
+                        secret=(risk_secret.value or "").strip(),
+                    )
+                    ok, err = await n.send_risk_card(
+                        title="✅ 触达告警通道测试",
+                        reason="这是一条测试消息，看到即表示通道正常。",
+                        steps="真正出问题时，这里会写清楚要怎么处理。",
+                        at_open_id=(risk_at.value or "").strip(),
+                    )
+                except Exception as e:
+                    ok, err = False, str(e)
+                if ok:
+                    ui.notify("测试卡片已发出，去群里看看", type="positive")
+                else:
+                    ui.notify(f"发送失败: {err}", type="negative")
+
+            with ui.row().classes("w-full items-center q-gutter-sm q-mt-md"):
+                ui.button(
+                    "保存触达告警配置", on_click=save_risk_config
+                ).classes("btn-primary").props("unelevated icon=save")
+                ui.button(
+                    "发个测试卡片", on_click=test_risk_alert
+                ).props("dense outlined").classes("btn-secondary")
+
         # ---- 多维表格（线索表）----
         with ui.expansion("多维表格（线索清单）", value=False).props("dense").classes("w-full q-mt-md"):
             ui.label(
