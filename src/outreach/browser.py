@@ -14,11 +14,28 @@ from typing import Any
 
 from playwright.sync_api import BrowserContext, Page, sync_playwright
 
-# 抹掉最明显的自动化特征。不是「反检测黑科技」，只是别一进门就自报家门。
+from ..utils import browser_identity
+
+# 抹掉最明显的自动化特征。
+#
+# ⚠ 这里只做「减法」，不做「加法」——
+# 之前有三行覆盖，反而制造了比不做更糟的破绽（2026-11-12 实测）：
+#
+#   navigator.plugins → [1,2,3,4,5]
+#     真 Chrome/Edge 的 plugins 是 PluginArray，plugins[0].name == "PDF Viewer"；
+#     换成普通数组后 plugins[0].name 变 undefined、
+#     `navigator.plugins instanceof PluginArray` 变 **false**。
+#     而系统 Edge 天然就有 5 个真插件——这行纯属自己制造破绽。
+#
+#   navigator.webdriver → undefined
+#     启动参数 ``--disable-blink-features=AutomationControlled`` 已经让它
+#     变成 false（真人浏览器的值）；再覆盖成 undefined 反而落在
+#     「既不是 true 也不是 false」的怪区间。
+#
+# 只留 languages 这一行：它和 navigator.language、Intl 的 locale 是自洽的，
+# 看着像中文用户，不会自相矛盾。
 _STEALTH = """
-Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
 Object.defineProperty(navigator, 'languages', {get: () => ['zh-CN', 'zh', 'en']});
-Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
 window.chrome = window.chrome || {runtime: {}};
 """
 
@@ -57,8 +74,16 @@ _MUTE_AUDIO = """
 })();
 """
 
-_UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
-       "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
+# ⚠ 这里**故意不覆盖** User-Agent。
+#
+# 以前写死了一句 "Chrome/131"，而真正跑的引擎是 Chromium 153 —— 差 22 个版本。
+# 更要命的是 Playwright 的 user_agent= 参数**只改字符串、不改 Client Hints**：
+#   navigator.userAgent              → Chrome/131.0.0.0   （我们编的）
+#   navigator.userAgentData.brands  → Chromium/153        （浏览器老实说的）
+# 两个版本号能在同一个页面里被当场对撞。抖音读一下就知道你在编。
+#
+# 所以：让浏览器自己如实报，一个字都别改。
+# 代价是 UA 里会出现真实版本号（甚至 Edg/xxx）——那才是真的。
 
 _ARGS = [
     "--disable-blink-features=AutomationControlled",
@@ -178,6 +203,10 @@ def _chrome_app_name(pw: Any) -> str:
 
     例：.../chrome-mac/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing
     → "Google Chrome for Testing"
+
+    ⚠ 只在没有系统浏览器（退回自带 Chromium）时用得上。
+    用了 channel 之后 executable_path 指向的**仍然是自带的 Chromium**，
+    拿它推 app 名会推错——那种情况要用 browser_identity.app_name_for()。
     """
     try:
         exe = pathlib.Path(pw.chromium.executable_path)
@@ -186,7 +215,7 @@ def _chrome_app_name(pw: Any) -> str:
                 return part[:-4]
     except Exception:
         pass
-    return "Google Chrome"
+    return browser_identity.BUNDLED_APP_NAME
 
 
 def _get_window_bounds(ctx: Any, page: Any) -> dict:
@@ -309,7 +338,8 @@ def bring_to_front(ctx: Any, page: Any, app_name: str = "") -> bool:
             pass
 
     # 再把整个 app 叫到前台（macOS 上窗口在前台 app 里才是真的「置前」）
-    for name in (app_name, "Google Chrome for Testing", "Google Chrome", "Chromium"):
+    for name in (app_name, "Microsoft Edge", "Google Chrome",
+                 "Google Chrome for Testing", "Chromium"):
         if not name:
             continue
         if activate_app(name):
@@ -338,8 +368,32 @@ class Browser:
         self._pw: Any = None
         self.ctx: BrowserContext | None = None
         self.page: Page | None = None
+        # 用哪个浏览器启动的（"" = Playwright 自带的 Chromium）
+        self.channel: str = ""
         # macOS 上这个浏览器的 app 名（撞验证码时要用它把窗口叫到前台）
         self.app_name: str = ""
+
+    def _launch(self) -> BrowserContext:
+        """真正启动浏览器的那个调用
+
+        ⚠ 注意这里**没有** user_agent 参数：
+        浏览器说什么就是什么，别替它编（理由见文件顶部那段注释）。
+        """
+        extra = {}
+        if self.channel:
+            extra["channel"] = self.channel
+        return self._pw.chromium.launch_persistent_context(
+            str(self.profile_dir),
+            headless=self.headless,
+            slow_mo=self.slow_mo,
+            args=_ARGS + (_OFFSCREEN if self.offscreen else []),
+            ignore_default_args=["--enable-automation", "--no-sandbox"],
+            viewport={"width": 1440, "height": 900},
+            locale="zh-CN",
+            timezone_id="Asia/Shanghai",
+            accept_downloads=False,
+            **extra,
+        )
 
     def __enter__(self) -> tuple[BrowserContext, Page]:
         # 启动浏览器会把前台抢走（实测：Edge → Google Chrome for Testing，
@@ -351,19 +405,18 @@ class Browser:
         prev_front = frontmost_app() if self.window_mode != "visible" else ""
 
         self._pw = sync_playwright().start()
-        self.ctx = self._pw.chromium.launch_persistent_context(
-            str(self.profile_dir),
-            headless=self.headless,
-            slow_mo=self.slow_mo,
-            args=_ARGS + (_OFFSCREEN if self.offscreen else []),
-            ignore_default_args=["--enable-automation", "--no-sandbox"],
-            user_agent=_UA,
-            viewport={"width": 1440, "height": 900},
-            locale="zh-CN",
-            timezone_id="Asia/Shanghai",
-            accept_downloads=False,
-        )
-        self.app_name = _chrome_app_name(self._pw)
+        # 用系统里装好的真浏览器（Edge / Chrome），别用 Playwright 自带的
+        # "Google Chrome for Testing"——那是非官方构建，指纹跟真人差一截，
+        # 而且它的 userAgentData.brands 里连 "Google Chrome" 这一项都没有。
+        self.channel, self.app_name = browser_identity.pick()
+        try:
+            self.ctx = self._launch()
+        except Exception:
+            # 系统浏览器起不来（装在奇怪的位置、版本太老……）→ 退回自带的 Chromium。
+            # 宁可指纹弱一点，也不能整个触达跑不起来。
+            self.channel = ""
+            self.ctx = self._launch()
+            self.app_name = _chrome_app_name(self._pw)
         self.ctx.add_init_script(_STEALTH)
         # 静音是默认行为：触达要打开作品看评论区，抖音会直接放视频带声音。
         self.ctx.add_init_script(_MUTE_AUDIO)
