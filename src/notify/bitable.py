@@ -470,6 +470,37 @@ class BitableWriter:
             return False, f"code={data.get('code')} msg={data.get('msg')}"
         return True, ""
 
+    async def _fetch_all_items(self) -> list[dict]:
+        """翻页拉全表记录
+
+        为什么必须翻页：`records` 接口单次最多 500 条，不带 page_token
+        就只拿得到第一页。表里的线索已经超过这个数了，
+        只拉一页 = 去重失效（建重复行）+ 状态回流失效。
+        """
+        url = (f"{_API_BASE}/bitable/v1/apps/{self.app_token}"
+               f"/tables/{self.table_id}/records")
+        out: list[dict] = []
+        page_token = ""
+        try:
+            async with httpx.AsyncClient(timeout=self.timeout) as client:
+                headers = await self._headers()
+                while True:
+                    params: dict = {"page_size": 500}
+                    if page_token:
+                        params["page_token"] = page_token
+                    resp = await client.get(url, headers=headers, params=params)
+                    data = resp.json()
+                    if data.get("code") != 0:
+                        break
+                    d = data.get("data") or {}
+                    out.extend(d.get("items") or [])
+                    page_token = d.get("page_token") or ""
+                    if not d.get("has_more") or not page_token:
+                        break
+        except Exception:
+            pass
+        return out
+
     async def search_by_douyin_id(self, douyin_id: str) -> Optional[str]:
         """
         按抖音号查已有记录的 record_id（用于去重）。
@@ -480,23 +511,7 @@ class BitableWriter:
         if not self.is_configured or not douyin_id:
             return None
 
-        url = (f"{_API_BASE}/bitable/v1/apps/{self.app_token}"
-               f"/tables/{self.table_id}/records")
-        try:
-            async with httpx.AsyncClient(timeout=self.timeout) as client:
-                resp = await client.get(
-                    url,
-                    headers=await self._headers(),
-                    params={"page_size": 500},
-                )
-                data = resp.json()
-        except Exception:
-            return None
-
-        if data.get("code") != 0:
-            return None
-
-        for item in (data.get("data") or {}).get("items") or []:
+        for item in await self._fetch_all_items():
             fields = item.get("fields") or {}
             value = fields.get("抖音号")
             if isinstance(value, list):
@@ -514,23 +529,7 @@ class BitableWriter:
         if not self.is_configured:
             return out
 
-        url = (f"{_API_BASE}/bitable/v1/apps/{self.app_token}"
-               f"/tables/{self.table_id}/records")
-        try:
-            async with httpx.AsyncClient(timeout=self.timeout) as client:
-                resp = await client.get(
-                    url,
-                    headers=await self._headers(),
-                    params={"page_size": 500},
-                )
-                data = resp.json()
-        except Exception:
-            return out
-
-        if data.get("code") != 0:
-            return out
-
-        for item in (data.get("data") or {}).get("items") or []:
+        for item in await self._fetch_all_items():
             fields = item.get("fields") or {}
             dy = _cell_text(fields.get("抖音号"))
             if not dy:
@@ -872,33 +871,75 @@ class LarkCliBitableWriter:
         except Exception as e:
             return False, str(e)
 
-    async def _fetch_douyin_map(self) -> dict[str, str]:
-        """拉一次全表，建立 抖音号 → record_id 映射（用于去重）"""
-        try:
-            data = await self._run([
+    # record-list 单次最多 200 条（json 格式）。
+    # 表里的线索早就超过这个数了（2026-11-12 实测 386 条），
+    # 所以「拉一页就当全表」这个假设已经不成立。
+    _PAGE_SIZE = 200
+
+    async def _record_list_paged(
+        self,
+        field_ids: Optional[list[str]] = None,
+        page_size: int = 200,
+        max_pages: int = 50,
+    ) -> tuple[list[str], list[str], list[list]]:
+        """翻页拉全表记录，返回 (字段名, record_id 列表, 行数据)
+
+        为什么必须翻页
+        --------------
+        以前只拉第一页（200 条）就当「全表」用了，后果有两处，
+        而且**都是静默失效**——不报错，只是有一半数据看不见：
+
+        1. 去重只看得到前 200 条 → 后一半的抖音号查不到 record_id
+           → **建出重复行**（2026-11-12 实测表里已经有 6 条重复）
+        2. 回拉销售改的「处理状态」同样只看得到前 200 条
+           → 后一半线索的状态同步不回来
+           （多机共用一张飞书表、靠回拉互相同步，这个断了就等于两台机器各跑各的）
+
+        注意 `has_more` 才是权威的翻页依据，不能靠「这页返回条数 < limit」来猜：
+        服务端在某些条件下会少给几行，猜错了就会漏记录。
+        """
+        names: list[str] = []
+        ids: list[str] = []
+        rows: list[list] = []
+        offset = 0
+        for _ in range(max_pages):
+            args = [
                 "base", "+record-list",
                 "--base-token", self.app_token,
                 "--table-id", self.table_id,
-                "--limit", "200",
-            ])
-        except Exception as e:
-            log.warning(f"[多维表格] 读取现有记录失败: {e}")
-            return {}
+                "--limit", str(page_size),
+                "--offset", str(offset),
+            ]
+            for f in (field_ids or []):
+                args += ["--field-id", f]
+            try:
+                data = await self._run(args)
+            except Exception as e:
+                log.warning(f"[多维表格] 读取记录失败（offset={offset}）: {e}")
+                break
+            d = data.get("data") or {}
+            if not names:
+                names = d.get("fields") or []
+            batch_ids = d.get("record_id_list") or []
+            batch_rows = d.get("data") or []
+            ids.extend(batch_ids)
+            rows.extend(batch_rows)
+            if not d.get("has_more") or not batch_rows:
+                break
+            offset += len(batch_rows)
+        return names, ids, rows
 
-        d = data.get("data") or {}
-        names = d.get("fields") or []
-        ids = d.get("record_id_list") or []
-        rows = d.get("data") or []
+    async def _fetch_douyin_map(self) -> dict[str, str]:
+        """拉一次全表，建立 抖音号 → record_id 映射（用于去重）
+
+        ⚠ 必须翻页拉全表：只拉第一页的话，表里后一半的抖音号查不到
+        record_id → 会建出重复行（实测已经出现 6 条重复）。
+        """
+        names, ids, rows = await self._record_list_paged(["抖音号"])
         try:
             di = names.index("抖音号")
         except ValueError:
             return {}
-
-        if len(ids) >= 200:
-            log.warning(
-                f"[多维表格] 记录数已达 {len(ids)} 条，接近 record-list 单次上限，"
-                "超出部分的去重可能失效"
-            )
 
         out: dict[str, str] = {}
         for rid, row in zip(ids, rows):
@@ -921,27 +962,15 @@ class LarkCliBitableWriter:
         用来把销售在飞书表里手动改的状态回流到本地。
         只读 3 个字段（抖音号 / 处理状态 / 触达状态），减少传输量。
 
+        ⚠ 必须翻页拉全表：只拉第一页的话，表里后一半的线索状态永远
+        拉不回来——多机共用一张飞书表就靠这个对齐，拉不全等于两台机器各跑各的。
+
         Returns:
             {抖音号: {"处理状态": "已跟进", "触达状态": "已留言"}}
         """
         out: dict[str, dict] = {}
-        try:
-            data = await self._run([
-                "base", "+record-list",
-                "--base-token", self.app_token,
-                "--table-id", self.table_id,
-                "--field-id", "抖音号",
-                "--field-id", "处理状态",
-                "--field-id", "触达状态",
-                "--limit", "200",
-            ])
-        except Exception as e:
-            log.warning(f"[多维表格] 读取状态失败: {e}")
-            return out
-
-        d = data.get("data") or {}
-        names = d.get("fields") or []
-        rows = d.get("data") or []
+        names, _ids, rows = await self._record_list_paged(
+            ["抖音号", "处理状态", "触达状态"])
         try:
             i_dy = names.index("抖音号")
         except ValueError:

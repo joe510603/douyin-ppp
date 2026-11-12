@@ -299,6 +299,134 @@ def test_cli_writer_parses_record_list():
     assert asyncio.run(w.search_by_douyin_id("nope")) is None
 
 
+# ============================================================
+# 翻页：表里超过 200 条时，只拉第一页就是「静默失效」
+# ============================================================
+
+def _paged_cli_writer(pages: list[dict]) -> tuple[LarkCliBitableWriter, list[int]]:
+    """造一个分页假后端，返回 (writer, 记录下来的 offset 列表)"""
+    w = _cli_writer()
+    seen_offsets: list[int] = []
+
+    async def fake_run(args, payload=None):
+        assert args[1] == "+record-list"
+        offset = int(args[args.index("--offset") + 1])
+        seen_offsets.append(offset)
+        # 每次请求返回下一页（模拟服务端按 offset 切片）
+        idx = min(len(seen_offsets) - 1, len(pages) - 1)
+        return pages[idx]
+
+    w._run = fake_run
+    return w, seen_offsets
+
+
+def test_cli_writer_paginates_until_no_more():
+    """超过单页上限时必须继续往后拉，不能停在第一页"""
+    page1 = {
+        "data": {
+            "fields": ["抖音号"],
+            "record_id_list": ["rec1"],
+            "data": [["dy001"]],
+            "has_more": True,
+        }
+    }
+    page2 = {
+        "data": {
+            "fields": ["抖音号"],
+            "record_id_list": ["rec2"],
+            "data": [["dy002"]],
+            "has_more": False,
+        }
+    }
+    w, offsets = _paged_cli_writer([page1, page2])
+    rid = asyncio.run(w.search_by_douyin_id("dy002"))
+    assert rid == "rec2", "第二页的抖音号也必须能被查到（否则去重失效→建重复行）"
+    # offset 必须往后推（跳过已经拿到的那些行），否则会重复拉同一页
+    assert offsets == [0, 1], f"应按页偏移继续翻，实际 {offsets}"
+
+
+def test_cli_writer_status_map_covers_all_pages():
+    """回拉状态要覆盖整张表——多机共用一张飞书表靠这个对齐"""
+    page1 = {
+        "data": {
+            "fields": ["抖音号", "处理状态", "触达状态"],
+            "record_id_list": ["rec1"],
+            "data": [["dy001", "已跟进", "已留言"]],
+            "has_more": True,
+        }
+    }
+    page2 = {
+        "data": {
+            "fields": ["抖音号", "处理状态", "触达状态"],
+            "record_id_list": ["rec2"],
+            "data": [["dy002", "待处理", "已留言"]],
+            "has_more": False,
+        }
+    }
+    w, _ = _paged_cli_writer([page1, page2])
+    m = asyncio.run(w.fetch_status_map())
+    assert set(m) == {"dy001", "dy002"}, f"整表都该拉到，实际 {set(m)}"
+    assert m["dy002"]["触达状态"] == "已留言"
+
+
+def test_cli_writer_dedup_map_covers_all_pages():
+    """去重映射也要翻页，否则后半表的抖音号会被当成新线索重复建行"""
+    page1 = {
+        "data": {
+            "fields": ["抖音号"],
+            "record_id_list": ["rec1"],
+            "data": [["dy001"]],
+            "has_more": True,
+        }
+    }
+    page2 = {
+        "data": {
+            "fields": ["抖音号"],
+            "record_id_list": ["rec9"],
+            "data": [["dy009"]],
+            "has_more": False,
+        }
+    }
+    w, _ = _paged_cli_writer([page1, page2])
+    m = asyncio.run(w._fetch_douyin_map())
+    assert m.get("dy009") == "rec9"
+
+
+def test_bitable_writer_paginates_with_page_token():
+    """app 凭据通道也要翻页：单次 500 条不够一张表的量"""
+    pages = [
+        {"code": 0, "data": {
+            "items": [{"fields": {"抖音号": "dy001", "处理状态": "已跟进",
+                                  "触达状态": "已留言"}}],
+            "page_token": "pt2", "has_more": True,
+        }},
+        {"code": 0, "data": {
+            "items": [{"fields": {"抖音号": "dy002", "处理状态": "待处理",
+                                  "触达状态": "已留言"}}],
+            "page_token": "", "has_more": False,
+        }},
+    ]
+    seen_tokens: list[str] = []
+
+    class _PagedClient(_FakeClient):
+        async def get(self, url, headers=None, params=None, **kwargs):
+            tok = (params or {}).get("page_token", "")
+            seen_tokens.append(tok)
+            return _FakeResponse(pages[len(seen_tokens) - 1])
+
+    import src.notify.bitable as _bt
+    orig = _bt.httpx.AsyncClient
+    _bt.httpx.AsyncClient = _PagedClient
+    try:
+        w = _writer()
+        m = asyncio.run(w.fetch_status_map())
+    finally:
+        _bt.httpx.AsyncClient = orig
+
+    assert set(m) == {"dy001", "dy002"}, f"整表都该拉到，实际 {set(m)}"
+    assert seen_tokens == ["", "pt2"], f"应带 page_token 翻第二页，实际 {seen_tokens}"
+
+
 def test_cli_writer_sync_updates_existing():
     """已存在的抖音号走批量 update，不新建"""
     w = _cli_writer()
