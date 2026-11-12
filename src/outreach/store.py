@@ -58,6 +58,42 @@ CREATE_OUTREACH_RUNS_INDEXES_SQL = [
     "CREATE INDEX IF NOT EXISTS idx_outreach_runs_started ON outreach_runs(started_at);",
 ]
 
+# 触达执行明细（每条留言一行，成功失败都记，用于去重和复盘）
+#
+# 跟 outreach_runs 一样放在 store.py：这个表是**触达线程**写的，
+# 表归它管才合理。放在 db_storage.py 的话，
+# 触达线程必须等主进程 init_db 跑完才能用（"no such table"）。
+CREATE_TABLE_OUTREACH_RECORDS_SQL = """
+
+CREATE TABLE IF NOT EXISTS outreach_records (
+    id TEXT PRIMARY KEY,
+    lead_id INTEGER DEFAULT NULL,
+    display_id TEXT DEFAULT '',
+    nickname TEXT DEFAULT '',
+    target_url TEXT DEFAULT '',
+    message TEXT DEFAULT '',
+    status TEXT DEFAULT 'pending',
+    error TEXT DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
+    -- ---- 触达执行明细（v2.0.11 接入自动触达时补）----
+    record_id TEXT DEFAULT '',     -- 飞书多维表格的 record_id（回写触达状态用）
+    sec_uid TEXT DEFAULT '',       -- 抖音定位到的用户 ID
+    aweme_id TEXT DEFAULT '',      -- 留言的作品 ID
+    aweme_desc TEXT DEFAULT '',    -- 作品文案（复盘用）
+    template_id TEXT DEFAULT '',   -- 用的哪条话术模板
+    channel TEXT DEFAULT 'comment',-- comment / dm
+    verified INTEGER DEFAULT 0     -- 1=回查确认评论真的在页面上
+);
+"""
+
+CREATE_OUTREACH_RECORDS_INDEXES_SQL = [
+    "CREATE INDEX IF NOT EXISTS idx_outreach_status ON outreach_records(status);",
+    "CREATE INDEX IF NOT EXISTS idx_outreach_lead ON outreach_records(lead_id);",
+    "CREATE INDEX IF NOT EXISTS idx_outreach_created ON outreach_records(created_at);",
+    "CREATE INDEX IF NOT EXISTS idx_outreach_display ON outreach_records(display_id);",
+]
+
 
 class OutreachStore:
     """触达任务的本地存储"""
@@ -86,12 +122,35 @@ class OutreachStore:
             self._conn.executescript(CREATE_TABLE_OUTREACH_RUNS_SQL)
             for sql in CREATE_OUTREACH_RUNS_INDEXES_SQL:
                 self._conn.execute(sql)
+            # 明细表也自己建——触达线程不该依赖主进程先 init_db
+            self._conn.executescript(CREATE_TABLE_OUTREACH_RECORDS_SQL)
+            for sql in CREATE_OUTREACH_RECORDS_INDEXES_SQL:
+                self._conn.execute(sql)
             cols = {r[1] for r in
                     self._conn.execute("PRAGMA table_info(outreach_runs)")}
             if "kind" not in cols:
                 self._conn.execute(
                     "ALTER TABLE outreach_runs ADD COLUMN kind TEXT DEFAULT ''"
                 )
+            # 明细表的补列（v2.0.11 之后陆续加的）
+            rec_cols = {r[1] for r in
+                        self._conn.execute("PRAGMA table_info(outreach_records)")}
+            for col, ddl2 in (
+                ("record_id", "TEXT DEFAULT ''"),
+                ("sec_uid", "TEXT DEFAULT ''"),
+                ("aweme_id", "TEXT DEFAULT ''"),
+                ("aweme_desc", "TEXT DEFAULT ''"),
+                ("template_id", "TEXT DEFAULT ''"),
+                ("channel", "TEXT DEFAULT 'comment'"),
+                ("verified", "INTEGER DEFAULT 0"),
+            ):
+                if col not in rec_cols:
+                    try:
+                        self._conn.execute(
+                            f"ALTER TABLE outreach_records ADD COLUMN {col} {ddl2}"
+                        )
+                    except sqlite3.OperationalError:
+                        pass
             self._conn.commit()
         except sqlite3.OperationalError:
             # 表被别的进程锁着 / 已经有别的结构 → 交给上层报错，别在这里崩

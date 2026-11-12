@@ -231,6 +231,12 @@ class OutreachConfig(BaseModel):
     comments_per_user: int = 1
     # 连续失败多少次自动停止本轮任务
     fail_stop_threshold: int = 3
+    # 连续多少条都「搜不到人」就停手（多半是搜索坏了，不是这些人都失效）
+    #
+    # 注意：单条搜不到人**不算**异常，不计入 fail_stop_threshold。
+    # 这里的阈值是另一回事——防的是「抖音改版了 / 搜索被限」导致每条都搜不到，
+    # 那时候继续跑就是纯空转。
+    not_found_stop_threshold: int = 5
     # 浏览器操作超时（秒）
     timeout: int = 30
 

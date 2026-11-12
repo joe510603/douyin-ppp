@@ -5,6 +5,60 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.28] - 2026-11-12
+
+### Fixed
+- **「搜不到人」被当成异常，3 条就把整轮掐断**（用户反馈
+  「连续没搜到人，这个不应该作为连续 3 次异常，主动停手（防止把号跑废）吧？
+  不要随便停下，效率太低了」）。
+
+  之前「没搜到这个人」抛的是普通 `DouyinError`，落进「连续异常」计数 →
+  3 条就触发「连续 3 次异常，主动停手」。
+
+  但搜不到人本来就是**大量存在的正常情况**——线索池里很多抖音号早就改名、
+  注销、被平台隐藏了。拿正常数据当异常，等于因为坏数据把整轮掐断，效率极低。
+
+  修法：
+
+  1. 新增 `LeadNotFound` 异常（专表「这个人搜不到」）。
+     它**不计入** `consecutive_errors`，所以不会触发异常停手。
+  2. 搜不到人的线索记成 **skipped**（不是 failed），summary 里单独给
+     `not_found` 计数，页面上也单列显示——
+     让人一眼看出「这些号失效了」，而不是「系统出错了」。
+  3. **但保留一道保护**：如果**连续** N 条（默认 5，可配
+     `outreach.not_found_stop_threshold`）全都搜不到人，
+     那多半是搜索出问题了（接口改版 / 被限流），不是这些人都恰好失效——
+     这时候继续跑纯属空转，主动停手并说明原因。
+  4. 搜到人（哪怕后续没作品、发送失败）→ 计数清零。
+
+  真异常（网络断了、页面打不开）照样按 `fail_stop_threshold` 停手——
+  该停还是要停，别把号跑废。
+
+### Fixed
+- **`outreach_records` 表也归触达线程自己管**。
+
+  这张表是触达线程写的，但建表 SQL 放在 `db_storage.py`（主进程那边），
+  触达线程必须等主进程 `init_db` 跑完才能用，否则
+  `no such table: outreach_records`。
+  现在建表 SQL 的所有权也收回到 `outreach/store.py`，两边共用同一份，
+  触达线程自己建表 + 补列。
+
+### Added
+- `scripts/reset_not_found_leads.py`：把被搜索故障误标的线索重置回「待触达」。
+
+  2026-11-11 23:05 修复搜索之前跑的每一轮，「搜不到人」都是**假的**，
+  那批线索被标成 failed 就不会再被触达了。
+  脚本按三个条件筛选（状态是 failed/skipped + note 含「没搜到这个人」+
+  该号没有成功留言记录），实测 19 条可以安全重置，已全部重置。
+
+### Testing
+- 测试 320（+7）
+- 新增用例：搜不到人不触发异常停手、记成 skipped 不是 failed、
+  连续全搜不到会停（防空转）、搜到一个计数清零、
+  真异常照样停、搜不到人不影响真异常计数
+
+---
+
 ## [2.0.27] - 2026-11-11
 
 ### Fixed

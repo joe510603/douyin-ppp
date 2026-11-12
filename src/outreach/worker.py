@@ -33,8 +33,8 @@ from typing import Callable, Optional
 from .browser import Browser, Session
 from .copywriter import Copywriter
 from .douyin_api import (
-    Douyin, DouyinError, KIND_LIMIT, KIND_LOGIN, KIND_VERIFY, NoWorks,
-    NotLoggedIn, RiskControl, VERIFY_TEXTS, normalize_kind,
+    Douyin, DouyinError, KIND_LIMIT, KIND_LOGIN, KIND_VERIFY, LeadNotFound,
+    NoWorks, NotLoggedIn, RiskControl, VERIFY_TEXTS, normalize_kind,
 )
 from .store import (
     STATUS_COMMENTED,
@@ -616,6 +616,7 @@ class OutreachWorker:
         summary = {
             "ok": True, "total": len(picked), "sent": 0, "failed": 0,
             "skipped": skipped, "dry": 0, "dry_run": dry, "stopped": "",
+            "not_found": 0,
         }
         if not picked:
             self.log("没有要处理的线索，结束")
@@ -623,8 +624,12 @@ class OutreachWorker:
 
         run_id = self.st.start_run(dry)
         consecutive_errors = 0
+        # 连续「搜不到人」的条数——用来区分「几个号失效了」和「搜索整体坏了」
+        consecutive_not_found = 0
         sent_in_run = 0
         max_err = int(o.fail_stop_threshold or 3)
+        # 连续这么多条都搜不到人，就该怀疑是搜索坏了而不是这些人都失效了
+        max_not_found = int(getattr(o, "not_found_stop_threshold", 5) or 5)
 
         profile = pathlib.Path(
             pathlib.Path(self.cfg.app.db_path).parent
@@ -670,6 +675,7 @@ class OutreachWorker:
                     try:
                         self._handle_one(dy, lead, summary)
                         consecutive_errors = 0
+                        consecutive_not_found = 0
                     except RiskControl as e:
                         # 优先用异常自带的类型（只有一套判据），
                         # 老异常没有 kind 时再退回关键词判断。
@@ -715,12 +721,49 @@ class OutreachWorker:
                         break
                     except NoWorks as e:
                         # 没作品是正常情况（大量普通用户），记账但不打断节奏
+                        # （搜到人了 → 搜索是通的，不算「搜不到」）
+                        consecutive_not_found = 0
                         summary["skipped"] += 1
                         self.log(f"  ⏭️ {e}")
                         self._set_status(lead, STATUS_SKIPPED, str(e))
                         self._emit(type="skipped", lead=lead, error=str(e))
+                    except LeadNotFound as e:
+                        # 这个人搜不到 —— **正常业务结果，不是故障**。
+                        #
+                        # 以前它抛的是普通 DouyinError，落进「连续异常」计数，
+                        # 3 条搜不到就停手。但线索池里大量抖音号本来就失效了
+                        # （改名/注销/被隐藏），拿正常数据当异常，
+                        # 等于因为坏数据把整轮掐断，效率极低。
+                        #
+                        # 所以这里**不计入** consecutive_errors，
+                        # 也不会触发「连续 N 次异常，主动停手」。
+                        consecutive_not_found += 1
+                        summary["not_found"] = summary.get("not_found", 0) + 1
+                        summary["skipped"] += 1
+                        self.log(f"  ⏭️ {e}")
+                        self._set_status(lead, STATUS_SKIPPED, str(e))
+                        self.st.add_touch(
+                            lead_id=lead["id"], record_id=lead.get("bitable_record_id") or "",
+                            display_id=lead["display_id"], nickname=lead.get("nickname") or "",
+                            status="skipped", error=str(e),
+                        )
+                        self._emit(type="skipped", lead=lead, error=str(e))
+                        # 但如果**连续**这么多条全都搜不到人，
+                        # 那多半是搜索出问题了（接口改版 / 被限流），
+                        # 不是这些人都恰好失效——这时候继续跑纯属空转。
+                        if consecutive_not_found >= max_not_found:
+                            self.stop_reason = (
+                                f"连续 {consecutive_not_found} 条都搜不到人，"
+                                f"多半是搜索出问题了（不是这些人都失效），主动停手"
+                            )
+                            self.log(f"🛑 {self.stop_reason}")
+                            self._emit(type="risk", lead=lead, error=self.stop_reason,
+                                       kind="limit")
+                            break
                     except DouyinError as e:
                         consecutive_errors += 1
+                        # 不是 LeadNotFound → 说明人找到了、搜索是通的
+                        consecutive_not_found = 0
                         summary["failed"] += 1
                         self.log(f"  ❌ {e}")
                         self._set_status(lead, STATUS_FAILED, str(e))
@@ -736,6 +779,7 @@ class OutreachWorker:
                             break
                     except Exception as e:
                         consecutive_errors += 1
+                        consecutive_not_found = 0
                         summary["failed"] += 1
                         self.log(f"  ❌ 未预期错误：{type(e).__name__}: {e}")
                         self._set_status(lead, STATUS_FAILED, f"{type(e).__name__}: {e}")
@@ -846,7 +890,7 @@ class OutreachWorker:
         info = dy.resolve(lead["display_id"], nickname=lead.get("nickname"))
         dy.check_risk()
         if not info:
-            raise DouyinError("没搜到这个人（抖音号可能已改名/注销/被平台隐藏）")
+            raise LeadNotFound("没搜到这个人（抖音号可能已改名/注销/被平台隐藏）")
 
         lead["nickname"] = info.get("nickname") or lead.get("nickname")
         lead["sec_uid"] = info.get("sec_uid")

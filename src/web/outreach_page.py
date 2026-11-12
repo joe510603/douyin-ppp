@@ -178,6 +178,7 @@ def create_outreach_page():
         dryn = result.get("dry", 0)
         failed = result.get("failed", 0)
         skipped = result.get("skipped", 0)
+        not_found = result.get("not_found", 0)
         stopped = result.get("stopped") or ""
 
         msg = (
@@ -185,6 +186,9 @@ def create_outreach_page():
             + (f"干跑 {dryn} 条　" if dryn else "")
             + f"已留言 {sent} 条　失败 {failed} 条　跳过 {skipped} 条"
         )
+        # 「搜不到人」单列出来——它不是失败，是这些抖音号本来就失效了
+        if not_found:
+            msg += f"（其中搜不到人 {not_found} 条）"
         if stopped:
             msg += f"　｜{stopped}"
         outreach_status.text = msg

@@ -10,6 +10,10 @@ from typing import Optional
 from ..config import get_config
 from ..models.comment import LiveComment, VideoComment, ScrapeTask, MessageType
 from ..models.lead import Lead, OutreachRecord, INTENT_LEVEL_ORDER
+from ..outreach.store import (
+    CREATE_OUTREACH_RECORDS_INDEXES_SQL,
+    CREATE_TABLE_OUTREACH_RECORDS_SQL,
+)
 from src.utils.logger import get_logger
 
 
@@ -165,36 +169,6 @@ CREATE_LEADS_INDEXES_SQL = [
     "CREATE INDEX IF NOT EXISTS idx_leads_score ON leads(intent_score);",
 ]
 
-CREATE_TABLE_OUTREACH_SQL = """
-CREATE TABLE IF NOT EXISTS outreach_records (
-    id TEXT PRIMARY KEY,
-    lead_id INTEGER DEFAULT NULL,
-    display_id TEXT DEFAULT '',
-    nickname TEXT DEFAULT '',
-    target_url TEXT DEFAULT '',
-    message TEXT DEFAULT '',
-    status TEXT DEFAULT 'pending',
-    error TEXT DEFAULT '',
-    created_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
-    updated_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime')),
-    -- ---- 触达执行明细（v2.0.11 接入自动触达时补）----
-    record_id TEXT DEFAULT '',     -- 飞书多维表格的 record_id（回写触达状态用）
-    sec_uid TEXT DEFAULT '',       -- 抖音定位到的用户 ID
-    aweme_id TEXT DEFAULT '',      -- 留言的作品 ID
-    aweme_desc TEXT DEFAULT '',    -- 作品文案（复盘用）
-    template_id TEXT DEFAULT '',   -- 用的哪条话术模板
-    channel TEXT DEFAULT 'comment',-- comment / dm
-    verified INTEGER DEFAULT 0     -- 1=回查确认评论真的在页面上
-);
-"""
-
-CREATE_OUTREACH_INDEXES_SQL = [
-    "CREATE INDEX IF NOT EXISTS idx_outreach_status ON outreach_records(status);",
-    "CREATE INDEX IF NOT EXISTS idx_outreach_lead ON outreach_records(lead_id);",
-    "CREATE INDEX IF NOT EXISTS idx_outreach_created ON outreach_records(created_at);",
-    "CREATE INDEX IF NOT EXISTS idx_outreach_display ON outreach_records(display_id);",
-]
-
 # 每轮触达任务的摘要（看板展示 + 排障）
 # ⚠️ 建表 SQL 的真相来源在 src/outreach/store.py ——
 # 这个表是触达线程写的，表归它管；store 那边还会自己补列（老库迁移）。
@@ -316,8 +290,8 @@ class DBStorage:
         await self._db.executescript(CREATE_TABLE_LEADS_SQL)
         for sql in CREATE_LEADS_INDEXES_SQL:
             await self._db.execute(sql)
-        await self._db.executescript(CREATE_TABLE_OUTREACH_SQL)
-        for sql in CREATE_OUTREACH_INDEXES_SQL:
+        await self._db.executescript(CREATE_TABLE_OUTREACH_RECORDS_SQL)
+        for sql in CREATE_OUTREACH_RECORDS_INDEXES_SQL:
             await self._db.execute(sql)
         # 迁移：老库补 source 字段（rule=规则判定 / llm=AI 判定）
         try:
