@@ -430,6 +430,8 @@ _FEISHU_STATUS_TO_LOCAL = {
     "待处理": "new",
     "已跟进": "contacted",
     "已忽略": "ignored",
+    # 销售拿到电话/微信了 → 终态，别再留言
+    "已留资": "converted",
 }
 _FEISHU_OUTREACH_TO_LOCAL = {
     "待触达": "pending",
@@ -438,6 +440,10 @@ _FEISHU_OUTREACH_TO_LOCAL = {
     "已留言": "commented",
     "失败": "failed",
     "已跳过": "skipped",
+    # 「这次没搜到」不是终态，等下轮重试
+    "搜不到": "not_found",
+    # 「已留资」→ 终态，不再进触达队列
+    "已留资": "converted",
 }
 
 
@@ -542,6 +548,18 @@ async def pull_bitable_status(db=None, config=None) -> dict:
         if new_outreach and new_outreach != r.get("outreach_status"):
             updates["outreach_status"] = new_outreach
 
+        # ---- 「已留资」两列必须一起生效 ----
+        #
+        # 销售在飞书表里把状态改成「已留资」（意思是已经拿到电话/微信了），
+        # 不管改的是「处理状态」还是「触达状态」那一列，
+        # 这个人就**不该再被留言**了 → 触达状态必须一起变成终态。
+        #
+        # 反过来也成立：只把处理状态改成「已留资」而触达状态还写着「待触达」，
+        # 这个人照样会被系统翻出来留言 —— 那是骚扰。
+        if new_status == "converted" or new_outreach == "converted":
+            updates["status"] = "converted"
+            updates["outreach_status"] = "converted"
+
         if not updates:
             skipped += 1
             continue
@@ -551,6 +569,17 @@ async def pull_bitable_status(db=None, config=None) -> dict:
         try:
             await db.update_lead(r["id"], **updates)
             updated += 1
+            # 「已留资」要把**两列**都写回飞书，
+            # 否则两列各说各话：本地是「已留资」、飞书还写着「待触达」，
+            # 下一轮回拉又会把本地的终态改回「待触达」。
+            if updates.get("outreach_status") == "converted":
+                try:
+                    await writer.patch_fields(
+                        r.get("bitable_record_id") or "",
+                        {"处理状态": "已留资", "触达状态": "已留资"},
+                    )
+                except Exception as e:
+                    log.warning(f"[多维表格] 写回「已留资」失败: {e}")
         except Exception:
             pass
 

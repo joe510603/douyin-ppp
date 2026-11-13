@@ -24,6 +24,8 @@ import uuid
 from datetime import datetime, timedelta
 from typing import Any, Optional
 
+from ..intelligence.contact_extractor import merge_contact
+
 # 触达状态 → leads.outreach_status 的取值
 STATUS_PENDING = "pending"
 STATUS_SEARCHING = "searching"
@@ -31,6 +33,23 @@ STATUS_FOUND = "found"
 STATUS_COMMENTED = "commented"
 STATUS_FAILED = "failed"
 STATUS_SKIPPED = "skipped"
+# 搜不到这个人 —— **可重试**，不是终态
+#
+# 为什么单独一个状态（2026-11-13）：
+#   抖音搜索一次只给 6~10 个人，目标常常在第 2、3 页；
+#   而且搜索结果是概率性的（同一个号 18:36 搜不到、18:50 搜得到）。
+#   所以「这一次没搜到」≠「这个人没了」。
+#   以前直接标 skipped（终态）→ 这条线索就永远不会再被触达，
+#   而用户抽查发现这些人**全都搜得到**（实测 4 个抽查 3 个能搜到）。
+#
+#   现在它留在队列里、排在一堆正常线索**后面**：
+#   正常线索先做，等队列见底了再回头重试这些。
+STATUS_NOT_FOUND = "not_found"
+# 已留资 —— 销售在飞书表里手动标的终态
+#
+# 拿到电话/微信的人就别再留言了（用户 2026-11-13 明确要求）。
+# 这是一个**终态**：不在待触达队列里，回拉认它、也不再把它改回 pending。
+STATUS_CONVERTED = "converted"
 
 
 # ================================================================
@@ -176,15 +195,22 @@ class OutreachStore:
 
         # leads 表归 db_storage 管，但触达线程不能干等主进程迁移完才敢用：
         # ``leads.sec_uid`` 是「已知抖音 sec_uid，跳过搜索」的依据，
+        # ``leads.contact_type`` / ``contact_value`` 是「联系方式」的落点，
         # 列没有的话 SELECT 直接报 no such column，整轮触达直接瘫。
         # 所以这里自己补一次（ALTER ADD COLUMN 是幂等的）。
         try:
             lead_cols = {r[1] for r in
                          self._conn.execute("PRAGMA table_info(leads)")}
-            if lead_cols and "sec_uid" not in lead_cols:
-                self._conn.execute(
-                    "ALTER TABLE leads ADD COLUMN sec_uid TEXT DEFAULT ''"
-                )
+            if lead_cols:
+                for col, ddl2 in (
+                    ("sec_uid", "TEXT DEFAULT ''"),
+                    ("contact_type", "TEXT DEFAULT ''"),
+                    ("contact_value", "TEXT DEFAULT ''"),
+                ):
+                    if col not in lead_cols:
+                        self._conn.execute(
+                            f"ALTER TABLE leads ADD COLUMN {col} {ddl2}"
+                        )
                 self._conn.commit()
         except sqlite3.OperationalError:
             pass
@@ -209,7 +235,7 @@ class OutreachStore:
         """取待触达的线索
 
         条件：
-        - outreach_status = pending
+        - outreach_status 是 pending **或** not_found（搜不到 → 可重试，排后面）
         - 有抖音号（display_id 不为空）——没号没法搜人
         - 意向等级 / 门店 / 意向分下限可过滤
 
@@ -221,14 +247,19 @@ class OutreachStore:
           一个人隔几天又在直播间问了一次，他其实是最"热乎"的，
           应该排在前面，不是被压到一堆老线索后面。
         - ``intent``：老的排序（高意向优先），留着方便对照/回退。
+
+        ⚠️ not_found 排在一堆 pending **后面**：
+          「这次没搜到」的线索要等正常线索做完了才回头重试，
+          否则它们会把每一轮的名额都占满。
         """
         sql = [
             "SELECT id, lead_key, display_id, nickname, car_model, store, ",
             "intent_level, intent_score, intent_reason, evidence, monitor_name, ",
-            "bitable_record_id, outreach_status, created_at, last_hit_at, sec_uid ",
-            "FROM leads WHERE outreach_status = ? AND display_id != ''"
+            "bitable_record_id, outreach_status, created_at, last_hit_at, ",
+            "contact_type, contact_value, sec_uid ",
+            "FROM leads WHERE outreach_status IN (?, ?) AND display_id != ''"
         ]
-        params: list[Any] = [STATUS_PENDING]
+        params: list[Any] = [STATUS_PENDING, STATUS_NOT_FOUND]
 
         if intent_levels:
             ph = ",".join("?" for _ in intent_levels)
@@ -247,8 +278,12 @@ class OutreachStore:
         else:
             # last_hit_at 为空的老数据（回填失败的那些）排到最后，
             # 用 created_at 兜底比较——格式统一过，字符串比较是安全的。
+            #
+            # ⚠ 前面的 CASE：pending 排前面，not_found（这次没搜到、
+            #   等下轮重试的）排后面 —— 别让它们把每轮名额占满。
             sql.append(
-                " ORDER BY COALESCE(NULLIF(last_hit_at, ''), created_at) DESC, "
+                " ORDER BY CASE outreach_status WHEN 'pending' THEN 0 ELSE 1 END, "
+                "COALESCE(NULLIF(last_hit_at, ''), created_at) DESC, "
                 "intent_score DESC, id DESC"
             )
         try:
@@ -316,6 +351,46 @@ class OutreachStore:
             [sec_uid, lead_id],
         )
         self._conn.commit()
+
+    def set_contact(
+        self,
+        lead_id: int,
+        contact_type: str,
+        contact_value: str,
+        prefer_new_same_type: bool = False,
+    ) -> tuple[bool, str, str]:
+        """把联系方式写回线索（**按类型合并**，不覆盖已有的同类）
+
+        返回 (是否真的改了, 合并后的 contact_type, 合并后的 contact_value)。
+        「是否真的改了」是给调用方决定要不要同步飞书用的 ——
+        没改还去写飞书就是白跑一次 lark-cli 子进程（实测 1.4 秒/次）。
+
+        ``prefer_new_same_type`` 默认 False（简介链路用）：
+        弹幕里说出来的联系方式是客户**当场**说的，比简介里那个更贴近这次问价，
+        所以简介只负责**补**没有的类型，不去覆盖弹幕已经有的。
+        """
+        contact_value = str(contact_value or "").strip()
+        if not contact_value:
+            return False, "", ""
+        row = self._conn.execute(
+            "SELECT contact_type, contact_value FROM leads WHERE id = ?", [lead_id]
+        ).fetchone()
+        if not row:
+            return False, "", ""
+        old_type = row["contact_type"] or ""
+        old_value = row["contact_value"] or ""
+        new_type, new_value = merge_contact(
+            old_type, old_value, contact_type, contact_value,
+            prefer_new_same_type=prefer_new_same_type,
+        )
+        if new_type == old_type and new_value == old_value:
+            return False, old_type, old_value
+        self._conn.execute(
+            "UPDATE leads SET contact_type = ?, contact_value = ? WHERE id = ?",
+            [new_type, new_value, lead_id],
+        )
+        self._conn.commit()
+        return True, new_type, new_value
 
     def cache_sec_uid_map(self, mapping: dict[str, str]) -> int:
         """批量缓存 sec_uid：一次搜索返回一页用户，顺手把它们都存下来

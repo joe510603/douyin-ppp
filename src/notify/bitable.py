@@ -69,6 +69,12 @@ LEAD_TABLE_FIELDS: list[dict] = [
         {"name": "待处理", "color_index": 4},
         {"name": "已跟进", "color_index": 0},
         {"name": "已忽略", "color_index": 3},
+        # ⚠「已留资」是**用户 2026-11-13 自己在飞书表里加的选项**
+        # （销售拿到电话/微信后手动标的状态）。
+        # 这里的定义只用于**新建表**；已存在的表不会被改
+        # （ensure_fields 只补建缺失字段，从不覆盖已有字段的选项）。
+        # 千万别把这个选项删掉 —— 删了销售就没法标「已留资」了。
+        {"name": "已留资", "color_index": 1},
     ]},
     {"name": "触达状态", "type": TYPE_SELECT, "options": [
         {"name": "待触达", "color_index": 4},
@@ -76,6 +82,11 @@ LEAD_TABLE_FIELDS: list[dict] = [
         {"name": "已定位", "color_index": 1},
         {"name": "已留言", "color_index": 2},
         {"name": "失败", "color_index": 3},
+        {"name": "已跳过", "color_index": 4},
+        # ⚠「已留资」= 用户手动标的终态（拿到电话/微信了）→ 不再留言
+        # ⚠「搜不到」= 这次没搜到（可重试，不是终态）
+        {"name": "已留资", "color_index": 1},
+        {"name": "搜不到", "color_index": 4},
     ]},
 ]
 
@@ -92,10 +103,15 @@ def _mask(text: str) -> str:
 # ============================================================
 
 LEVEL_LABELS = {"high": "高意向", "medium": "中意向", "low": "低意向"}
-STATUS_LABELS = {"new": "待处理", "pushed": "待处理", "contacted": "已跟进", "ignored": "已忽略"}
+STATUS_LABELS = {"new": "待处理", "pushed": "待处理", "contacted": "已跟进",
+                 "ignored": "已忽略", "converted": "已留资"}
 OUTREACH_LABELS = {
     "pending": "待触达", "searching": "搜索中", "found": "已定位",
     "commented": "已留言", "failed": "失败", "skipped": "已跳过",
+    # 「搜不到」不是终态（等下轮重试），要跟「已跳过」区分开
+    "not_found": "搜不到",
+    # 「已留资」= 销售已经拿到电话/微信了 → 终态，别再留言
+    "converted": "已留资",
 }
 
 # 门店名归一化：配置里同一个门店有多种写法
@@ -194,7 +210,7 @@ def _lead_to_fields(lead: dict, found_at: Any, skip_status: bool = False) -> dic
         "车型": lead.get("car_model") or "",
         "判定依据": (lead.get("intent_reason") or "")[:200],
         "来源直播间": lead.get("monitor_name") or lead.get("live_room") or "",
-        "弹幕原文": (evidence or "")[:500],
+        "弹幕原文": (evidence or "")[:1000],
     }
     # 门店：把门店名归一化（去掉「小米汽车」前缀和各种分隔符），
     # 让 14 个门店能按同一套名字筛选、分配给销售。
@@ -641,6 +657,12 @@ LEAD_TABLE_FIELDS_V3: list[dict] = [
         {"name": "待处理", "hue": "Gray", "lightness": "Lighter"},
         {"name": "已跟进", "hue": "Green", "lightness": "Light"},
         {"name": "已忽略", "hue": "Red", "lightness": "Lighter"},
+        # ⚠「已留资」是**用户 2026-11-13 自己在飞书表里加的选项**，
+        # 销售拿到电话/微信后手动标它。
+        # 这里只用于**新建表**；已有的表不会被改
+        # （ensure_fields 只补建缺失字段，从不覆盖已有字段的选项）。
+        # 别删 —— 删了销售就没法标「已留资」了。
+        {"name": "已留资", "hue": "Blue", "lightness": "Lighter"},
     ]},
     {"name": "触达状态", "type": "select", "multiple": False, "options": [
         {"name": "待触达", "hue": "Gray", "lightness": "Lighter"},
@@ -649,6 +671,10 @@ LEAD_TABLE_FIELDS_V3: list[dict] = [
         {"name": "已留言", "hue": "Green", "lightness": "Light"},
         {"name": "失败", "hue": "Red", "lightness": "Lighter"},
         {"name": "已跳过", "hue": "Gray", "lightness": "Lighter"},
+        # ⚠「已留资」= 用户手动标的终态（拿到电话/微信了）→ 不再留言
+        # ⚠「搜不到」= 这次没搜到（可重试，不是终态）
+        {"name": "已留资", "hue": "Blue", "lightness": "Lighter"},
+        {"name": "搜不到", "hue": "Gray", "lightness": "Lighter"},
     ]},
 ]
 

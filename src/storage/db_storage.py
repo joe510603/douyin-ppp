@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import aiosqlite
+import json
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
 from ..config import get_config
+from ..intelligence.contact_extractor import merge_contact
 from ..models.comment import LiveComment, VideoComment, ScrapeTask, MessageType
 from ..models.lead import Lead, OutreachRecord, INTENT_LEVEL_ORDER
 from ..outreach.store import (
@@ -23,6 +25,43 @@ log = get_logger("db_storage")
 def _intent_rank(level: str) -> int:
     """意向等级排序值，越大优先级越高"""
     return INTENT_LEVEL_ORDER.get(level, 0)
+
+
+def _merge_evidence(old_json: str, new_json: str, cap: int = 10) -> str:
+    """把老证据和新证据**合并**（去重、限长）
+
+    为什么以前要改
+    --------------
+    以前 upsert 更新时 ``evidence = ?`` 直接整个覆盖，
+    而写入方每次只带**当前这一条**弹幕
+    （``json.dumps([comment.content[:200]])``）。
+    结果就是：
+      · ``evidence_count`` 在累加（表里显示「5 条证据」）
+      · ``evidence`` 内容却**只剩最后一句**
+
+    用户看到的现象就是「同一个人说的内容只保留了一句」。
+
+    现在改成：老证据 + 新证据，去重后保留最近 ``cap`` 条。
+    （``evidence_count`` 仍然是累计总数，不受这里的截断影响。）
+    """
+    def _load(s: str) -> list[str]:
+        try:
+            v = json.loads(s or "[]")
+        except Exception:
+            return []
+        if isinstance(v, list):
+            return [str(x) for x in v if str(x).strip()]
+        # 老数据可能是裸字符串
+        return [str(v)] if str(v or "").strip() else []
+
+    out: list[str] = []
+    for item in _load(old_json) + _load(new_json):
+        item = item.strip()
+        if not item or item in out:
+            continue
+        out.append(item)
+    return json.dumps(out[-cap:], ensure_ascii=False)
+
 
 # SQL 语句常量
 CREATE_TABLE_LIVE_SQL = """
@@ -457,7 +496,7 @@ class DBStorage:
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         existing = await self._db.execute(
             "SELECT id, intent_level, intent_score, contact_type, contact_value, "
-            "evidence_count, comment_count FROM leads WHERE lead_key = ?",
+            "evidence_count, comment_count, evidence FROM leads WHERE lead_key = ?",
             [lead.lead_key],
         )
         row = await existing.fetchone()
@@ -511,11 +550,24 @@ class DBStorage:
             new_reason = lead.intent_reason or row["intent_reason"]
             new_model = lead.car_model or row["car_model"]
 
-        # 联系方式：有新的就覆盖，没有就保留旧的
-        if lead.contact_value:
-            new_contact_type, new_contact_value = lead.contact_type, lead.contact_value
-        else:
-            new_contact_type, new_contact_value = old_contact_type, old_contact_value
+        # 联系方式：按**类型**合并
+        #
+        # 为什么不能整体覆盖（2026-11-13）：
+        # 联系方式有两个来源 —— 弹幕原文、抖音主页简介。
+        # 整体覆盖会让「简介里的微信」被「弹幕里的电话」整条挤掉，
+        # 白白丢掉另一个渠道拿到的联系方式。
+        # 同类型取新的（弹幕是实时说的，更准），不同类型追加（两个都留着）。
+        new_contact_type, new_contact_value = merge_contact(
+            old_contact_type, old_contact_value,
+            lead.contact_type, lead.contact_value,
+            prefer_new_same_type=True,
+        )
+
+        # 证据是**累加**的，不是覆盖：
+        # 同一个人说了三句，表里就该看得到三句（用户 2026-11-13 要求）。
+        # 以前这里是 `evidence = ?` 直接盖掉，而写入方每次只带当前这一条，
+        # 于是 evidence_count 在涨、内容却只剩最后一句。
+        new_evidence = _merge_evidence(row["evidence"] or "", lead.evidence or "")
 
         await self._db.execute(
             """UPDATE leads SET
@@ -538,7 +590,7 @@ class DBStorage:
                 lead.room_id, lead.monitor_name, store, lead.live_room,
                 new_level, new_score, new_reason, new_model,
                 new_contact_type, new_contact_value,
-                lead.evidence, old_evidence_count + lead.evidence_count,
+                new_evidence, old_evidence_count + lead.evidence_count,
                 old_comment_count + lead.comment_count,
                 lead.last_hit_at, now, lead.lead_key,
             ],

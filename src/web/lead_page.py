@@ -45,7 +45,28 @@ OUTREACH_LABELS = {
     "commented": "已留言",
     "failed": "失败",
     "skipped": "已跳过",
+    "not_found": "搜不到",
+    "converted": "已留资",
 }
+
+
+def _evidence_text(raw: str | None, limit: int = 120) -> str:
+    """把弹幕原文（JSON 数组）拼成一行能看的文字
+
+    同一个人说的**每一句**都要能看到（用户 2026-11-13 明确要求）。
+    """
+    import json
+
+    s = str(raw or "").strip()
+    if not s:
+        return ""
+    if s.startswith("["):
+        try:
+            items = json.loads(s)
+            s = " / ".join(str(i) for i in items)
+        except (ValueError, TypeError):
+            pass
+    return s[:limit]
 
 
 def _store_options() -> dict:
@@ -118,6 +139,8 @@ def create_lead_page():
             r["intent_reason"] = (r.get("intent_reason") or "")[:60]
             r["contact_value"] = (r.get("contact_value") or "")[:40]
             r["source"] = "规则" if (r.get("source") or "rule") == "rule" else "AI"
+            # 弹幕原文：这个人**说的每一句**都要能看到（用户 2026-11-13 要求）
+            r["evidence"] = _evidence_text(r.get("evidence"))
 
         lead_table.rows = rows
         lead_table.update()
@@ -445,6 +468,7 @@ def create_lead_page():
                 {"name": "car_model", "label": "车型", "field": "car_model", "align": "left"},
                 {"name": "contact_value", "label": "联系方式", "field": "contact_value", "align": "left"},
                 {"name": "intent_reason", "label": "判定依据", "field": "intent_reason", "align": "left"},
+                {"name": "evidence", "label": "弹幕原文", "field": "evidence", "align": "left"},
                 {"name": "source", "label": "来源", "field": "source", "align": "center"},
                 {"name": "status", "label": "状态", "field": "status", "align": "center"},
                 {"name": "outreach_status", "label": "触达", "field": "outreach_status", "align": "center"},

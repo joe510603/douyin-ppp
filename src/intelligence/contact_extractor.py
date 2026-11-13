@@ -187,3 +187,102 @@ def extract_contacts(texts: list[str]) -> ContactInfo:
             # 已经有联系方式且判定为广告，直接返回
             return merged
     return merged
+
+
+# ============================================================
+# 合并两个来源的联系方式
+# ============================================================
+#
+# 联系方式现在有**两个来源**：
+#   1. 弹幕原文（客户在直播间自己说的）
+#   2. 抖音主页简介（有人习惯把电话写在简介里）
+#
+# 两个来源会先后写进同一条线索，所以必须能合并。
+
+# 类型 → 展示标签（value 字段里就是这么拼的，合并时要能认回来）
+CONTACT_LABELS = {"phone": "电话", "wechat": "微信", "qq": "QQ"}
+
+
+def split_contact(contact_type: str, contact_value: str) -> dict[str, str]:
+    """把存的 ``contact_type`` / ``contact_value`` 拆回 {类型: 值}
+
+    存的时候 value 是拼好的字符串（"电话 138xxx / 微信 abc"），
+    合并的时候要按类型分别处理，所以得先拆回结构化。
+
+    兼容老数据：以前可能存的是**裸值**（"138xxx"，没有"电话 "前缀）。
+    这种只有一个类型、只有一段的时候直接对上号。
+    """
+    types = [t for t in (contact_type or "").split("+") if t]
+    segs = [s.strip() for s in (contact_value or "").split(" / ") if s.strip()]
+    if not types or not segs:
+        return {}
+    out: dict[str, str] = {}
+    for seg in segs:
+        for t, label in CONTACT_LABELS.items():
+            if seg.startswith(label + " "):
+                out[t] = seg[len(label) + 1:].strip()
+                break
+    if not out and len(types) == 1 and len(segs) == 1:
+        out[types[0]] = segs[0]
+    return {t: out[t] for t in types if t in out}
+
+
+def merge_contact(
+    old_type: str,
+    old_value: str,
+    new_type: str,
+    new_value: str,
+    prefer_new_same_type: bool = True,
+) -> tuple[str, str]:
+    """按「类型」合并两处来源的联系方式，返回 (contact_type, contact_value)
+
+    规则
+    ----
+    - 一边是空 → 原样返回另一边（**不做任何改写**，
+      老数据里存的是裸值 "138xxx"，改写成 "电话 138xxx" 会动到别处的断言）
+    - 同类型：
+      ``prefer_new_same_type=True``  → 用新的（弹幕链路用：弹幕是实时说的，更准）
+      ``prefer_new_same_type=False`` → 保留旧的（简介链路用：
+      弹幕里的联系方式是客户**当场**说的，比简介里那个更贴近这次问价，
+      简介只负责**补**没有的类型）
+    - 不同类型 → **追加**（弹幕给了电话、简介给了微信，两个都要留着）
+
+    为什么不能整体覆盖
+    ------------------
+    整体覆盖会让「简介里的微信」被「弹幕里的电话」整条挤掉，
+    白白丢掉一个渠道拿到的联系方式。
+    """
+    old_type = str(old_type or "").strip()
+    old_value = str(old_value or "").strip()
+    new_type = str(new_type or "").strip()
+    new_value = str(new_value or "").strip()
+
+    if not new_value:
+        return old_type, old_value
+    if not old_value:
+        return new_type, new_value
+
+    old_parts = split_contact(old_type, old_value)
+    new_parts = split_contact(new_type, new_value)
+    if not old_parts or not new_parts:
+        # 有一边认不出类型 → 认不出就没法按类型合并，只能整体取新的
+        return new_type, new_value
+
+    merged: dict[str, str] = dict(old_parts)
+    for t, v in new_parts.items():
+        if t in merged and not prefer_new_same_type:
+            continue
+        merged[t] = v
+
+    # 类型顺序用固定的「电话 / 微信 / QQ」，
+    # 跟 ContactInfo.value 的排法一致 —— 合并顺序不影响最终长什么样。
+    order = [t for t in ("phone", "wechat", "qq") if t in merged]
+    order += [t for t in new_type.split("+") if t in merged and t not in order]
+    order += [t for t in old_type.split("+") if t in merged and t not in order]
+
+    out_type = "+".join(order)
+    out_value = " / ".join(
+        f"{CONTACT_LABELS[t]} {merged[t]}" if t in CONTACT_LABELS else merged[t]
+        for t in order
+    )
+    return out_type, out_value

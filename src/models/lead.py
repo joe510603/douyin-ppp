@@ -31,6 +31,7 @@ class LeadStatus(str, Enum):
     PUSHED = "pushed"      # 已推送飞书
     CONTACTED = "contacted"  # 已跟进
     IGNORED = "ignored"    # 已忽略
+    CONVERTED = "converted"  # 已留资（销售在飞书表里标的终态）
 
 
 class OutreachStatus(str, Enum):
@@ -42,6 +43,8 @@ class OutreachStatus(str, Enum):
     COMMENTED = "commented"  # 已留言
     FAILED = "failed"      # 失败
     SKIPPED = "skipped"    # 已跳过（超上限/无抖音号等）
+    NOT_FOUND = "not_found"  # 这次没搜到这个人（**可重试**，不是终态）
+    CONVERTED = "converted"  # 已留资（终态，不再留言）
 
 
 def fmt_dt(dt) -> str:
