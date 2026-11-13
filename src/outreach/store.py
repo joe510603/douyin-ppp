@@ -381,6 +381,26 @@ class OutreachStore:
             # 老库补不上列时不能拖垮整轮触达，退化成「按 0 算」
             return 0
 
+    def release_stuck_leads(self) -> int:
+        """把卡在「搜索中 / 已定位」的线索退回队列
+
+        为什么需要
+        ----------
+        这两个状态都不是终态，而待触达队列只挑 ``pending`` / ``not_found``，
+        所以卡在这里的线索就**永远没人管了**（实测卡了 3 条出不来）。
+
+        正常跑完的轮次不受影响 —— 结束时手上那条已经是
+        已留言 / 已跳过 / 失败 这些终态，不会被误改。
+        进程被杀掉 / 崩了、来不及归还的那条，靠这个在下一轮开头兜底。
+        """
+        cur = self._conn.execute(
+            "UPDATE leads SET outreach_status = 'pending', "
+            "outreach_note = '上一轮中断，重新排队' "
+            "WHERE outreach_status IN ('searching', 'found')"
+        )
+        self._conn.commit()
+        return int(cur.rowcount or 0)
+
     def reset_not_found_count(self, lead_id: int) -> None:
         """把「搜不到」计数清零（人工把线索放回队列时用）"""
         try:

@@ -936,6 +936,15 @@ class OutreachWorker:
 
         # ---- 1) 取名单 ----
         self.log("① 读取待触达线索…")
+        # 上一轮崩了 / 被杀时，手上那条会停在「搜索中 / 已定位」——
+        # 那不是终态，队列只挑 pending → 这条就永远没人管了（实测卡了 3 条）。
+        # 每轮开头兜一次底。
+        try:
+            stuck = self.st.release_stuck_leads()
+            if stuck:
+                self.log(f"   ↩ 把 {stuck} 条卡住的线索退回队列（上一轮中断留下的）")
+        except Exception as e:
+            self.log(f"   ⚠️ 清理卡住的线索失败: {e}")
         leads = self.st.pending_leads(
             intent_levels=list(o.intent_levels or []),
             stores=list(o.stores or []),
@@ -985,12 +994,11 @@ class OutreachWorker:
         # 用来给「验证过了立刻回头重试」加个上限，防止
         # 「验证→重试→又弹验证→再验证」变成死循环。
         lead_retries: dict[int, int] = {}
-        # 连续「搜不到人」的条数——用来区分「几个号失效了」和「搜索整体坏了」
+        # 连续「搜不到人」的条数——只用来打日志提醒，不再拿它判断「搜索坏了」
+        # （2026-11-13 用户纠正：搜不到就该跳过继续触达，别在这儿掐断整轮）
         consecutive_not_found = 0
         sent_in_run = 0
         max_err = int(o.fail_stop_threshold or 3)
-        # 连续这么多条都搜不到人，就该怀疑是搜索坏了而不是这些人都失效了
-        max_not_found = int(getattr(o, "not_found_stop_threshold", 5) or 5)
 
         profile = pathlib.Path(
             pathlib.Path(self.cfg.app.db_path).parent
@@ -1177,18 +1185,29 @@ class OutreachWorker:
                                 status="not_found", error=str(e),
                             )
                             self._emit(type="skipped", lead=lead, error=str(e))
-                        # 但如果**连续**这么多条全都搜不到人，
-                        # 那多半是搜索出问题了（接口改版 / 被限流），
-                        # 不是这些人都恰好失效——这时候继续跑纯属空转。
-                        if consecutive_not_found >= max_not_found:
-                            self.stop_reason = (
-                                f"连续 {consecutive_not_found} 条都搜不到人，"
-                                f"多半是搜索出问题了（不是这些人都失效），主动停手"
+                        # ⚠ 这里**不停手**（2026-11-13 用户反馈纠正）：
+                        #   「是不是转牛角尖了，一直在搜索搜不到的人，然后一直触发风控？
+                        #     按现在的方法，搜不到应该就是真的搜不到了，继续去触达呀」
+                        #
+                        # 老逻辑是「连续 N 条都搜不到 → 判定搜索坏了 → 停手 + 切慢档」。
+                        # 现在这个判定**既不准又致命**：
+                        #   · 不准 —— 搜索正常返回 17~19 个候选，只是号码对不上，
+                        #     这跟「搜索接口坏了」完全是两回事（现在能按证据分三态了）
+                        #   · 致命 —— 一停手就是**整轮 0 产出**，还能顺手把账号拖进慢档
+                        #     （90~120 秒一条）。实测 2026-11-13 下午：连续两轮
+                        #     「发 0　跳过 5」，13 分钟一条没发出去，
+                        #     而同一批里真正能触达的人排在第 30 位，一轮都轮不到。
+                        #
+                        # 搜索真坏了有**专门的信号**，不需要靠连续数去猜：
+                        #   · 限流   → SearchUnavailable → 停手
+                        #   · 没跑起来 → SearchNotReady  → 重试
+                        # 「搜不到人」是**数据问题**，不是平台问题 → 跳过、继续做下一个。
+                        consecutive_not_found += 1
+                        if consecutive_not_found % 5 == 0:
+                            self.log(
+                                f"  ℹ️ 已经有 {consecutive_not_found} 条连续搜不到人"
+                                f"（不是搜索坏了，是这些号在抖音上真搜不到）——继续做下一条"
                             )
-                            self.log(f"🛑 {self.stop_reason}")
-                            self._emit(type="risk", lead=lead, error=self.stop_reason,
-                                       kind="limit")
-                            break
                     except SearchNotReady as e:
                         # 搜索**动作没在页面上跑起来** —— 这不是限流！
                         #
@@ -1419,6 +1438,16 @@ class OutreachWorker:
         for ld in fresh:
             did = str(ld.get("display_id") or "")
             if not did or did in in_batch:
+                continue
+            # ⚠ 别插队「搜不到」的人（2026-11-13 现场踩到的坑）
+            #
+            # 插队只看「谁更新」，不看状态。而这些号 last_hit_at 最晚
+            # （今天还在直播间被抓到），于是每次都被顶到队头——
+            # 而它们在抖音上根本搜不到，插队 = 每轮第一个就去搜一个不存在的人。
+            #
+            # 实测 2026-11-13 下午：连着两轮「发 0　跳过 5」，13 分钟一条没发出去，
+            # 队列里真正能触达的人排在第 30 位，一轮都轮不到。
+            if ld.get("outreach_status") == STATUS_NOT_FOUND:
                 continue
             # 30 天内真的发出去过的不再打扰
             try:

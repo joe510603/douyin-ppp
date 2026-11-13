@@ -322,6 +322,88 @@ def test_阈值可配置(tmp_path, monkeypatch):
     assert _读(db)[0] == "skipped"
 
 
+def test_默认阈值是一次就跳过(tmp_path, monkeypatch):
+    """用户 2026-11-13：「按现在的方法，搜不到应该就是真的搜不到了」
+
+    单轮内部已经试过三种搜法（抖音号 → 昵称 → 抖音号再搜），
+    都对不上号就是真搜不到 → 一次就跳过，别占下一轮的名额。
+    """
+    from src.config import get_config
+
+    assert get_config().outreach.not_found_skip_threshold == 1
+
+    db = _建库(tmp_path)
+    _加线索(db)
+    w = _worker(tmp_path, db, not_found_skip_threshold=1)
+    _跑一轮(w, _线索(), monkeypatch)
+    status, cnt, _synced, note = _读(db)
+    assert status == "skipped", "一次搜不到就该跳过"
+    assert cnt == 1
+    assert "人工验证" in note
+
+
+# ============================================================
+# 插队不该把「搜不到的人」顶到队头
+# ============================================================
+
+def test_插队不插搜不到的人(tmp_path):
+    """搜不到的人 last_hit_at 最晚（今天还在直播间被抓到），
+    插队只看「谁更新」不看状态 → 每轮第一个就去搜一个不存在的人。
+
+    实测 2026-11-13 下午：连着两轮「发 0　跳过 5」，13 分钟一条没发出去，
+    真正能触达的人排在第 30 位，一轮都轮不到。
+    """
+    db = _建库(tmp_path)
+    _加线索(db)
+    w = _worker(tmp_path, db)
+
+    picked = [{"id": 1, "display_id": "u1", "last_hit_at": "2026-11-10 10:00:00"}]
+    fresh = [
+        {"id": 2, "display_id": "u2", "outreach_status": "not_found",
+         "last_hit_at": "2026-11-13 10:00:00", "nickname": "搜不到的人"},
+        {"id": 3, "display_id": "u3", "outreach_status": "pending",
+         "last_hit_at": "2026-11-13 10:00:00", "nickname": "正常人"},
+    ]
+    w.st.pending_leads = lambda **kw: list(fresh)
+
+    assert w._promote_hot_leads(picked, 0) == 1
+    assert picked[0]["display_id"] == "u3", "不该把搜不到的人插到队头"
+
+
+# ============================================================
+# 卡住的线索要能回到队列
+# ============================================================
+
+def test_卡在搜索中的线索会退回队列(tmp_path):
+    """「搜索中 / 已定位」不是终态，队列只挑 pending → 卡着就永远没人管
+
+    实测卡了 3 条出不来。上一轮崩了/被杀时来不及归还，
+    靠每轮开头的兜底把它们放回队列。
+    """
+    db = _建库(tmp_path)
+    _加线索(db, lead_id=1)
+    _加线索(db, lead_id=2)
+    _加线索(db, lead_id=3)
+    conn = sqlite3.connect(str(db))
+    conn.execute("UPDATE leads SET outreach_status = 'searching' WHERE id = 1")
+    conn.execute("UPDATE leads SET outreach_status = 'found' WHERE id = 2")
+    conn.execute("UPDATE leads SET outreach_status = 'pending' WHERE id = 3")
+    conn.commit()
+    conn.close()
+
+    st = OutreachStore(db)
+    assert st.release_stuck_leads() == 2
+
+    conn = sqlite3.connect(str(db))
+    got = dict(conn.execute(
+        "SELECT id, outreach_status FROM leads WHERE id IN (1,2,3)"
+    ).fetchall())
+    conn.close()
+    assert got[1] == "pending"
+    assert got[2] == "pending"
+    assert got[3] == "pending"
+
+
 # ============================================================
 # 人工在飞书里放回队列 → 回拉要能采纳
 # ============================================================

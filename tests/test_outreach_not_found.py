@@ -144,14 +144,25 @@ def test_搜不到人记成skipped不是failed(tmp_path, monkeypatch):
     assert result["skipped"] == 2
 
 
-def test_连续全搜不到还是会停(tmp_path, monkeypatch):
-    """防的是「搜索整体坏了还在空转」"""
+def test_连续全搜不到也不停手(tmp_path, monkeypatch):
+    """搜不到就该跳过继续，别掐断整轮
+
+    用户 2026-11-13 纠正：「是不是转牛角尖了，一直在搜索搜不到的人，
+    然后一直触发风控？……搜不到应该就是真的搜不到了，继续去触达呀」
+
+    老逻辑是「连续 N 条都搜不到 → 判定搜索坏了 → 停手 + 切慢档」。
+    实测 2026-11-13 下午：连着两轮「发 0　跳过 5」，13 分钟一条没发出去，
+    而同一批里真正能触达的人排在第 30 位，一轮都轮不到。
+
+    现在「搜索坏了」有专门的信号（限流 → SearchUnavailable、
+    没跑起来 → SearchNotReady），不需要靠连续数去猜。
+    """
     w = _worker(tmp_path, not_found_stop_threshold=4)
     leads = _线索(10)
     script = [LeadNotFound("没搜到这个人")] * 10
     result = _跑一轮(w, leads, script, monkeypatch)
-    assert result.get("stopped"), "连续太多条搜不到人，该停"
-    assert "搜不到" in result["stopped"]
+    assert not result.get("stopped"), f"搜不到不该停手：{result.get('stopped')}"
+    assert result.get("not_found") == 10, result
 
 
 def test_搜到一个之后计数清零(tmp_path, monkeypatch):
