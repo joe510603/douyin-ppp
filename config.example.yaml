@@ -98,6 +98,7 @@ outreach:
   max_per_run: 10
   comments_per_user: 1
   fail_stop_threshold: 3   # 连续失败几次自动停止
+  not_found_skip_threshold: 3  # 同一条线索搜不到几次就跳过（终态，留给人工验证）
   timeout: 30
   dry_run: true            # ⚠️ 默认开着：只生成话术，不发送。第一次务必先干跑
   stop_on_risk: true       # 撞到验证码/登录失效立即停手

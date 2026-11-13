@@ -206,6 +206,11 @@ class OutreachStore:
                     ("sec_uid", "TEXT DEFAULT ''"),
                     ("contact_type", "TEXT DEFAULT ''"),
                     ("contact_value", "TEXT DEFAULT ''"),
+                    # 「搜不到」累计次数——用来判断是不是该放弃了（用户 2026-11-13 指示）
+                    ("not_found_count", "INTEGER DEFAULT 0"),
+                    # 处理状态（销售在飞书里标的「已跟进/已留资」）
+                    # pending_leads 要读它来生成「上次同步进飞书的状态」标记
+                    ("status", "TEXT DEFAULT ''"),
                 ):
                     if col not in lead_cols:
                         self._conn.execute(
@@ -256,7 +261,7 @@ class OutreachStore:
             "SELECT id, lead_key, display_id, nickname, car_model, store, ",
             "intent_level, intent_score, intent_reason, evidence, monitor_name, ",
             "bitable_record_id, outreach_status, created_at, last_hit_at, ",
-            "contact_type, contact_value, sec_uid ",
+            "contact_type, contact_value, sec_uid, status, not_found_count ",
             "FROM leads WHERE outreach_status IN (?, ?) AND display_id != ''"
         ]
         params: list[Any] = [STATUS_PENDING, STATUS_NOT_FOUND]
@@ -289,22 +294,28 @@ class OutreachStore:
         try:
             rows = self._conn.execute("".join(sql), params).fetchall()
         except sqlite3.OperationalError as e:
-            # ``sec_uid`` 列补不上时（老库 + ALTER 失败）别让整轮瘫掉：
-            # 退回不带 sec_uid 的查询，少用一次「跳过搜索」而已。
-            if "sec_uid" not in str(e):
+            # 补不上的列（老库 + ALTER 失败）别让整轮瘫掉：
+            # 退回不带这些列的查询，少用一次「跳过搜索」而已。
+            if not any(c in str(e) for c in ("sec_uid", "status", "not_found_count")):
                 raise
-            fallback = [s.replace(", sec_uid ", " ") for s in sql]
+            fallback = sql
+            for col in (", sec_uid ", ", status ", ", not_found_count "):
+                fallback = [s.replace(col, " ") for s in fallback]
             rows = self._conn.execute("".join(fallback), params).fetchall()
             out = []
             for r in rows:
                 d = dict(r)
-                d["sec_uid"] = ""
+                d.setdefault("sec_uid", "")
+                d.setdefault("status", "")
+                d.setdefault("not_found_count", 0)
                 out.append(d)
             return out
         out = []
         for r in rows:
             d = dict(r)
             d.setdefault("sec_uid", "")
+            d.setdefault("status", "")
+            d.setdefault("not_found_count", 0)
             out.append(d)
         return out
 
@@ -320,15 +331,65 @@ class OutreachStore:
         status: str,
         error: str = "",
         sec_uid: str = "",
+        synced_status: str = "",
     ) -> None:
-        """更新线索的触达状态（同时清掉旧错误信息）"""
-        self._conn.execute(
-            "UPDATE leads SET outreach_status = ?, "
-            "outreach_note = ?, outreach_at = datetime('now','localtime') "
-            "WHERE id = ?",
-            [status, (error or "")[:300], lead_id],
-        )
+        """更新线索的触达状态（同时清掉旧错误信息）
+
+        ``synced_status``：可选，把「上次同步进飞书的状态」一起对齐。
+        为什么要对齐：回拉判断「本地这次有没有自己改过」全靠这个标记。
+        本地刚把状态改成 X、而标记还停在旧值 → 回拉永远认为「本地改过」，
+        于是销售在飞书表里手动改回去（比如把「已跳过」改回「待触达」）
+        永远不生效。跳过是**留给人工验证**的状态，人工要能放回队列，
+        所以跳过时要把标记对齐到当前值。
+        """
+        if synced_status:
+            self._conn.execute(
+                "UPDATE leads SET outreach_status = ?, "
+                "outreach_note = ?, outreach_at = datetime('now','localtime'), "
+                "bitable_synced_status = ? WHERE id = ?",
+                [status, (error or "")[:300], synced_status, lead_id],
+            )
+        else:
+            self._conn.execute(
+                "UPDATE leads SET outreach_status = ?, "
+                "outreach_note = ?, outreach_at = datetime('now','localtime') "
+                "WHERE id = ?",
+                [status, (error or "")[:300], lead_id],
+            )
         self._conn.commit()
+
+    def bump_not_found(self, lead_id: int) -> int:
+        """记一次「这次没搜到这个人」，返回累计次数
+
+        为什么要有次数：一次搜不到**不能**说明这个人没了（抖音搜索是概率性的、
+        一次只给 6~10 个人）。但搜了 N 次还搜不到，就多半是真的搜不到了
+        （改名 / 注销 / 被隐藏）——这时候继续吊在队列末尾纯属浪费名额。
+        用户 2026-11-13 明确要求：多次搜不到就跳过，后面人工验证。
+        """
+        try:
+            self._conn.execute(
+                "UPDATE leads SET not_found_count = "
+                "COALESCE(not_found_count, 0) + 1 WHERE id = ?",
+                [lead_id],
+            )
+            self._conn.commit()
+            row = self._conn.execute(
+                "SELECT not_found_count FROM leads WHERE id = ?", [lead_id]
+            ).fetchone()
+            return int((row[0] if row else 0) or 0)
+        except sqlite3.OperationalError:
+            # 老库补不上列时不能拖垮整轮触达，退化成「按 0 算」
+            return 0
+
+    def reset_not_found_count(self, lead_id: int) -> None:
+        """把「搜不到」计数清零（人工把线索放回队列时用）"""
+        try:
+            self._conn.execute(
+                "UPDATE leads SET not_found_count = 0 WHERE id = ?", [lead_id]
+            )
+            self._conn.commit()
+        except sqlite3.OperationalError:
+            pass
 
     def set_sec_uid(self, lead_id: int, sec_uid: str, nickname: str = "") -> None:
         """记下定位到的抖音 sec_uid（下次直接开主页，省一次搜索）

@@ -369,6 +369,18 @@ class DBStorage:
         except aiosqlite.OperationalError:
             pass
 
+        # 迁移：老库补 not_found_count（「搜不到」累计次数）
+        #
+        # 搜够 N 次还搜不到 → 跳过（终态），留给人工验证（用户 2026-11-13 指示）。
+        # 人工把线索放回队列时要把它清零，给一次全新机会。
+        try:
+            await self._db.execute(
+                "ALTER TABLE leads ADD COLUMN not_found_count INTEGER DEFAULT 0"
+            )
+            await self._db.commit()
+        except aiosqlite.OperationalError:
+            pass
+
         # 迁移：老库补 sec_uid（抖音 sec_uid）
         #
         # 有了它，下次触达同一个线索**不用再搜索**——
@@ -722,6 +734,8 @@ class DBStorage:
             "nickname", "display_id", "live_room", "bitable_record_id",
             "bitable_synced_status",
             "evidence", "evidence_count",
+            # 「搜不到」累计次数——人工把线索放回队列时要清零
+            "not_found_count",
         }
         updates = {k: v for k, v in fields.items() if k in allowed}
         if not updates:

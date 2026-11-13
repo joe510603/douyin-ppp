@@ -118,6 +118,7 @@ def create_lead_page():
             rows, total = await db.query_leads(
                 intent_levels=levels,
                 status=status_filter.value or None,
+                outreach_status=outreach_filter.value or None,
                 has_contact=has_contact,
                 keyword=keyword_input.value.strip() or None,
                 store=store_filter.value or None,
@@ -352,7 +353,10 @@ def create_lead_page():
                 skipped += 1
                 continue
             await db.update_lead(
-                row["id"], outreach_status="pending", outreach_note=""
+                row["id"], outreach_status="pending", outreach_note="",
+                # 人工放回队列 = 给一次全新机会，「搜不到」计数清零，
+                # 否则它下一轮搜不到又立刻被跳过，人工的放回等于白放。
+                not_found_count=0,
             )
             added += 1
 
@@ -434,6 +438,14 @@ def create_lead_page():
                          "contacted": "已跟进", "ignored": "已忽略"},
                 value="",
                 label="处理状态",
+            ).props("dense outlined").classes("col-6 col-sm-2 app-input")
+
+            # 触达状态筛选 —— 人工验证「多次搜不到被跳过」的线索时用
+            # （用户 2026-11-13：搜不到够多次就跳过，后面人工验）
+            outreach_filter = ui.select(
+                options={"": "全部触达状态", **{k: v for k, v in OUTREACH_LABELS.items()}},
+                value="",
+                label="触达状态",
             ).props("dense outlined").classes("col-6 col-sm-2 app-input")
 
             contact_filter = ui.select(

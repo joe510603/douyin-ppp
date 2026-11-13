@@ -829,7 +829,9 @@ class OutreachWorker:
     # 状态回写
     # ================================================================
 
-    def _set_status(self, lead: dict, status: str, error: str = "") -> None:
+    def _set_status(
+        self, lead: dict, status: str, error: str = "", synced_status: str = ""
+    ) -> None:
         """回写本地 + 飞书
 
         干跑时**完全不改状态**（本地也不改）。
@@ -838,12 +840,17 @@ class OutreachWorker:
         回拉也不会把它改回 pending（本地相对上次同步的值变了，走「跳过」分支），
         下一轮真跑时这些线索就再也不会被处理。
         多机共用一张飞书表时更危险：干跑会把另一台机器写的真实触达状态盖掉。
+
+        ``synced_status``：把「上次同步进飞书的状态」一起对齐（见 store 里的说明）。
+        只在「跳过、留给人工验证」这种**希望人工能放回队列**的状态上用。
         """
         if self._dry:
             return
 
         try:
-            self.st.set_outreach_status(lead["id"], status, error)
+            self.st.set_outreach_status(
+                lead["id"], status, error, synced_status=synced_status
+            )
         except Exception as e:
             self.log(f"  ⚠️ 本地状态回写失败: {e}")
 
@@ -852,6 +859,19 @@ class OutreachWorker:
         except Exception as e:
             # 飞书写失败不影响主流程继续跑
             self.log(f"  ⚠️ 飞书状态回写失败: {e}")
+
+    def _synced_marker(self, lead: dict, outreach_status: str) -> str:
+        """生成「上次同步进飞书的状态」标记（处理状态|触达状态）
+
+        回拉判断「本地这次有没有自己改过」全靠这个标记。
+        跳过是**留给人工验证**的状态：人工在飞书表里把它改回「待触达」，
+        回拉必须能采纳 —— 所以标记要跟当前值一致，
+        否则回拉永远认为「本地改过」，人工的改动永远不生效。
+        """
+        from ..notify.bitable import STATUS_LABELS
+
+        st = STATUS_LABELS.get(lead.get("status") or "", "待处理")
+        return f"{st}|{FEISHU_STATUS.get(outreach_status, outreach_status)}"
 
     def _push_feishu_status(self, lead: dict, status: str) -> None:
         """把「触达状态」写回飞书多维表格（**异步**，不阻塞触达）
@@ -1120,20 +1140,43 @@ class OutreachWorker:
                         summary["not_found"] = summary.get("not_found", 0) + 1
                         summary["skipped"] += 1
                         self.log(f"  ⏭️ {e}")
-                        # ⚠ 不标 skipped（那是终态 = 永远不再触达）。
                         # 「这一次没搜到」≠「这个人没了」：
                         #   抖音一次只给 6~10 个人，目标常在第 2、3 页；
                         #   而且搜索结果是概率性的（同号 18:36 搜不到、18:50 搜得到）。
                         # 实测（2026-11-13）：抽查 4 个「搜不到」的号，3 个当场就搜到了。
-                        # 所以标成 not_found —— 留在队列里、排在一堆正常线索**后面**，
+                        # 所以先标成 not_found —— 留在队列里、排在一堆正常线索**后面**，
                         # 等正常线索做完了再回头重试。
-                        self._set_status(lead, STATUS_NOT_FOUND, str(e))
-                        self.st.add_touch(
-                            lead_id=lead["id"], record_id=lead.get("bitable_record_id") or "",
-                            display_id=lead["display_id"], nickname=lead.get("nickname") or "",
-                            status="not_found", error=str(e),
-                        )
-                        self._emit(type="skipped", lead=lead, error=str(e))
+                        #
+                        # 但「永远可重试」也有代价：失效的抖音号每轮都被捞出来重搜，
+                        # 白占名额还永远不消失。所以记一个**累计次数**：
+                        # 搜够 N 次还搜不到 → 多半这人真搜不到了（改名/注销/被隐藏），
+                        # 跳过（终态），留给人工验证（用户 2026-11-13 指示）。
+                        nf_count = 0 if self._dry else self.st.bump_not_found(lead["id"])
+                        nf_threshold = int(getattr(o, "not_found_skip_threshold", 3) or 3)
+                        if nf_count >= nf_threshold:
+                            note = f"连续 {nf_count} 次搜不到这个人，已跳过待人工验证"
+                            self.log(f"  🚫 {note}")
+                            # 同步标记对齐到当前值 —— 回拉据此判断「本地改过没」。
+                            # 不对齐的话，销售在飞书表里把它改回「待触达」永远不生效，
+                            # 而「跳过 → 人工验证 → 放回队列」正是这个状态存在的意义。
+                            self._set_status(
+                                lead, STATUS_SKIPPED, note,
+                                synced_status=self._synced_marker(lead, STATUS_SKIPPED),
+                            )
+                            self.st.add_touch(
+                                lead_id=lead["id"], record_id=lead.get("bitable_record_id") or "",
+                                display_id=lead["display_id"], nickname=lead.get("nickname") or "",
+                                status="skipped", error=note,
+                            )
+                            self._emit(type="skipped", lead=lead, error=note)
+                        else:
+                            self._set_status(lead, STATUS_NOT_FOUND, str(e))
+                            self.st.add_touch(
+                                lead_id=lead["id"], record_id=lead.get("bitable_record_id") or "",
+                                display_id=lead["display_id"], nickname=lead.get("nickname") or "",
+                                status="not_found", error=str(e),
+                            )
+                            self._emit(type="skipped", lead=lead, error=str(e))
                         # 但如果**连续**这么多条全都搜不到人，
                         # 那多半是搜索出问题了（接口改版 / 被限流），
                         # 不是这些人都恰好失效——这时候继续跑纯属空转。

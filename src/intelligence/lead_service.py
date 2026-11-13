@@ -548,6 +548,12 @@ async def pull_bitable_status(db=None, config=None) -> dict:
         if new_outreach and new_outreach != r.get("outreach_status"):
             updates["outreach_status"] = new_outreach
 
+        # 人工把线索放回队列（飞书里把「触达状态」改成「待触达」）
+        # → 给它一次全新机会，把「搜不到」累计次数清零。
+        # 不清零的话，它下一轮又搜不到就立刻又被跳过 —— 人工的放回等于白放。
+        if updates.get("outreach_status") == "pending":
+            updates["not_found_count"] = 0
+
         # ---- 「已留资」两列必须一起生效 ----
         #
         # 销售在飞书表里把状态改成「已留资」（意思是已经拿到电话/微信了），
