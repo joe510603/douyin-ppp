@@ -409,17 +409,39 @@ class LiveDetector:
                         )
                         log.info(f"[浏览器] 持久化上下文启动成功，注入 {len(inject_cookies)} 条 cookie 覆盖 profile...")
                         # 必须先访问 domain 一次才能 add_cookies
+                        #
+                        # ⚠ 只等「响应头」（commit），不等整页资源（2026-11-13）：
+                        #   这里唯一的目的就是让 origin 建立起来好注入 cookie，
+                        #   等 domcontentloaded 要 15 秒，而检测是 14 个账号并发
+                        #   （每个都启一个 Chromium）→ 实测整个检测器吃掉 216% CPU，
+                        #   把触达的浏览器挤得搜索从 20 秒变成 60+ 秒。
+                        #   改成 commit 后这一步 15 秒 → 1~2 秒。
                         first_page = context.pages[0] if context.pages else context.new_page()
                         try:
-                            first_page.goto("https://www.douyin.com/", wait_until="domcontentloaded", timeout=15000)
+                            first_page.goto("https://www.douyin.com/",
+                                           wait_until="commit", timeout=15000)
                         except Exception:
                             pass  # 即使失败也继续
                         if inject_cookies:
+                            added = False
                             try:
                                 context.add_cookies(inject_cookies)
-                                log.info(f"[浏览器] ✅ 已注入 {len(inject_cookies)} 条 cookie 覆盖 profile")
+                                added = True
                             except Exception as e:
-                                log.warning(f"设置 cookies 失败: {e}")
+                                log.warning(f"设置 cookies 失败（等页面加载完再试一次）: {e}")
+                            if not added:
+                                # 保险起见：等页面真的加载完再试一次
+                                # （cookie 注入失败 = 用 profile 里的旧 cookie
+                                #   → 可能被重定向到首页 → 误判「没开播」→ 漏掉直播间）
+                                try:
+                                    first_page.wait_for_load_state(
+                                        "domcontentloaded", timeout=10000)
+                                    context.add_cookies(inject_cookies)
+                                    added = True
+                                except Exception as e:
+                                    log.warning(f"设置 cookies 仍然失败: {e}")
+                            if added:
+                                log.info(f"[浏览器] ✅ 已注入 {len(inject_cookies)} 条 cookie 覆盖 profile")
                         page = context.pages[0] if context.pages else context.new_page()
                     except Exception as e:
                         log.warning(f"持久化上下文启动失败，回退独立 browser: {e}")
