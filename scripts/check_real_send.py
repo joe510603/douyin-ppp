@@ -33,7 +33,7 @@ from src.outreach.douyin_api import Douyin  # noqa: E402
 # 上次被判「发不出去」的那条，原样参数
 AWEME_ID = "7693153770800486054"
 TEXT = "老板，你在问小米汽车多久能提车对吧？我这边能帮你查下现在的交付节奏～"
-NICK = "张氏传媒"
+NICK = "测试昵称N"
 SHOT_DIR = pathlib.Path("data/outreach_shots")
 
 

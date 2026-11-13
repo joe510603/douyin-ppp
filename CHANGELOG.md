@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - **搜索搜不到人，根因找到了：抖音要求先过「拼图验证」才能搜索**
-  （用户反馈「G1808575996、987714317、53722928132 我抽查了几个，
+  （用户反馈「999999101、999999102、999999103 我抽查了几个，
   用手机都能搜到，你这边是什么情况？」）。
 
   手机**确实**能搜到——限流/拦截的是抖音 **web 端搜索**，
@@ -198,7 +198,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Testing
 - 端到端验证（`scripts/check_search_fixed.py`）：用真实的 `Douyin.resolve()`
-  搜 3 个抖音号，**全部搜到**（含之前必失败的 `987714317`）
+  搜 3 个抖音号，**全部搜到**（含之前必失败的 `999999102`）
 
 ---
 
@@ -333,7 +333,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ✓ 验证通过，回查发现评论已经发出去了
   ✅ 已留言
   ⏳ 等 59s 再找下一个
-  [3/10] Wang___19
+  [3/10] 999999204
   🛑 触发风控：抖音要求验证本人操作…立即停止        ← 第 2 条根本没发就被拦死
   ```
 
@@ -706,7 +706,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   **只 PATCH 这四个字段**，「处理状态」「触达状态」一律不碰——
   那是双向字段，另一台机器也在写这张表，
   用本地默认值覆盖会把对方的真实触达进度抹掉
-- 修正 `84668218565`：飞书显示「低意向/24」，
+- 修正 `999999203`：飞书显示「低意向/24」，
   实际问的是「yu7标准版首付8万加购置税保险一共首付多少」「yu7标准版下定到提车多久时间」
   → 改为「高意向/72」
 

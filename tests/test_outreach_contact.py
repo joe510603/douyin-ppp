@@ -88,10 +88,10 @@ def test_set_contact写入简介里的电话(tmp_path):
     db = _建库(tmp_path)
     _加线索(db)
     st = OutreachStore(db)
-    changed, t, v = st.set_contact(1, "phone", "电话 13281975716")
+    changed, t, v = st.set_contact(1, "phone", "电话 19900000001")
     assert changed is True
     assert t == "phone"
-    assert "13281975716" in v
+    assert "19900000001" in v
     assert _读(db) == (t, v)
 
 
@@ -130,10 +130,10 @@ def test_简介里的电话会写库并同步飞书(tmp_path):
     _加线索(db, record_id="rec1")
     w = _worker(tmp_path, db)
     w._harvest_profile_contact(
-        {"signature": "隆广顺大量招收学员，加盟电话13281975716"}, _线索())
+        {"signature": "隆广顺大量招收学员，加盟电话19900000001"}, _线索())
     t, v = _读(db)
     assert t == "phone"
-    assert "13281975716" in v
+    assert "19900000001" in v
     assert w._feishu.pushed == [("rec1", {"联系方式": v})]
 
 
@@ -208,6 +208,6 @@ def test_没有飞书record_id也不报错(tmp_path):
     w = _worker(tmp_path, db)
     lead = _线索()
     lead["bitable_record_id"] = ""
-    w._harvest_profile_contact({"signature": "加盟电话13281975716"}, lead)
+    w._harvest_profile_contact({"signature": "加盟电话19900000001"}, lead)
     assert _读(db)[0] == "phone"
     assert w._feishu.pushed == []

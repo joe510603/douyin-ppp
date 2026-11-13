@@ -23,7 +23,7 @@ from src.config import get_config  # noqa: E402
 from src.outreach.douyin_api import Douyin  # noqa: E402
 
 # 真实存在的抖音号（从待触达线索里挑）
-TEST_IDS = ["987714317", "155642154", "1127482314"]
+TEST_IDS = ["999999102", "999999104", "999999105"]
 
 
 def main() -> int:

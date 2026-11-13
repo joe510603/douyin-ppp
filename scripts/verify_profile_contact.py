@@ -36,7 +36,7 @@ def _读(lead_id: int):
 
 def main() -> int:
     cfg = get_config()
-    targets = sys.argv[1:] or ["xxy22244"]
+    targets = sys.argv[1:] or ["test_user_b"]
     profile = str(pathlib.Path(cfg.outreach.profile_dir).absolute())
     print(f"profile: {profile}\n")
 

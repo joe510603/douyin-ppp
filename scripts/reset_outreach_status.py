@@ -26,7 +26,7 @@
     .venv/bin/python scripts/reset_outreach_status.py
 
     # 只重置指定抖音号
-    .venv/bin/python scripts/reset_outreach_status.py --display-id 601939522 --apply
+    .venv/bin/python scripts/reset_outreach_status.py --display-id 999999202 --apply
 
     # 真的执行（重置所有非 pending 的线索）
     .venv/bin/python scripts/reset_outreach_status.py --apply

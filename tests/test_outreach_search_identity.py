@@ -2,17 +2,17 @@
 
 背景（2026-11-12 实测，用户反馈「它说搜不到，我用手机试了试能搜到」）
 --------------------------------------------------------------------
-线索 `198785742 / 候鸟…` 在生产跑里被判成「这个人搜不到」，
+线索 `999999106 / 测试昵称C…` 在生产跑里被判成「这个人搜不到」，
 但 18:50 用探针跑，**同一个号又搜到了**，sec_uid 一模一样。
 
 三个问题叠在一起：
 
-1. **昵称是抖音截断的**（"候鸟…"，3 个字符）
-   → 拿它当搜索词等于搜「候鸟…」这个带省略号的词，**永远搜不到**。
+1. **昵称是抖音截断的**（"测试昵称C…"，3 个字符）
+   → 拿它当搜索词等于搜「测试昵称C…」这个带省略号的词，**永远搜不到**。
 
 2. **昵称不唯一**：抖音的截断昵称会被不同的人共用。
-   实测搜「候鸟…」返回了一个 unique_id=17996686 的人，
-   而我们要找的是 unique_id=198785742 —— **认错人了**。
+   实测搜「测试昵称C…」返回了一个 unique_id=999999112 的人，
+   而我们要找的是 unique_id=999999106 —— **认错人了**。
    认错人 = 拿客户的号给陌生人发广告，比跳过还糟。
 
 3. **抖音的搜索结果是概率性的**：同一个号，有时返回、有时给空。
@@ -38,15 +38,15 @@ def _douyin() -> Douyin:
 # ============================================================
 
 def test_昵称末尾的省略号要去掉():
-    """抖音给的昵称是截断的（"候鸟…"）—— 带省略号搜不到任何人"""
-    assert Douyin._clean_nickname("候鸟…") == "候鸟"
-    assert Douyin._clean_nickname("候鸟...") == "候鸟"
-    assert Douyin._clean_nickname("候鸟… ") == "候鸟"
+    """抖音给的昵称是截断的（"测试昵称C…"）—— 带省略号搜不到任何人"""
+    assert Douyin._clean_nickname("测试昵称C…") == "测试昵称C"
+    assert Douyin._clean_nickname("测试昵称C...") == "测试昵称C"
+    assert Douyin._clean_nickname("测试昵称C… ") == "测试昵称C"
 
 
 def test_完整昵称不动():
     assert Douyin._clean_nickname("张伟") == "张伟"
-    assert Douyin._clean_nickname("喔哟哟！不得了不得了……") == "喔哟哟！不得了不得了"
+    assert Douyin._clean_nickname("测试昵称D！不得了不得了……") == "测试昵称D！不得了不得了"
     assert Douyin._clean_nickname("") == ""
     assert Douyin._clean_nickname(None) == ""
 
@@ -75,10 +75,10 @@ def test_昵称搜到的不是那个人就不认():
     # 候选里有昵称一样、但抖音号是另一个人的
     _假装搜索结果(dy, [{
         "sec_uid": "MS4wLjABAAAA_others",
-        "unique_id": "17996686",
-        "nickname": "候鸟…",
+        "unique_id": "999999112",
+        "nickname": "测试昵称C…",
     }])
-    info = dy._resolve_once("候鸟", by_nickname=True, want_dy="198785742")
+    info = dy._resolve_once("测试昵称C", by_nickname=True, want_dy="999999106")
     assert info is None, "抖音号对不上就不能认"
 
 
@@ -86,15 +86,15 @@ def test_昵称搜到的抖音号对得上就认():
     """昵称只是搜索词，认人靠抖音号 —— 对得上就该认出来"""
     dy = _douyin()
     _假装搜索结果(dy, [
-        {"sec_uid": "MS4wLjABAAAA_other", "unique_id": "17996686",
-         "nickname": "候鸟…"},
-        {"sec_uid": "MS4wLjABAAAA_right", "unique_id": "198785742",
-         "nickname": "候鸟…"},
+        {"sec_uid": "MS4wLjABAAAA_other", "unique_id": "999999112",
+         "nickname": "测试昵称C…"},
+        {"sec_uid": "MS4wLjABAAAA_right", "unique_id": "999999106",
+         "nickname": "测试昵称C…"},
     ])
-    info = dy._resolve_once("候鸟", by_nickname=True, want_dy="198785742")
+    info = dy._resolve_once("测试昵称C", by_nickname=True, want_dy="999999106")
     assert info is not None
     assert info["sec_uid"] == "MS4wLjABAAAA_right"
-    assert info["unique_id"] == "198785742"
+    assert info["unique_id"] == "999999106"
 
 
 def test_短号也要能对上():
@@ -102,10 +102,10 @@ def test_短号也要能对上():
     dy = _douyin()
     _假装搜索结果(dy, [{
         "sec_uid": "MS4wLjABAAAA_x",
-        "short_id": "198785742",
-        "nickname": "候鸟…",
+        "short_id": "999999106",
+        "nickname": "测试昵称C…",
     }])
-    info = dy._resolve_once("候鸟", by_nickname=True, want_dy="198785742")
+    info = dy._resolve_once("测试昵称C", by_nickname=True, want_dy="999999106")
     assert info is not None
     assert info["sec_uid"] == "MS4wLjABAAAA_x"
 
@@ -115,9 +115,9 @@ def test_没有抖音号可对时才认昵称():
     dy = _douyin()
     _假装搜索结果(dy, [{
         "sec_uid": "MS4wLjABAAAA_x", "unique_id": "111",
-        "nickname": "候鸟…",
+        "nickname": "测试昵称C…",
     }])
-    info = dy._resolve_once("候鸟…", by_nickname=True)
+    info = dy._resolve_once("测试昵称C…", by_nickname=True)
     assert info is not None
 
 
@@ -132,18 +132,18 @@ def test_抖音号搜索失败会重试一次(monkeypatch):
 
     def fake_resolve_once(unique_id, by_nickname=False, want_dy=""):
         calls.append(f"{unique_id}|{by_nickname}")
-        if unique_id == "198785742" and not by_nickname and calls.count(
-                "198785742|False") == 1:
+        if unique_id == "999999106" and not by_nickname and calls.count(
+                "999999106|False") == 1:
             return None          # 第一次搜不到
         if by_nickname:
             return None          # 昵称也没命中
-        return {"sec_uid": "MS4wLjABAAAA_right", "unique_id": "198785742",
-                "nickname": "候鸟…"}
+        return {"sec_uid": "MS4wLjABAAAA_right", "unique_id": "999999106",
+                "nickname": "测试昵称C…"}
 
     dy._resolve_once = fake_resolve_once
-    info = dy.resolve("198785742", nickname="候鸟…")
+    info = dy.resolve("999999106", nickname="测试昵称C…")
     assert info is not None
-    assert "198785742|False" in calls, "抖音号要重搜一次"
+    assert "999999106|False" in calls, "抖音号要重搜一次"
     assert any(c.endswith("|True") for c in calls), "中间要走一次昵称搜索"
 
 
@@ -157,8 +157,8 @@ def test_搜到了就不重试(monkeypatch):
         return {"sec_uid": "x", "unique_id": unique_id, "nickname": "n"}
 
     dy._resolve_once = fake_resolve_once
-    dy.resolve("198785742", nickname="候鸟…")
-    assert calls == ["198785742"]
+    dy.resolve("999999106", nickname="测试昵称C…")
+    assert calls == ["999999106"]
 
 
 def test_昵称是空的就不折腾():
@@ -171,5 +171,5 @@ def test_昵称是空的就不折腾():
         return None
 
     dy._resolve_once = fake_resolve_once
-    assert dy.resolve("198785742", nickname="") is None
-    assert calls == ["198785742"]
+    assert dy.resolve("999999106", nickname="") is None
+    assert calls == ["999999106"]

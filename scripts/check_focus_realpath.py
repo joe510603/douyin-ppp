@@ -21,7 +21,7 @@ from src.outreach.browser import Browser, frontmost_app  # noqa: E402
 from src.outreach.douyin_api import Douyin  # noqa: E402
 
 # 触达历史里真实发过评论的那个号
-TARGET = "155642154"
+TARGET = "999999104"
 DOUYIN = "https://www.douyin.com"
 
 

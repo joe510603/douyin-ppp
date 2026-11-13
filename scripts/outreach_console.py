@@ -12,9 +12,9 @@
     ▶ 读取待触达线索…
        待触达 200 条 → 本次挑 3 条
     ② 启动浏览器（窗口在屏幕外）…
-    [1/3] 42917865256　深夜的我　SU7　high
-      搜索：42917865256
-      ✓ 定位到 深夜的我（作品 67 条）
+    [1/3] 999999201　测试昵称R　SU7　high
+      搜索：999999201
+      ✓ 定位到 测试昵称R（作品 67 条）
       ✓ 选中作品 7698682290624408683　「77年9月的蛇出来结合一下」
       ✍️ [price] 老板，看到你在直播间问小米汽车的价格，可以找我了解下…
       🧪 干跑，不发送、不回写
@@ -29,7 +29,7 @@
     .venv/bin/python scripts/outreach_console.py --limit 3 --real
 
     # 只处理指定抖音号
-    .venv/bin/python scripts/outreach_console.py --only 42917865256 --real
+    .venv/bin/python scripts/outreach_console.py --only 999999201 --real
 
 ⚠️ 账号被判限流时冷却期内会拒绝启动（见 risk_cooldown_minutes）。
 """

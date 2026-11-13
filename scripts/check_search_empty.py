@@ -46,7 +46,7 @@ def main() -> int:
               f"{'sessionid' in names or 'sessionid_ss' in names}")
 
         # 搜一个号
-        q = "987714317"
+        q = "999999102"
         box = page.locator('input[placeholder*="搜索"]').first
         box.wait_for(state="visible", timeout=15000)
         box.click()

@@ -1,7 +1,7 @@
 """搜索被限流 ≠ 搜不到人（2026-11-12）
 
 用户反馈：
-「G1808575996、987714317、53722928132 我抽查了几个，用手机都能搜到，你这边是什么情况？」
+「999999101、999999102、999999103 我抽查了几个，用手机都能搜到，你这边是什么情况？」
 
 真相
 ----
@@ -150,7 +150,7 @@ def test_探针也搜不到就判定接口被限流():
 
     dy = _dy(_search)
     with pytest.raises(SearchUnavailable):
-        dy._resolve_once("987714317")
+        dy._resolve_once("999999102")
     assert Douyin.SEARCH_CANARY in calls, "判定前必须先探一次"
 
 
@@ -163,7 +163,7 @@ def test_探针能搜到就说明人是真的不在():
 
     dy = _dy(_search)
     # 不抛 SearchUnavailable，说明它当成「正常搜不到」
-    assert dy._resolve_once("987714317") is None
+    assert dy._resolve_once("999999102") is None
 
 
 def test_搜到目标就完全不探针():
@@ -172,12 +172,12 @@ def test_搜到目标就完全不探针():
 
     def _search(q, expect_hit=True, want_ids=None):
         calls.append(q)
-        return [_用户("987714317")]
+        return [_用户("999999102")]
 
     dy = _dy(_search)
-    info = dy._resolve_once("987714317")
-    assert info and info["sec_uid"] == "sec-987714317"
-    assert calls == ["987714317"], f"不该多探：{calls}"
+    info = dy._resolve_once("999999102")
+    assert info and info["sec_uid"] == "sec-999999102"
+    assert calls == ["999999102"], f"不该多探：{calls}"
 
 
 def test_探针结果有缓存不重复探():
@@ -252,7 +252,7 @@ def test_搜索要求验证时抛验证异常而不是搜不到():
     ]
 
     with pytest.raises(RiskControl) as ei:
-        dy._resolve_once("987714317")
+        dy._resolve_once("999999102")
     assert normalize_kind(getattr(ei.value, "kind", "")) == KIND_VERIFY
 
 

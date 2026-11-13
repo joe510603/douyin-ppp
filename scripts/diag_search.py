@@ -15,7 +15,7 @@ C. **真的搜不到这个人** —— 号失效了
 
 用法：
     .venv/bin/python scripts/diag_search.py                # 默认测几个之前失败的号
-    .venv/bin/python scripts/diag_search.py 198785742 123  # 指定抖音号
+    .venv/bin/python scripts/diag_search.py 999999106 123  # 指定抖音号
 """
 from __future__ import annotations
 
@@ -32,10 +32,10 @@ from src.outreach.douyin_api import Douyin  # noqa: E402
 
 # 之前被标「失败」的（都是被限流误杀的），外加一个已知能搜到的对照
 DEFAULT_TARGETS = [
-    "Mixue.1228",
-    "JJ882233er",
-    "713315435",
-    "198785742",   # 对照组：2026-11-12 实测 7~8 秒找到、认对过人
+    "test_user_d",
+    "test_user_c",
+    "999999110",
+    "999999106",   # 对照组：2026-11-12 实测 7~8 秒找到、认对过人
 ]
 
 

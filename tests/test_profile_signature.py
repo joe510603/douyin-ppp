@@ -74,9 +74,9 @@ def _douyin(page, works=None) -> Douyin:
 def _用户信息(**kw) -> str:
     user = {
         "sec_uid": "MS4wLjABAAAAxxxx",
-        "nickname": "永华：",
-        "unique_id": "yonghua38816",
-        "signature": "隆广顺大量招收学员，加盟电话13281975716",
+        "nickname": "测试昵称E：",
+        "unique_id": "test_user_a",
+        "signature": "隆广顺大量招收学员，加盟电话19900000001",
         "aweme_count": 3,
     }
     user.update(kw)
@@ -88,8 +88,8 @@ def _用户信息(**kw) -> str:
 def test_老接口能拿到完整简介():
     dy = _douyin(_FakePage(body=_用户信息()))
     got = dy.fetch_profile_info("MS4wLjABAAAAxxxx")
-    assert got and got["signature"].endswith("加盟电话13281975716")
-    assert got["nickname"] == "永华："
+    assert got and got["signature"].endswith("加盟电话19900000001")
+    assert got["nickname"] == "测试昵称E："
 
 
 def test_老接口不需要签名参数():
@@ -123,10 +123,10 @@ def test_空sec_uid直接返回None():
 def test_已知sec_uid的快路径也能拿到简介():
     """这条快路径**不搜索**，所以简介得单独去取"""
     page = _FakePage(body=_用户信息())
-    dy = _douyin(page, works=[{"aweme_id": "a1", "author_nickname": "永华："}])
+    dy = _douyin(page, works=[{"aweme_id": "a1", "author_nickname": "测试昵称E："}])
     got = dy.resolve_by_sec_uid("MS4wLjABAAAAxxxx")
-    assert got and got["signature"].endswith("加盟电话13281975716")
-    assert got["nickname"] == "永华："
+    assert got and got["signature"].endswith("加盟电话19900000001")
+    assert got["nickname"] == "测试昵称E："
 
 
 def test_老接口挂了退到主页DOM():

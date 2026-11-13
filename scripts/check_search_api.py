@@ -31,7 +31,7 @@ from playwright.sync_api import sync_playwright  # noqa: E402
 from src.config import get_config  # noqa: E402
 
 DOUYIN = "https://www.douyin.com"
-SEARCH_Q = "987714317"
+SEARCH_Q = "999999102"
 
 
 def main() -> int:

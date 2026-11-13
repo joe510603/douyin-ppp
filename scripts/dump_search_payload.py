@@ -28,7 +28,7 @@ from playwright.sync_api import sync_playwright  # noqa: E402
 from src.config import get_config  # noqa: E402
 
 DOUYIN = "https://www.douyin.com"
-Q = "987714317"
+Q = "999999102"
 
 
 def 找用户(obj, out: dict, path: str = "") -> None:

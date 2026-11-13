@@ -25,7 +25,7 @@ from playwright.sync_api import sync_playwright  # noqa: E402
 from src.config import get_config  # noqa: E402
 
 DOUYIN = "https://www.douyin.com"
-Q = "987714317"
+Q = "999999102"
 
 
 def _抓用户数(page, hits, marker):
@@ -84,7 +84,7 @@ def main() -> int:
         n = _抓用户数(page, hits, "A")
         print(f"  接口命中 {len(hits)} 次，解析出用户 {n} 个")
         txt = page.inner_text("body")
-        print(f"  页面里有「抖音号: 987714317」: {'987714317' in txt}")
+        print(f"  页面里有「抖音号: 999999102」: {'999999102' in txt}")
         print(f"  页面文本前 200: {txt[:200]!r}")
         if n:
             print("  ✅ 方案 A 可行")
