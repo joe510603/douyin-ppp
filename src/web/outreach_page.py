@@ -290,19 +290,36 @@ def create_outreach_page():
                         if getattr(o, "adaptive_delay", True):
                             from ..outreach.store import OutreachStore
                             slow = False
+                            slow_reason = ""
                             try:
-                                st = OutreachStore(config.app.db_path)
+                                # ⚠ 路径必须是 ``config.storage.db_path``。
+                                #   这里原来写的是 ``config.app.db_path`` ——
+                                #   那个字段**根本不存在**（AttributeError），
+                                #   而异常被下面的 except 吞掉了 →
+                                #   慢档状态永远读不到 → 页面**永远显示「快档」**。
+                                #   （2026-11-13 实测：实际在等 120 秒慢档，
+                                #     页面却写着「快档 20-30 秒」——
+                                #     用户会以为程序没按预期退避。）
+                                st = OutreachStore(config.storage.db_path)
                                 try:
-                                    slow = bool(st.speed_state().get("slow"))
+                                    state = st.speed_state()
+                                    slow = bool(state.get("slow"))
+                                    slow_reason = str(state.get("reason") or "")
                                 finally:
                                     st.close()
                             except Exception:
                                 pass
-                            delay_txt = (
-                                f"间隔 自适应·{'慢档' if slow else '快档'} "
-                                f"{int(o.fast_delay_min)}-{int(o.fast_delay_max)}"
-                                f"/{int(o.slow_delay_min)}-{int(o.slow_delay_max)} 秒"
-                            )
+                            if slow:
+                                delay_txt = (
+                                    f"间隔 自适应·**当前慢档** "
+                                    f"{int(o.slow_delay_min)}-{int(o.slow_delay_max)} 秒"
+                                    + (f"（{slow_reason[:30]}）" if slow_reason else "")
+                                )
+                            else:
+                                delay_txt = (
+                                    f"间隔 自适应·当前快档 "
+                                    f"{int(o.fast_delay_min)}-{int(o.fast_delay_max)} 秒"
+                                )
                         else:
                             delay_txt = f"间隔 {int(o.min_delay)}-{int(o.max_delay)} 秒"
                         outreach_info.text = (

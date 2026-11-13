@@ -1063,11 +1063,6 @@ class OutreachWorker:
         sent_in_run = 0
         max_err = int(o.fail_stop_threshold or 3)
 
-        profile = pathlib.Path(
-            pathlib.Path(self.cfg.app.db_path).parent
-            if hasattr(self.cfg.app, "db_path")
-            else "data"
-        ).parent
         profile_dir = pathlib.Path(o.profile_dir or "data/outreach_profile")
         if not profile_dir.is_absolute():
             profile_dir = pathlib.Path.cwd() / profile_dir

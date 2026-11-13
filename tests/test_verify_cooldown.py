@@ -333,3 +333,50 @@ def test_默认等待时长是30分钟():
 
     assert OutreachConfig.model_fields["captcha_wait_minutes"].default == 30
     assert OutreachConfig.model_fields["verify_cooldown_minutes"].default == 45
+
+
+# ============================================================
+# 回归：网页上的「快档/慢档」要显示真的那个
+# ============================================================
+
+def test_慢档状态能从存储层读出来(tmp_path):
+    """慢档是记在 DB 里的，页面必须能读到它
+
+    之前页面读的是 ``config.app.db_path`` —— 那个字段**根本不存在**，
+    AttributeError 被 except 吞掉 → 页面**永远显示「快档」**。
+    实测：实际在等 120 秒慢档，页面写着「快档 20-30 秒」。
+    """
+    st = OutreachStore(tmp_path / "t.db")
+    try:
+        st.set_slow_delay(60, "撞了风控")
+        assert st.speed_state()["slow"] is True
+        st.clear_slow_delay()
+        assert st.speed_state()["slow"] is False
+    finally:
+        st.close()
+
+
+def test_代码里不要再写app_db_path():
+    """钉死这个字段名：数据库路径只有 ``config.storage.db_path``
+
+    ``config.app`` 里没有 ``db_path``，写错了会 AttributeError。
+    之前就因为这个，页面上的快档/慢档显示一直是错的（异常被吞了，看不出来）。
+    """
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parent.parent
+    bad = []
+    for p in (root / "src").rglob("*.py"):
+        for i, line in enumerate(p.read_text(encoding="utf-8").splitlines(), 1):
+            code = line.split("#")[0]
+            if "app.db_path" in code:
+                bad.append(f"{p.relative_to(root)}:{i}")
+    assert not bad, f"这些地方还在用不存在的 config.app.db_path：{bad}"
+
+
+def test_配置里数据库路径字段是对的():
+    from src.config import get_config
+
+    cfg = get_config()
+    assert cfg.storage.db_path, "存储路径必须在 storage 配置里"
+    assert not hasattr(cfg.app, "db_path"), "app 里不该有 db_path（写了也是错的）"
