@@ -1084,6 +1084,7 @@ class LiveDetector:
         self,
         accounts: list[MonitorAccount],
         stagger_delay: float = 4.0,
+        max_concurrency: int = 0,
     ) -> dict[str, LiveRoomInfo]:
         """
         批量检测多个账号（并发）。
@@ -1091,10 +1092,22 @@ class LiveDetector:
         【2026-10-13 改动】原来是顺序扫描（9 个账号 × 15s = 2 分钟多），期间直播间上下播
         可能错过窗口。现在用 asyncio.gather 并发，所有账号一起检测，~15s 完成一轮。
 
+        ⚠ 但并发**不是越多越好**（2026-11-13 实测）：
+          每个账号都要**各启一个 Chromium**（Playwright 的 sync API 不能跨线程共用，
+          所以并发是靠线程数堆出来的），14 个账号并发 = 14 个浏览器同时起来，
+          实测吃掉 **290% CPU**（10 核机器 load average 17~27）。
+          而触达那边每分钟都在真发消息，它的浏览器被挤得搜索从 20 秒变成 46 秒。
+
+          所以这里加一个**并发上限**（默认 4 个）：
+          CPU 降到 ~85%，代价是一轮检测从 ~15 秒变成 ~55 秒
+          —— 开播后平均多等 40 秒才被发现。取舍得业务自己定，
+          配置项是 live_detection.max_concurrency。
+
         Args:
             accounts: 监控账号列表
             stagger_delay: 已废弃（保留参数兼容）。原本用于错峰避免同时请求，
                            现在浏览器实例天然隔离，并发不再有封禁风险。
+            max_concurrency: 同时最多检测几个账号（0 = 用配置里的值）
 
         Returns:
             {sec_user_id: LiveRoomInfo}
@@ -1102,12 +1115,24 @@ class LiveDetector:
         if not accounts:
             return {}
 
-        async def _detect_one(acc: MonitorAccount) -> tuple[str, LiveRoomInfo]:
+        if not max_concurrency:
             try:
-                return (acc.sec_user_id, await self.detect(acc))
-            except Exception as e:
-                log.error(f"批量检测异常 [{acc.name}]: {e}")
-                return (acc.sec_user_id, LiveRoomInfo(status=False))
+                from ..config import get_config
+                max_concurrency = int(get_config().live_detection.max_concurrency or 4)
+            except Exception:
+                max_concurrency = 4
+        max_concurrency = max(1, int(max_concurrency))
+
+        # 信号量：把「同时起几个浏览器」限制住
+        sem = asyncio.Semaphore(max_concurrency)
+
+        async def _detect_one(acc: MonitorAccount) -> tuple[str, LiveRoomInfo]:
+            async with sem:
+                try:
+                    return (acc.sec_user_id, await self.detect(acc))
+                except Exception as e:
+                    log.error(f"批量检测异常 [{acc.name}]: {e}")
+                    return (acc.sec_user_id, LiveRoomInfo(status=False))
 
         # 并发跑所有账号，每个账号独立 LiveDetector（避免共享 httpx 跨 event loop）
         results = await asyncio.gather(

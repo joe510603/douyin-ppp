@@ -125,25 +125,25 @@ def test_没有抖音号可对时才认昵称():
 # 重试：抖音的搜索结果不稳定
 # ============================================================
 
-def test_抖音号搜索失败会重试一次(monkeypatch):
-    """同一个号 18:36 搜不到、18:50 又搜到了 —— 值得重试一次"""
+def test_抖音号搜索失败不再重试(monkeypatch):
+    """砍掉第 3 次搜索（2026-11-13 用户拍板）
+
+    第 3 次就是把第 1 次原样重做一遍，只为对付抖音结果的概率性。
+    实测当天触发 2 次、0 次救回过人，每次赔上 20~40 秒。
+    搜不到的人会被跳过（终态），真要再给机会，人工在飞书里放回队列。
+
+    需要那个保险时：配置 search_retry=True（见 test_throughput.py）。
+    """
     dy = _douyin()
     calls: list[str] = []
 
     def fake_resolve_once(unique_id, by_nickname=False, want_dy=""):
         calls.append(f"{unique_id}|{by_nickname}")
-        if unique_id == "999999106" and not by_nickname and calls.count(
-                "999999106|False") == 1:
-            return None          # 第一次搜不到
-        if by_nickname:
-            return None          # 昵称也没命中
-        return {"sec_uid": "MS4wLjABAAAA_right", "unique_id": "999999106",
-                "nickname": "测试昵称C…"}
+        return None
 
     dy._resolve_once = fake_resolve_once
-    info = dy.resolve("999999106", nickname="测试昵称C…")
-    assert info is not None
-    assert "999999106|False" in calls, "抖音号要重搜一次"
+    assert dy.resolve("999999106", nickname="测试昵称C…") is None
+    assert calls.count("999999106|False") == 1, f"不该搜第三次：{calls}"
     assert any(c.endswith("|True") for c in calls), "中间要走一次昵称搜索"
 
 
