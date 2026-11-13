@@ -35,8 +35,8 @@ from .browser import Browser, Session
 from .copywriter import Copywriter
 from .douyin_api import (
     Douyin, DouyinError, KIND_LIMIT, KIND_LOGIN, KIND_SEARCH, KIND_VERIFY,
-    LeadNotFound, NoWorks, NotLoggedIn, RiskControl, SearchUnavailable,
-    VERIFY_TEXTS, normalize_kind,
+    LeadNotFound, NoWorks, NotLoggedIn, RiskControl, SearchNotReady,
+    SearchUnavailable, VERIFY_TEXTS, normalize_kind,
 )
 from .store import (
     STATUS_COMMENTED,
@@ -1145,6 +1145,43 @@ class OutreachWorker:
                             self.log(f"🛑 {self.stop_reason}")
                             self._emit(type="risk", lead=lead, error=self.stop_reason,
                                        kind="limit")
+                            break
+                    except SearchNotReady as e:
+                        # 搜索**动作没在页面上跑起来** —— 这不是限流！
+                        #
+                        # 为什么不能按限流处理（2026-11-13 现场日志）：
+                        #   12:36:58  判「搜索接口被限流」（探针搜「小米」也空）
+                        #   12:38:31  同样的搜索 **16.7 秒就成功了**
+                        # 抖音的限流窗口活不过 90 秒，把它当铁证 →
+                        #   · 白等 90~120 秒慢档
+                        #   · 线索退回 pending
+                        #   · 一轮下来少触达一批人
+                        #
+                        # 而「动作没跑起来」是**我们自己没把搜索做出来**
+                        #（页面没渲染完 / 回车没触发 / 点 tab 没点上），
+                        # 退避对它一点用没有。
+                        #
+                        # 所以：不切慢档，退回 pending 下一轮再试。
+                        # 但仍然计入连续异常 —— 连续多次都做不出搜索，
+                        # 说明浏览器/页面出了真问题，该停下来等人看一眼。
+                        consecutive_errors += 1
+                        consecutive_not_found = 0
+                        summary["skipped"] += 1
+                        self.log(f"  🔁 {e}（不是限流，下轮再试）")
+                        self._set_status(
+                            lead, STATUS_PENDING,
+                            f"搜索没跑起来，下轮重试：{str(e)[:80]}",
+                        )
+                        self._emit(type="failed", lead=lead, error=str(e))
+                        if consecutive_errors >= max_err:
+                            self.stop_reason = (
+                                f"连续 {consecutive_errors} 条都做不出搜索"
+                                f"（搜索动作没跑起来，不是限流），主动停手"
+                            )
+                            self._stop_kind = KIND_SEARCH
+                            self.log(f"🛑 {self.stop_reason}")
+                            self._emit(type="risk", lead=lead,
+                                       error=self.stop_reason, kind=KIND_SEARCH)
                             break
                     except SearchUnavailable as e:
                         # 搜索接口返回空、而且**没有**「要求验证」的信号

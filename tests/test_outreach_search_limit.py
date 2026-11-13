@@ -121,7 +121,18 @@ def _dy(search_impl, log=None) -> Douyin:
     dy.ensure_login = lambda: None
     dy.check_risk = lambda: None
     dy._body_text = lambda: ""
-    dy._search = search_impl
+
+    def _search(q, expect_hit=True, want_ids=None, evidence=None):
+        data = search_impl(q, expect_hit=expect_hit, want_ids=want_ids)
+        if evidence is not None:
+            # 假实现默认「抖音回话了，只是用户列表是空的」→ 真限流。
+            # （「压根没搜起来」那种情况由 test_search_not_throttled.py 覆盖）
+            evidence.update({"hits": 1, "user_hits": 1, "empty_bodies": 0,
+                             "statuses": [200], "parsed": len(data),
+                             "search_ran": True})
+        return data
+
+    dy._search = _search
     return dy
 
 

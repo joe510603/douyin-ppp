@@ -14,6 +14,7 @@ import json
 import pathlib
 import random
 import time
+import urllib.parse
 from typing import Any, Callable, Optional
 
 
@@ -166,6 +167,30 @@ class SearchUnavailable(DouyinError):
     """
 
 
+class SearchNotReady(DouyinError):
+    """搜索**动作根本没在页面上跑起来** —— 这不是限流
+
+    为什么要有这个类型（2026-11-13 实测）：
+    「搜不到用户」一直有两种含义被混为一谈：
+      a) 抖音被限流 → 真的停手
+      b) **页面压根没发起搜索**（搜索框没渲染出来 / 回车没触发 / 点了 tab 但接口没对上）
+         → 这跟限流毫无关系，是**我们自己没把搜索做出来**
+
+    怎么分清（靠证据，不靠猜）：
+      · 抓到了 ``discover/search`` 响应、里面 ``user_list`` 是空的 → 抖音限流（a）
+      · **一个**用户列表响应都没抓到 → 搜索动作没跑起来（b）
+
+    证据来自 2026-11-13 的现场日志：
+      12:36:58 判「搜索接口被限流」（探针搜「小米」也空）
+      12:38:31 同样的搜索 **16.7 秒就成功了**
+    —— 抖音的限流窗口活不过 90 秒，却被当成了铁证，
+    于是白等 90~120 秒慢档，还把线索退回队列。
+
+    处理：退回 pending 下一轮再试，**不切慢档、不算异常停手**
+    （真限流才值得退避；这是偶发的自己做坏了）。
+    """
+
+
 class Douyin:
     def __init__(self, page: Page, shot_dir: str | pathlib.Path | None = None,
                  log: Callable[[str], None] = print):
@@ -190,8 +215,16 @@ class Douyin:
         # user_list（实测 status_code=0、cursor=10、user_list=[]）。
         # 所以「搜某人返回 0 个用户」有两种完全不同的含义，
         # 得靠探针（搜一个一定搜得到的词）才能分清。
+        #
+        # ⚠️ 这里存的是**三态**，不是布尔（2026-11-13）：
+        #   ok        = 接口正常
+        #   throttled = 抖音真限流（回话了，只是用户列表是空的）
+        #   not_run   = 搜索动作压根没跑起来（**不是限流**，是自己没做成）
+        # 以前只有布尔，把 not_run 也当成 throttled →
+        # 白等 90~120 秒慢档，还白白丢掉一批线索。
         self._search_health_at = 0.0
-        self._search_healthy = True
+        self._search_health_state = "ok"
+        self._search_health_reason = ""
         # 最近一次搜索返回的用户（批量缓存 sec_uid 用）
         self.last_search_users: list[dict] = []
         # 主页作品缓存（sec_uid → 作品列表）
@@ -405,7 +438,9 @@ class Douyin:
                  mid_hook: Optional[Callable[[], None]] = None,
                  pager: Optional[Callable[[], None]] = None,
                  found: Optional[Callable[[list], bool]] = None,
-                 page_budget: int = 12000) -> list[dict]:
+                 page_budget: int = 12000,
+                 evidence: Optional[dict] = None,
+                 abort_if: Optional[Callable[[], bool]] = None) -> list[dict]:
         """执行 action，同时抓指定接口的响应
 
         url_part: 匹配 URL 的子串，也可以传一组子串（任一命中就算）
@@ -414,12 +449,19 @@ class Douyin:
         pager: 首屏出来之后，用来「翻出下一页」的回调（往下滚）
         found: 判断是不是已经找到目标了（参数是已抓到的所有响应）
         page_budget: 翻页最多花多少毫秒
+        evidence: 把「到底发生了什么」的证据写进这个 dict（给上层判断用）
+        abort_if: 每轮等待前问一次，返回 True 就**立刻放弃等待**、返回已抓到的
+                  （用在「动作压根没跑起来」时，别白等满 timeout）
         """
         parts = (url_part,) if isinstance(url_part, str) else tuple(url_part)
         hits: list[Response] = []
         parsed: list[dict] = []
         done: list[bool] = [False]
         cursor: list[int] = [0]
+
+        if evidence is not None:
+            evidence.update({"hits": 0, "user_hits": 0, "empty_bodies": 0,
+                             "statuses": [], "parsed": 0})
 
         def on_resp(r: Response) -> None:
             try:
@@ -432,10 +474,26 @@ class Douyin:
             while cursor[0] < len(hits):
                 r = hits[cursor[0]]
                 cursor[0] += 1
+                raw = ""
                 try:
-                    parsed.extend(self._parse_jsonish(r.text()))
+                    raw = r.text()
                 except Exception:
                     pass
+                try:
+                    parsed.extend(self._parse_jsonish(raw))
+                except Exception:
+                    pass
+                if evidence is not None:
+                    evidence["hits"] += 1
+                    try:
+                        evidence["statuses"].append(r.status)
+                    except Exception:
+                        pass
+                    if not (raw or "").strip():
+                        # 抖音限流最典型的表现：HTTP 200 但**响应体是空的**
+                        evidence["empty_bodies"] += 1
+                    if any("user_list" in j for j in parsed if isinstance(j, dict)):
+                        evidence["user_hits"] += 1
                 if expect and any(expect(j) for j in parsed):
                     done[0] = True
 
@@ -450,6 +508,14 @@ class Douyin:
                     self.log(f"  （预热动作没成功：{str(e).splitlines()[0][:50]}）")
             end = time.time() + timeout / 1000
             while time.time() < end:
+                # 提前放弃：动作压根没跑起来就别白等满 timeout
+                # （实测：搜索没跑起来 → 白等 40 秒 → 被误判成「限流」）
+                if abort_if is not None:
+                    try:
+                        if abort_if():
+                            break
+                    except Exception:
+                        pass
                 self.page.wait_for_timeout(250)
                 drain()
                 if done[0]:
@@ -476,6 +542,8 @@ class Douyin:
                     pager()
                     self.page.wait_for_timeout(900)
                     drain()
+            if evidence is not None:
+                evidence["parsed"] = len([j for j in parsed if j])
             return [j for j in parsed if j]
         finally:
             try:
@@ -584,8 +652,68 @@ class Douyin:
                     return t
         return ""
 
+    # 搜索动作在页面上「真的执行了」的判据：URL 跳到了搜索结果页
+    _SEARCH_URL_MARK = "/search/"
+
+    def _type_in_search_box(self, q: str) -> bool:
+        """在**当前页面**的搜索框里输入 q 并回车
+
+        返回 False = 这一页没有可用的搜索框（调用方去回首页）。
+
+        ⚠ 为什么不能直接用 ``.first``（2026-11-13 实测）：
+        搜索结果页上有**两个**匹配 ``input[placeholder*="搜索"]`` 的元素 ——
+        一个是可见的（"搜索你感兴趣的内容"，392×36），
+        另一个是**隐藏的**（尺寸 0×0，是搜索弹层里的那个，placeholder 就叫「搜索」）。
+        DOM 顺序一变，``.first`` 就会挑中隐藏的那个，
+        ``wait_for(visible)`` 等满 8 秒 → 白等 + 这次搜索直接废掉。
+        所以用 ``:visible`` 只挑真正看得见的那个。
+        """
+        try:
+            box = self.page.locator('input[placeholder*="搜索"]:visible').first
+            box.wait_for(state="visible", timeout=3000)
+            box.click()
+            self.page.wait_for_timeout(random.randint(200, 500))
+            box.fill(q)
+            self.page.wait_for_timeout(random.randint(200, 500))
+            self.page.keyboard.press("Enter")
+            return True
+        except Exception as e:
+            self.log(f"  （这页的搜索框用不了：{str(e).splitlines()[0][:50]}）")
+            return False
+
+    def _wait_search_url(self, url_before: str, q: str = "",
+                         timeout: float = 8.0) -> bool:
+        """等 URL 跳到搜索结果页 —— 证明搜索动作**真的执行了**
+
+        为什么必须有这个判定（2026-11-13 用户亲眼看到的现象）：
+        「日志写着『搜索：HAJImi』，浏览器上却根本没有搜索动作」。
+        没有这个判定，代码会白等满 40 秒超时，
+        然后把「没搜到」当成「被限流」——
+        而其实是自己没把搜索做出来（首页没渲染完 / 回车没触发）。
+
+        抖音搜索完会跳到 ``/jingxuan/search/{关键词}``，
+        所以「URL 里有 /search/」就是搜索动作执行了的证据。
+
+        ⚠️ 光比「URL 变了」不够：**搜同一个词**时 URL 可能一模一样
+        （探针固定搜「小米」，连着两次就会撞上），
+        所以再补一条「URL 里含这个词」的判据。
+        """
+        needle = urllib.parse.quote(str(q or ""), safe="")
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            now = self.page.url or ""
+            if self._SEARCH_URL_MARK in now:
+                if now != url_before:
+                    return True
+                # URL 没变 → 可能是搜了同一个词，看 URL 里有没有这个词
+                if needle and needle in now:
+                    return True
+            self.page.wait_for_timeout(200)
+        return False
+
     def _search(self, q: str, expect_hit: bool = True,
-                want_ids: Optional[list[str]] = None) -> list[dict]:
+                want_ids: Optional[list[str]] = None,
+                evidence: Optional[dict] = None) -> list[dict]:
         """像真人一样用搜索框搜。
 
         实测（2026-11）：直接 goto /search/{q}?type=user 页面是空的（SPA 路由不认），
@@ -604,17 +732,39 @@ class Douyin:
         ``want_ids`` = 目标人的抖音号。传了它就会**往下翻页**去找，
         直到找到目标 / 抖音说没下一页了（抖音一次只给 6~10 个人，
         目标常常在第 2、3 页）。
+
+        ``evidence`` = 把「到底发生了什么」写进这个 dict：
+          · ``search_ran``  搜索动作在页面上真的执行了吗
+          · ``user_hits``   抓到了几个**用户列表**响应（>0 = 抖音回话了）
+          · ``hits``        抓到了几个搜索相关响应（>0 但 user_hits=0 = tab 没点上）
+        上层靠它分清「真限流」和「我们自己没把搜索做出来」——
+        这两件事以前被混为一谈，代价是白等 90 秒 + 白白丢掉一批线索。
         """
+        ev: dict = evidence if evidence is not None else {}
+
         def do_search() -> None:
+            """在页面上真的执行一次搜索"""
+            url_before = self.page.url or ""
+            # 先试**当前页**的搜索框：
+            #   · 少加载一次首页 = 快 3~5 秒
+            #   · 也少一次「首页还没渲染完、搜索框点不着」的机会
+            #     （实测搜索没跑起来时，浏览器上看起来就是「根本没搜」）
+            #
+            # ⚠ 但浏览器刚启动时页面是 about:blank（连 douyin.com 都不是），
+            #   在那儿等搜索框纯属白等 8 秒 —— 直接去首页。
+            cur = self.page.url or ""
+            if cur and "douyin.com" in cur:
+                if self._type_in_search_box(q) and self._wait_search_url(url_before, q, 8):
+                    ev["search_ran"] = True
+                    return
+            # 当前页不行 → 回首页重搜一次
             self._goto(f"{DOUYIN}/")
             self.page.wait_for_timeout(random.randint(800, 1500))
-            box = self.page.locator('input[placeholder*="搜索"]').first
-            box.wait_for(state="visible", timeout=15000)
-            box.click()
-            self.page.wait_for_timeout(random.randint(200, 500))
-            box.fill(q)
-            self.page.wait_for_timeout(random.randint(200, 500))
-            self.page.keyboard.press("Enter")
+            url_before = self.page.url or ""
+            if self._type_in_search_box(q):
+                ev["search_ran"] = self._wait_search_url(url_before, q, 10)
+            else:
+                ev["search_ran"] = False
 
         def hit(j: dict) -> bool:
             """响应到了就算数，**不强求「搜到目标」**
@@ -666,14 +816,35 @@ class Douyin:
                     return True
             return False
 
-        data = self._capture(
-            ("discover/search", "general/search"),
-            do_search, timeout=40000, expect=hit, settle=1500,
-            mid_hook=self._click_user_tab,
-            pager=self._scroll_more_users if want else None,
-            found=_hit_target if want else None,
-            page_budget=15000,
-        )
+        data: list[dict] = []
+        for attempt in range(2):
+            ev.update({"search_ran": False, "hits": 0, "user_hits": 0,
+                       "empty_bodies": 0, "statuses": [], "parsed": 0})
+            data = self._capture(
+                ("discover/search", "general/search"),
+                do_search, timeout=40000, expect=hit, settle=1500,
+                mid_hook=self._click_user_tab,
+                pager=self._scroll_more_users if want else None,
+                found=_hit_target if want else None,
+                page_budget=15000,
+                evidence=ev,
+                # 搜索动作压根没跑起来 → 别白等满 40 秒
+                abort_if=lambda: not ev.get("search_ran"),
+            )
+            users = self._extract_users(data)
+            if users:
+                break
+            if ev.get("user_hits"):
+                # 抖音回话了，只是用户列表是空的 → **这是答案**，不是故障
+                break
+            # 一个用户列表响应都没有 —— 这**不是限流**：
+            #   · search_ran=False → 页面压根没发起搜索（动作没跑起来）
+            #   · hits>0           → 只回了综合 tab 的响应（「用户」tab 没点上）
+            # 这两种都是**我们自己没把搜索做出来**，重做一遍就好。
+            if attempt == 0:
+                self.log("  （没拿到用户列表，重做一次搜索）")
+                continue
+            break
         # 首屏没命中时再多等一会儿（分几段推过来的）
         if not self._extract_users(data):
             self.page.wait_for_timeout(1500)
@@ -712,15 +883,21 @@ class Douyin:
 
     def _health_ttl(self) -> int:
         """探针结论的有效期：正常的结论留久一点，被限流的结论过期快"""
-        return self.SEARCH_HEALTH_TTL if self._search_healthy else self.SEARCH_UNHEALTHY_TTL
+        return (self.SEARCH_HEALTH_TTL
+                if self._search_health_state == "ok"
+                else self.SEARCH_UNHEALTHY_TTL)
 
     def _search_known_throttled(self) -> bool:
         """已知搜索接口此刻是废的（探针结论还在有效期内）
 
         用来在**搜索之前**就短路 —— 明知搜了也是白等 20~40 秒，
         不如直接告诉 worker「搜索被限流了」。
+
+        ⚠ 只有**真限流**才短路。
+        「搜索动作没跑起来」（not_run）不算限流 —— 实测它 90 秒后就自己好了，
+        当成限流去退避纯属白白浪费一轮触达。
         """
-        if self._search_healthy or not self._search_health_at:
+        if self._search_health_state != "throttled" or not self._search_health_at:
             return False
         return (time.time() - self._search_health_at) < self.SEARCH_UNHEALTHY_TTL
 
@@ -737,17 +914,25 @@ class Douyin:
         所以之前两种情况混在一起，分不清「这批人都失效了」还是「接口坏了」。
 
         解法：再搜一个**一定搜得到**的词（金丝雀）。
-          · 金丝雀也搜不到 → 接口坏了 → SearchUnavailable（停手）
-          · 金丝雀能搜到   → 接口是好的 → 目标不在结果里 → LeadNotFound（跳过）
+          · 金丝雀能搜到        → 接口是好的 → 目标不在结果里 → LeadNotFound（跳过）
+          · 金丝雀回了个空列表  → **真限流** → SearchUnavailable（停手）
+          · 金丝雀压根没搜起来  → **不是限流**（我们自己没做成）→ SearchNotReady
+
+        ⚠️ 最后这一档是 2026-11-13 补的（现场证据）：
+          12:36:58 判「搜索接口被限流」（探针搜「小米」也空）
+          12:38:31 同样的搜索 **16.7 秒就成功了**
+        抖音的限流窗口活不过 90 秒，把它当铁证 →
+        白等 90~120 秒慢档 + 线索退回队列 + 少触达一批人。
 
         ⚠️ 探针结果要缓存：探针自己也是一次搜索，
         每条搜不到的线索都探一次 = 搜索次数翻倍 = 更快撞上限流。
         """
         if not force and (time.time() - self._search_health_at) < self._health_ttl():
-            return self._search_healthy
+            return self._search_health_state == "ok"
         canary = self.SEARCH_CANARY
+        ev: dict = {}
         try:
-            data = self._search(canary, expect_hit=False)
+            data = self._search(canary, expect_hit=False, evidence=ev)
             users = self._extract_users(data)
             healthy = bool(users)
         except RiskControl:
@@ -757,12 +942,23 @@ class Douyin:
         except Exception as e:
             self.log(f"  ⚠️ 探测搜索接口失败：{str(e).splitlines()[0][:80]}")
             healthy = False
+            ev = {}
         self._search_health_at = time.time()
-        self._search_healthy = healthy
         if healthy:
+            self._search_health_state = "ok"
+            self._search_health_reason = ""
             self.log(f"  🔎 探测：搜「{canary}」能搜到 {len(users)} 个用户 → 搜索接口正常")
+        elif ev.get("user_hits"):
+            # 抖音给了用户列表响应，只是里面是空的 → **真限流**
+            self._search_health_state = "throttled"
+            self._search_health_reason = "throttled"
+            self.log(f"  🔎 探测：搜「{canary}」返回了**空的用户列表** → 搜索接口被限流了")
         else:
-            self.log(f"  🔎 探测：搜「{canary}」也一个用户都没有 → 搜索接口被限流了")
+            # 一个用户列表响应都没抓到 → **不是限流**，是搜索动作没跑起来
+            self._search_health_state = "not_run"
+            self._search_health_reason = "not_run"
+            self.log(f"  🔎 探测：搜「{canary}」**压根没发起搜索请求**"
+                     f"（不是限流，是搜索动作没跑起来）")
         return healthy
 
     def resolve(self, unique_id: str, nickname: str | None = None) -> dict | None:
@@ -876,6 +1072,16 @@ class Douyin:
             # 也会停错手、发错通知。
             healthy = self._probe_search_health()
             if not healthy:
+                # ⚠️ 探针的结论要**按证据**分两种（2026-11-13）：
+                #   throttled = 抖音回话了、用户列表是空的 → **真限流**
+                #   not_run   = 压根没抓到用户列表响应 → 搜索动作没跑起来，
+                #               这跟限流无关（实测 90 秒后同样的搜索就成功了）
+                # 以前两种都抛 SearchUnavailable → 切慢档 90~120 秒、
+                # 线索退回队列，白白少触达一批人。
+                if self._search_health_state == "not_run":
+                    raise SearchNotReady(
+                        f"搜索动作没跑起来（页面没发起搜索请求）：搜「{q}」"
+                    )
                 raise SearchUnavailable(
                     f"搜索接口返回空（疑似被抖音限流）：搜「{q}」一个用户都没返回，"
                     f"探针搜「{self.SEARCH_CANARY}」同样为空"

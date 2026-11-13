@@ -65,7 +65,7 @@ def test_探针判定限流后_搜索前就短路():
     """探针说接口废了 → 下一条线索连搜都不用搜"""
     d = _douyin()
     # 假装刚刚探针判定失败
-    d._search_healthy = False
+    d._search_health_state = "throttled"
     d._search_health_at = time.time()
     assert d._search_known_throttled() is True
 
@@ -79,14 +79,14 @@ def test_限流结论过期得比正常结论快():
 def test_限流结论过期之后就不短路了():
     """过期了就重新搜 —— 限流可能已经恢复了"""
     d = _douyin()
-    d._search_healthy = False
+    d._search_health_state = "throttled"
     d._search_health_at = time.time() - (d.SEARCH_UNHEALTHY_TTL + 5)
     assert d._search_known_throttled() is False
 
 
 def test_接口正常时永远不短路():
     d = _douyin()
-    d._search_healthy = True
+    d._search_health_state = "ok"
     d._search_health_at = time.time()
     assert d._search_known_throttled() is False
 
@@ -94,6 +94,6 @@ def test_接口正常时永远不短路():
 def test_探针缓存_健康结论用长有效期():
     """接口正常时，探针结论留 5 分钟（少做无谓的探针搜索）"""
     d = _douyin()
-    d._search_healthy = True
+    d._search_health_state = "ok"
     d._search_health_at = time.time()
     assert d._health_ttl() == d.SEARCH_HEALTH_TTL
