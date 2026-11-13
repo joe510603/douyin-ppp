@@ -655,7 +655,7 @@ class Douyin:
     # 搜索动作在页面上「真的执行了」的判据：URL 跳到了搜索结果页
     _SEARCH_URL_MARK = "/search/"
 
-    def _type_in_search_box(self, q: str) -> bool:
+    def _type_in_search_box(self, q: str, timeout: int = 3000) -> bool:
         """在**当前页面**的搜索框里输入 q 并回车
 
         返回 False = 这一页没有可用的搜索框（调用方去回首页）。
@@ -670,7 +670,7 @@ class Douyin:
         """
         try:
             box = self.page.locator('input[placeholder*="搜索"]:visible').first
-            box.wait_for(state="visible", timeout=3000)
+            box.wait_for(state="visible", timeout=timeout)
             box.click()
             self.page.wait_for_timeout(random.randint(200, 500))
             box.fill(q)
@@ -757,11 +757,28 @@ class Douyin:
                 if self._type_in_search_box(q) and self._wait_search_url(url_before, q, 8):
                     ev["search_ran"] = True
                     return
+                # ⚠ 输入进去了、页面却没跳 → 在**当前页**再敲一次
+                #   （抖音搜索框有时要再敲一下才触发）。
+                #   这比「回首页重搜」快一个数量级 —— 回首页实测要 80+ 秒。
+                if self._type_in_search_box(q) and self._wait_search_url(url_before, q, 6):
+                    ev["search_ran"] = True
+                    return
             # 当前页不行 → 回首页重搜一次
-            self._goto(f"{DOUYIN}/")
-            self.page.wait_for_timeout(random.randint(800, 1500))
+            #
+            # ⚠ 只等「响应头」（commit），**不等整页资源**：
+            #   实测 2026-11-13，等 domcontentloaded 要 80+ 秒
+            #   （首页很重，而且机器上同时跑着直播检测的十几个浏览器），
+            #   而搜索框是首屏元素，commit 之后 1~2 秒就点得到。
+            #   这一步是触达吞吐的大头：省下 70 秒 × 每一条 = 一轮省 20+ 分钟。
+            try:
+                self._goto(f"{DOUYIN}/", wait="commit", timeout=20000, retries=0)
+            except Exception as e:
+                self.log(f"  （回首页失败：{str(e).splitlines()[0][:50]}）")
+                ev["search_ran"] = False
+                return
+            self.page.wait_for_timeout(random.randint(1500, 2500))
             url_before = self.page.url or ""
-            if self._type_in_search_box(q):
+            if self._type_in_search_box(q, timeout=8000):
                 ev["search_ran"] = self._wait_search_url(url_before, q, 10)
             else:
                 ev["search_ran"] = False
