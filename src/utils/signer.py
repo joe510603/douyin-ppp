@@ -107,18 +107,23 @@ def generate_a_bogus(params: str, user_agent: str = "", js_file: Optional[str] =
     
     try:
         import execjs
-        
+    except ImportError:
+        # PyExecJS 早从 requirements 里移除了（改用 xhshow 纯算法 / Node 签名服务），
+        # 所以这条路**永远不会成功**。而调用方本来就容错（`if a_bogus: ...`），
+        # 每次都打一条 ERROR 只会把真错误淹在噪音里。
+        # 抖音 web 端真正的签名走 websdk 服务（3010 端口），不是这条。
+        log.debug("未安装 PyExecJS，跳过本地 a_bogus（改由 Node 签名服务负责）")
+        return ""
+
+    try:
         # 读取并编译 JS 文件
         code = js_path.read_text(encoding="utf-8-sig")
         ctx = execjs.compile(code)
-        
+
         # 调用签名函数（MediaCrawler 使用 sign_datail 函数）
         result = ctx.call("sign_datail", params, user_agent)
-        
+
         return str(result) if result else ""
-    except ImportError:
-        log.error("未安装 PyExecJS，请运行: pip install PyExecJS")
-        return ""
     except Exception as e:
         log.error(f"a_bogus 生成失败: {e}", exc_info=True)
         return ""
