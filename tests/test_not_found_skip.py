@@ -340,6 +340,33 @@ def test_人工放回队列计数清零(tmp_path):
 # 阈值可配置
 # ============================================================
 
+def test_同步标记能在别的线程写(tmp_path):
+    """on_ok 回调跑在飞书推送的**后台线程**里
+
+    2026-11-13 实测踩过：SQLite objects created in a thread can only be
+    used in that same thread → 标记一直更新不上，回拉就一直不采纳人工的放回。
+    store 的连接必须允许跨线程使用（SQLite 是 serialized 模式，安全）。
+    """
+    import threading
+
+    db = _建库(tmp_path)
+    _加线索(db)
+    st = OutreachStore(db)
+    err: list[str] = []
+
+    def _写():
+        try:
+            st.set_synced_status(1, "待处理|已跳过")
+        except Exception as e:
+            err.append(str(e))
+
+    t = threading.Thread(target=_写)
+    t.start()
+    t.join()
+    assert not err, err
+    assert _读(db)[2] == "待处理|已跳过"
+
+
 def test_阈值可配置(tmp_path, monkeypatch):
     """阈值设 5 → 第 5 次才跳过，前 4 次都还能重试"""
     db = _建库(tmp_path)

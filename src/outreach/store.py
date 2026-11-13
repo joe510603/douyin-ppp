@@ -136,7 +136,14 @@ class OutreachStore:
     def __init__(self, db_path: str | pathlib.Path):
         self.db_path = pathlib.Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(str(self.db_path), timeout=15.0)
+        # ⚠ check_same_thread=False：这个 store 会被**飞书推送的后台线程**碰
+        #   （写成功后的 on_ok 回调要把「上次同步进飞书的状态」标记落库，
+        #   见 worker._push_feishu_status）。SQLite 默认的 C 库是
+        #   SERIALIZED 模式，同一连接上的访问由 C 层自己串行化，
+        #   所以跨线程用是安全的（再配 busy_timeout 兜住写锁竞争）。
+        self._conn = sqlite3.connect(
+            str(self.db_path), timeout=15.0, check_same_thread=False
+        )
         self._conn.row_factory = sqlite3.Row
         # 写锁最多等 15 秒再报 "database is locked"——主进程可能正在写线索
         self._conn.execute("PRAGMA busy_timeout=15000")
