@@ -80,14 +80,46 @@ def create_outreach_page():
     """创建抖音触达控制台页面"""
 
     async def _do_resume():
-        """人工验证完了，让触达接着跑"""
+        """人工验证完了，让触达接着跑
+
+        ⚠ 这里必须**同时**解除「自动触达」的暂停。
+
+        以前只叫醒 worker（runner.resume()），可要是那一轮已经因为
+        「等验证超时」结束了，自动触达那边早就标成「已暂停」——
+        这时点这个按钮就是**点了没反应**：
+        runner 说「现在没有在等验证」，自动触达也还停着，什么都没发生。
+        用户反馈的「图片验证手动过了，但是没反应了」就是这个。
+
+        只解除**验证**造成的暂停（「今天已发满」那种不能顺手解除，
+        否则点一下就提前开跑了）。
+        """
+        from ..outreach.auto_scheduler import get_auto_scheduler
+        from ..outreach.douyin_api import KIND_VERIFY
         from ..outreach.runner import get_outreach_runner
 
         runner = get_outreach_runner()
-        if runner.resume():
-            ui.notify("已继续", type="positive")
+        woke = runner.resume()
+
+        unpaused = False
+        try:
+            unpaused = get_auto_scheduler().clear_pause(
+                "人工验证完成", only_kind=KIND_VERIFY,
+            )
+        except Exception:
+            unpaused = False
+
+        if woke and unpaused:
+            ui.notify("已继续，触达和自动触达都接着跑", type="positive")
+        elif woke:
+            ui.notify("已继续，触达接着跑", type="positive")
+        elif unpaused:
+            ui.notify("已解除暂停，自动触达接着跑", type="positive")
         else:
-            ui.notify("现在没有在等验证", type="warning")
+            ui.notify(
+                "现在没有在等验证（自动触达也没在暂停）——"
+                "如果确实刚过完验证，点上面的「解除暂停」",
+                type="warning",
+            )
 
     async def _do_show_window():
         """把浏览器窗口叫到屏幕中间，让用户自己去操作验证

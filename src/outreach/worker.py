@@ -40,13 +40,16 @@ from .douyin_api import (
 )
 from .store import (
     STATUS_COMMENTED,
+    STATUS_CONVERTED,
     STATUS_FAILED,
     STATUS_FOUND,
+    STATUS_NOT_FOUND,
     STATUS_PENDING,
     STATUS_SEARCHING,
     STATUS_SKIPPED,
     OutreachStore,
 )
+from ..intelligence.contact_extractor import extract_contacts
 
 # 触达状态 → 飞书表「触达状态」列的文案
 FEISHU_STATUS = {
@@ -56,7 +59,35 @@ FEISHU_STATUS = {
     STATUS_COMMENTED: "已留言",
     STATUS_FAILED: "失败",
     STATUS_SKIPPED: "已跳过",
+    STATUS_NOT_FOUND: "搜不到",
+    STATUS_CONVERTED: "已留资",
 }
+
+
+def _is_transient_error(err: BaseException) -> bool:
+    """这个错误是不是「偶发的」？
+
+    偶发的错误**不该**把线索永久踢出队列——
+    待触达队列只挑 ``outreach_status='pending'``，
+    一旦标成 failed，这条线索就再也不会被处理。
+
+    实测（2026-11-13）：一次搜索限流 + 几次页面超时 / 连接被掐断，
+    就把 100 多条**完全有效**的线索判了死刑（failed 有 141 条，pending 只剩 50 条）。
+    而这些号在手机上全都是能搜到的。
+
+    判据（按可靠度排）：
+    - 异常类型是 TimeoutError（Playwright 的和内建的都算）
+    - 报错文本里有超时 / 连接被掐断的痕迹
+      （net::ERR_、ERR_CONNECTION、Timeout）
+    """
+    if type(err).__name__ == "TimeoutError":
+        return True
+    msg = str(err)
+    for kw in ("Timeout", "timeout", "net::ERR_", "ERR_CONNECTION",
+               "ERR_TIMED_OUT", "ERR_EMPTY_RESPONSE", "Connection reset"):
+        if kw in msg:
+            return True
+    return False
 
 
 def lead_to_copywriter_input(lead: dict) -> dict:
@@ -252,6 +283,8 @@ class OutreachWorker:
         self.show_window_event = show_window_event
         # 正在等人工验证
         self.waiting_human = False
+        # 手上正在处理的那条线索（轮次异常结束时靠它退回队列）
+        self._current_lead: Optional[dict] = None
         # 本轮临时覆盖的两条之间间隔（秒）；None = 用配置里的
         self._delay_min: Optional[float] = None
         self._delay_max: Optional[float] = None
@@ -459,6 +492,58 @@ class OutreachWorker:
             self.log(f"  （飞书通知失败：{err}）")
         return ok
 
+    def _notify_resumed(self, lead: Optional[dict] = None) -> bool:
+        """验证过了 → 主动告诉用户一声「已经恢复，接着发」
+
+        为什么必须有这个通知
+        ------------------
+        2026-11-13 用户反馈「图片验证出来后，手动过了，但是没反应了」。
+        查日志发现程序**其实恢复了**（09:54:32 自动检测到验证码已过，继续跑），
+        但用户肉眼看过去就是「什么都没发生」：
+
+        - 恢复只有一行内部日志，没人在意；
+        - 恢复后紧接着就撞上**搜索接口限流**，一条也没发出去；
+        - 然后进入慢档，每条要等 102 秒 → 屏幕上就是一直不動。
+
+        所以恢复必须**主动说一声**。让人知道：程序还活着、在跑、
+        以及为什么短时间内看不到留言（搜索限流，线索不会丢）。
+        """
+        n = self.cfg.notify
+        lines = [
+            "验证已经过了，触达**自动接着跑**，不用再点「继续」。",
+        ]
+        if lead:
+            lines.append(f"**正在重试**：抖音号 {lead.get('display_id') or ''}")
+        lines.append(
+            "如果接下来几分钟没看到留言，多半是抖音网页版搜索接口在限流"
+            "（不报错、就是搜不出人）。系统会自动退避重试，**线索不会丢**。"
+        )
+        if not (getattr(n, "risk_webhook_enabled", False)
+                and (n.risk_webhook_url or "").strip()):
+            self.log("  （没配群机器人，就不打扰你了）")
+            return False
+        try:
+            from ..notify.feishu import FeishuNotifier
+
+            notifier = FeishuNotifier(
+                webhook_url=n.risk_webhook_url,
+                secret=getattr(n, "risk_webhook_secret", "") or "",
+            )
+            ok, err = _run_coro_blocking(
+                notifier.send_info_card(
+                    title="✅ 抖音验证已通过，触达继续",
+                    lines=lines,
+                ),
+                timeout=30,
+            )
+        except Exception as e:
+            ok, err = False, str(e)
+        if ok:
+            self.log("  📣 已在飞书群里告诉你「验证已过，继续发」")
+        else:
+            self.log(f"  （群机器人没发出去：{err}）")
+        return ok
+
     def _bring_window_back(self) -> bool:
         """把浏览器窗口挪到屏幕中间并置前
 
@@ -585,6 +670,33 @@ class OutreachWorker:
             return False
         finally:
             self.waiting_human = False
+
+    def _release_current_lead(self) -> None:
+        """把「手上正在处理」的那条线索退回待触达
+
+        为什么需要
+        ----------
+        轮次异常结束（撞验证超时 / 进程被杀 / 抛异常）时，
+        手上那条会停在「搜索中」或「已定位」——
+        这俩都不是终态，而待触达队列只挑 ``pending``，
+        所以这条线索就**永远没人管了**（实测：卡了 3 条出不来）。
+
+        正常跑完的轮次不受影响：那条线索那时已经是
+        已留言 / 已跳过 / 失败 这些终态，不会被误改。
+        """
+        lead = getattr(self, "_current_lead", None)
+        if not lead:
+            return
+        self._current_lead = None
+        try:
+            row = self.st.get_lead(lead["id"])
+        except Exception:
+            return
+        if not row:
+            return
+        if row.get("outreach_status") in (STATUS_SEARCHING, STATUS_FOUND):
+            self._set_status(lead, STATUS_PENDING, "上一轮中断，重新排队")
+            self.log(f"  ↩ 中断时手上这条已退回队列（{lead.get('display_id')}）")
 
     def _recycle_page(self) -> None:
         """把当前页清空，释放视频解码占的内存"""
@@ -849,6 +961,10 @@ class OutreachWorker:
 
         run_id = self.st.start_run(dry)
         consecutive_errors = 0
+        # 每条线索「撞验证后重试」的次数（lead_id → 次数）
+        # 用来给「验证过了立刻回头重试」加个上限，防止
+        # 「验证→重试→又弹验证→再验证」变成死循环。
+        lead_retries: dict[int, int] = {}
         # 连续「搜不到人」的条数——用来区分「几个号失效了」和「搜索整体坏了」
         consecutive_not_found = 0
         sent_in_run = 0
@@ -896,6 +1012,9 @@ class OutreachWorker:
                         self._promote_hot_leads(picked, idx)
                     lead = picked[idx]
                     idx += 1
+                    # 记下「手上正在处理哪条」——
+                    # 轮次异常结束时靠它把这条退回队列（见 _release_current_lead）
+                    self._current_lead = lead
                     self.log(
                         f"\n[{idx}/{len(picked)}] {lead['display_id']}　{lead.get('nickname') or ''}"
                         f"　{lead.get('car_model') or '车型未知'}　{lead.get('intent_level') or ''}"
@@ -929,11 +1048,35 @@ class OutreachWorker:
                             self._bring_window_back()
                             self._notify_risk(KIND_VERIFY, str(e), lead)
                             if self._wait_for_human(str(e)):
-                                # 人工验证完了：这条线索退回待触达，重新来
+                                # 人工验证完了 → **回头重试这一条**，不是跳到下一条。
+                                #
+                                # 为什么（2026-11-13 用户反馈「触发了验证的抖音号好像被直接跳过了」）：
+                                #   验证码就是在**搜这个人**的时候弹的——人已经找到门口了，
+                                #   验证一过就该马上去敲他的门。跳到下一条 = 这个人白排一次队，
+                                #   还得再等下一轮（队列里几十个人，轮到他可能是一小时后）。
+                                try:
+                                    # 搜索阶段这条路径以前**没清**验证状态：
+                                    # 粘住的话，下一条线索刚开跑就被自己的旧状态拦死
+                                    # （跟发送阶段 2026-11-11 踩的是同一个坑）。
+                                    dy.clear_verify()
+                                except Exception:
+                                    pass
                                 self._set_status(lead, STATUS_PENDING, "验证码已人工处理，重新排队")
                                 self.stop_reason = ""
                                 self._stop_kind = ""
-                                self.log("↩ 继续处理队列")
+                                self._notify_resumed(lead)
+                                retries = lead_retries.get(lead["id"], 0) + 1
+                                lead_retries[lead["id"]] = retries
+                                max_retry = max(1, int(getattr(o, "verify_retry_max", 2) or 2))
+                                if retries <= max_retry:
+                                    # idx 在上面已经 +1 过，这里 -1 退回来 → 回头处理同一条
+                                    idx -= 1
+                                    self.log(f"↩ 验证已通过，回头重试这条（{retries}/{max_retry}）")
+                                else:
+                                    self.log(
+                                        f"↩ 验证已通过，但这条重试 {retries} 次仍撞验证，"
+                                        f"留在队列里下轮接着来"
+                                    )
                                 continue
                             self.stop_reason = f"验证码未人工处理：{e}"
                         else:
@@ -977,11 +1120,18 @@ class OutreachWorker:
                         summary["not_found"] = summary.get("not_found", 0) + 1
                         summary["skipped"] += 1
                         self.log(f"  ⏭️ {e}")
-                        self._set_status(lead, STATUS_SKIPPED, str(e))
+                        # ⚠ 不标 skipped（那是终态 = 永远不再触达）。
+                        # 「这一次没搜到」≠「这个人没了」：
+                        #   抖音一次只给 6~10 个人，目标常在第 2、3 页；
+                        #   而且搜索结果是概率性的（同号 18:36 搜不到、18:50 搜得到）。
+                        # 实测（2026-11-13）：抽查 4 个「搜不到」的号，3 个当场就搜到了。
+                        # 所以标成 not_found —— 留在队列里、排在一堆正常线索**后面**，
+                        # 等正常线索做完了再回头重试。
+                        self._set_status(lead, STATUS_NOT_FOUND, str(e))
                         self.st.add_touch(
                             lead_id=lead["id"], record_id=lead.get("bitable_record_id") or "",
                             display_id=lead["display_id"], nickname=lead.get("nickname") or "",
-                            status="skipped", error=str(e),
+                            status="not_found", error=str(e),
                         )
                         self._emit(type="skipped", lead=lead, error=str(e))
                         # 但如果**连续**这么多条全都搜不到人，
@@ -1013,7 +1163,26 @@ class OutreachWorker:
                         consecutive_not_found = 0
                         summary["failed"] += 1
                         self.log(f"  ❌ {e}")
-                        self._set_status(lead, STATUS_FAILED, str(e))
+                        # 搜索接口被限流 → 切慢档。
+                        # 为什么：限流就是「你搜太频繁了」的信号，这时候继续快档
+                        # 等于拿限流去撞限流，越撞越死（实测：每分钟空撞一轮，
+                        # 一小时下来把 100 多条线索全判了死刑）。
+                        self._enter_slow_mode(f"search: {str(e)[:60]}")
+                        # ⚠ 这里**不能**把线索标成 failed。
+                        #
+                        # 搜索接口被限流是**平台侧的故障**，跟这个人有没有效毫无关系
+                        # （同一个人换个时间可能就搜得到，限流是随机窗口）。
+                        # 而待触达队列只挑 outreach_status='pending'——
+                        # 一旦标成 failed，这条线索就**永久出局**，再也不会被触达。
+                        # 每撞一次限流就悄悄吃掉一批线索，等于静默的数据损失
+                        # （实测 2026-11-13：「薛菇凉」只是撞上一次搜索限流就被标 failed）。
+                        #
+                        # 所以设回 pending，下一轮接着试。
+                        # 30 天去重靠 outreach_records，不靠这个状态，所以不会重复打扰。
+                        self._set_status(
+                            lead, STATUS_PENDING,
+                            f"搜索接口被限流，稍后重试：{str(e)[:80]}",
+                        )
                         self._emit(type="failed", lead=lead, error=str(e))
                         if consecutive_errors >= max_err:
                             self.stop_reason = (
@@ -1032,7 +1201,15 @@ class OutreachWorker:
                         consecutive_not_found = 0
                         summary["failed"] += 1
                         self.log(f"  ❌ {e}")
-                        self._set_status(lead, STATUS_FAILED, str(e))
+                        if _is_transient_error(e):
+                            # 偶发的（页面超时、连接被掐断）→ 留在队列里下轮再试，
+                            # 别因为一次网络抖动就把这条线索判死刑。
+                            self._set_status(
+                                lead, STATUS_PENDING,
+                                f"临时故障，稍后重试：{str(e)[:80]}",
+                            )
+                        else:
+                            self._set_status(lead, STATUS_FAILED, str(e))
                         self.st.add_touch(
                             lead_id=lead["id"], record_id=lead.get("bitable_record_id") or "",
                             display_id=lead["display_id"], nickname=lead.get("nickname") or "",
@@ -1048,7 +1225,16 @@ class OutreachWorker:
                         consecutive_not_found = 0
                         summary["failed"] += 1
                         self.log(f"  ❌ 未预期错误：{type(e).__name__}: {e}")
-                        self._set_status(lead, STATUS_FAILED, f"{type(e).__name__}: {e}")
+                        if _is_transient_error(e):
+                            self._set_status(
+                                lead, STATUS_PENDING,
+                                f"临时故障，稍后重试：{type(e).__name__}: {str(e)[:60]}",
+                            )
+                        else:
+                            self._set_status(
+                                lead, STATUS_FAILED,
+                                f"{type(e).__name__}: {str(e)[:120]}",
+                            )
                         self._emit(type="failed", lead=lead, error=str(e))
                         if consecutive_errors >= max_err:
                             self.stop_reason = f"连续 {consecutive_errors} 次异常，主动停手"
@@ -1071,6 +1257,11 @@ class OutreachWorker:
                             self._sleep_between()
 
         finally:
+            # 轮次异常结束（撞验证超时、进程被杀、抛异常）时，
+            # 手上那条线索会停在「搜索中 / 已定位」——这俩都不是终态，
+            # 而待触达队列只挑 pending → 这条线索就**永远没人管了**。
+            # 实测（2026-11-13）：有 3 条卡在 searching/found 里出不来。
+            self._release_current_lead()
             self._page = None
             self._dy = None
             # 飞书状态是后台线程写的 → 收尾时等它排空，
@@ -1269,6 +1460,47 @@ class OutreachWorker:
         except Exception as e:
             self.log(f"  （批量缓存 sec_uid 失败：{str(e).splitlines()[0][:60]}）")
 
+    def _harvest_profile_contact(self, info: dict, lead: dict) -> None:
+        """从抖音主页简介里补联系方式
+
+        为什么要有这一步（用户 2026-11-13 要求）：
+        有些客户**不在弹幕里留电话**，直接把自己的联系方式写在**个人简介**里。
+        弹幕里没有联系方式 ≠ 这个人没法联系 —— 只看弹幕会漏掉一大半。
+
+        合并规则（跟弹幕来源的联系方式放一起）：
+        - 简介里的**同类**联系方式**不覆盖**弹幕里已有的
+          （弹幕是客户当场说的，更贴近这次问价；简介只负责「补」）
+        - 简介里的**不同类**（弹幕给了电话、简介给了微信）→ 追加，两个都留着
+
+        简介本身如果是广告引流（"加微信了解"那种），**照样记**：
+        那个微信号是他本人的，是真是同行让销售自己看内容判断，
+        程序替他们做主反而会漏掉真客户。
+        """
+        signature = str(info.get("signature") or "").strip()
+        if not signature:
+            return
+        c = extract_contacts([signature])
+        if not c.has_contact:
+            return
+        try:
+            changed, m_type, m_value = self.st.set_contact(
+                lead["id"], c.contact_type, c.value, prefer_new_same_type=False)
+        except Exception as e:
+            self.log(f"  （写联系方式失败：{str(e)[:60]}）")
+            return
+        if not changed:
+            # 联系方式本来就有（而且类型一样）→ 不用动，也不用同步飞书
+            self.log(f"  📞 简介里有联系方式，但已有的是同类型，保留原来的：{m_value}")
+            return
+        lead["contact_type"] = m_type
+        lead["contact_value"] = m_value
+        hint = "（像是引流内容，销售自己判断）" if c.is_spam else ""
+        self.log(f"  📞 简介里有联系方式：{m_value}{hint}")
+        # 同步飞书「联系方式」列（异步写，不阻塞触达）
+        record_id = lead.get("bitable_record_id") or ""
+        if record_id:
+            self._feishu.push(record_id, {"联系方式": m_value})
+
     def _handle_one(self, dy: Douyin, lead: dict, summary: dict) -> None:
         """处理一条线索：找人 → 挑作品 → 生成话术 → 发送 → 回查"""
         o = self.cfg.outreach
@@ -1309,6 +1541,8 @@ class OutreachWorker:
         self.log(f"  ✓ 定位到 {lead['nickname']}（作品 {info.get('aweme_count')} 条）")
         # 顺手把这次搜索拿到的 sec_uid 都存下来（下次不用再搜）
         self._cache_sec_uids(dy, lead)
+        # 简介里的联系方式（有人习惯把电话写在简介里，不在弹幕里说）
+        self._harvest_profile_contact(info, lead)
         _mark("找人")
 
         # b. 挑作品

@@ -262,6 +262,13 @@ class OutreachConfig(BaseModel):
     auto_round_gap_seconds: int = 60
     # 队列空了之后多久看一眼有没有新线索（秒）
     auto_idle_poll_seconds: int = 30
+    # 搜索接口被限流后，暂停自动触达多少分钟（到点自动重试）
+    #
+    # 为什么要有这个：抖音网页版的搜索被限流 = 「你搜太频繁了」。
+    # 这时候继续跑等于拿限流去撞限流，窗口一直续着。
+    # 实测（2026-11-13）：连续模式下一轮接一轮地撞，一小时把 100 多条
+    # 完全有效的线索全撞死了。停 30 分钟等它自己恢复最划算。
+    search_pause_minutes: int = 30
     # 每日留言上限（防风控）
     daily_limit: int = 30
     # 两次留言之间的随机延时区间（秒）
@@ -379,6 +386,15 @@ class OutreachConfig(BaseModel):
     # 等超过下面的分钟数没人管，就当放弃、结束本轮。
     captcha_wait_minutes: int = 15
     captcha_bring_to_front: bool = True
+
+    # 人工验证通过后，同一条线索最多重试几次
+    #
+    # 为什么要有上限：验证过了立刻回头重试是对的行为
+    # （验证码就是在搜这个人时弹的，人已经找到门口了），
+    # 但万一抖音立刻又弹一个，就会变成
+    # 「验证→重试→再验证→再重试」的循环，把人耗在这儿。
+    # 2 次够覆盖「第一次是搜索触发的、第二次是发评论触发的」这种常见情况。
+    verify_retry_max: int = 2
 
     # ---- 留言文案 ----
     # 话术库路径（留空用 src/outreach/templates.yaml）

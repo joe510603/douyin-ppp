@@ -186,6 +186,55 @@ class FeishuNotifier:
         }
         return await self.send_card(card)
 
+    async def send_info_card(
+        self,
+        title: str,
+        lines: list[str] | str = "",
+        at_open_id: str = "",
+    ) -> tuple[bool, str]:
+        """发一张「好消息」卡片（绿色）
+
+        跟 ``send_risk_card`` 的区别只有两点：颜色是绿的、不 @ 人。
+        但这两点很重要——「出事了」才需要强提醒（红卡片 + @），
+        「恢复了」再 @ 一次就是在打扰用户。
+
+        用途：人工验证通过后告诉用户「已经恢复，接着发」。
+        没有这张卡片，用户手动过完验证回头一看像「没反应」，
+        以为程序卡死了（2026-11-13 实测就是这个误解）。
+        """
+        if not self.is_configured:
+            return False, "未配置飞书 webhook"
+
+        if isinstance(lines, str):
+            lines = [lines] if lines else []
+        elements: list[dict] = []
+        if lines:
+            elements.append({
+                "tag": "div",
+                "text": {"tag": "lark_md", "content": "\n".join(lines)},
+            })
+        if at_open_id:
+            elements.append({"tag": "hr"})
+            elements.append({
+                "tag": "div",
+                "text": {
+                    "tag": "lark_md",
+                    "content": f'<at user_id="{at_open_id}"></at>',
+                },
+            })
+
+        card = {
+            "config": {"wide_screen_mode": True},
+            "header": {
+                "template": "green",
+                "title": {"tag": "plain_text", "content": title},
+            },
+            "elements": elements or [
+                {"tag": "div", "text": {"tag": "lark_md", "content": "无内容"}}
+            ],
+        }
+        return await self.send_card(card)
+
     async def push_leads(
         self,
         leads: list[dict],

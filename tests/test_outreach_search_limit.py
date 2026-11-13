@@ -133,7 +133,7 @@ def test_探针也搜不到就判定接口被限流():
     """目标搜不到 + 探针也搜不到 → 接口坏了 → SearchUnavailable"""
     calls: list[str] = []
 
-    def _search(q, expect_hit=True):
+    def _search(q, expect_hit=True, want_ids=None):
         calls.append(q)
         return []
 
@@ -145,7 +145,7 @@ def test_探针也搜不到就判定接口被限流():
 
 def test_探针能搜到就说明人是真的不在():
     """目标搜不到，但探针搜得到 → 接口是好的 → 不是故障，返回 None"""
-    def _search(q, expect_hit=True):
+    def _search(q, expect_hit=True, want_ids=None):
         if q == Douyin.SEARCH_CANARY:
             return [_用户("小米汽车")]
         return []
@@ -159,7 +159,7 @@ def test_搜到目标就完全不探针():
     """正常情况不许多花一次搜索"""
     calls: list[str] = []
 
-    def _search(q, expect_hit=True):
+    def _search(q, expect_hit=True, want_ids=None):
         calls.append(q)
         return [_用户("987714317")]
 
@@ -173,7 +173,7 @@ def test_探针结果有缓存不重复探():
     """探针自己也是一次搜索，每条都探等于搜索次数翻倍"""
     calls: list[str] = []
 
-    def _search(q, expect_hit=True):
+    def _search(q, expect_hit=True, want_ids=None):
         calls.append(q)
         return []
 
@@ -187,7 +187,7 @@ def test_探针结果有缓存不重复探():
 
 def test_接口正常时SearchUnavailable不会被误抛():
     """接口正常时，SearchUnavailable 一次都不该出现"""
-    def _search(q, expect_hit=True):
+    def _search(q, expect_hit=True, want_ids=None):
         return [_用户("x")] if q == Douyin.SEARCH_CANARY else []
 
     dy = _dy(_search)
@@ -247,7 +247,7 @@ def test_搜索要求验证时抛验证异常而不是搜不到():
 
 def test_普通空结果不误报成验证():
     """没有 search_nil_info 的空结果，不能当成要验证"""
-    def _search(q, expect_hit=True):
+    def _search(q, expect_hit=True, want_ids=None):
         return [_用户("x")] if q == Douyin.SEARCH_CANARY else [{"user_list": []}]
 
     dy = _dy(_search)

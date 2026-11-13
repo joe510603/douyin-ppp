@@ -402,12 +402,18 @@ class Douyin:
     # 抓响应：先挂监听 → 执行动作 → 边等边解析，直到某条响应满足 expect
     def _capture(self, url_part, action: Callable[[], None], timeout: int = 9000,
                  expect: Callable[[dict], bool] | None = None, settle: int = 600,
-                 mid_hook: Optional[Callable[[], None]] = None) -> list[dict]:
+                 mid_hook: Optional[Callable[[], None]] = None,
+                 pager: Optional[Callable[[], None]] = None,
+                 found: Optional[Callable[[list], bool]] = None,
+                 page_budget: int = 12000) -> list[dict]:
         """执行 action，同时抓指定接口的响应
 
         url_part: 匹配 URL 的子串，也可以传一组子串（任一命中就算）
         mid_hook: action 之后、开始等待响应之前执行的回调
                   （用来做「等页面稳定 → 点某个 tab」这类事）
+        pager: 首屏出来之后，用来「翻出下一页」的回调（往下滚）
+        found: 判断是不是已经找到目标了（参数是已抓到的所有响应）
+        page_budget: 翻页最多花多少毫秒
         """
         parts = (url_part,) if isinstance(url_part, str) else tuple(url_part)
         hits: list[Response] = []
@@ -450,12 +456,52 @@ class Douyin:
                     break
             self.page.wait_for_timeout(settle)
             drain()
+
+            # ---- 翻页：目标常常不在第一页 ----
+            #
+            # 抖音一次只给 6~10 个用户，后面还有（has_more=1）。
+            # 实测（2026-11-13）：93176319901 在 cursor=30 那页才出现，
+            # 以前只等第一页就下结论「这个人搜不到」→ 线索被永久跳过，
+            # 而用户抽查发现这些人**全都搜得到**。
+            #
+            # 所以首屏之后继续往下滚，逼抖音把下一页吐出来，
+            # 直到找到目标 / 抖音说没有下一页 / 翻页预算用完。
+            if pager is not None:
+                page_end = time.time() + page_budget / 1000
+                while time.time() < page_end:
+                    if found is not None and found(parsed):
+                        break
+                    if self._no_more_pages(parsed):
+                        break
+                    pager()
+                    self.page.wait_for_timeout(900)
+                    drain()
             return [j for j in parsed if j]
         finally:
             try:
                 self.page.remove_listener("response", on_resp)
             except Exception:
                 pass
+
+    def _no_more_pages(self, parsed: list[dict]) -> bool:
+        """抖音说「没有下一页了」吗
+
+        只看**用户列表**那个响应的 has_more —— 综合 tab 的响应里
+        也有 has_more，但它跟用户列表不是一回事。
+        """
+        for j in parsed or []:
+            if not isinstance(j, dict):
+                continue
+            if "user_list" in j and j.get("has_more") in (False, 0):
+                return True
+        return False
+
+    def _scroll_more_users(self) -> None:
+        """在搜索结果页往下滚，逼抖音加载下一页用户"""
+        try:
+            self.page.mouse.wheel(0, 3000)
+        except Exception:
+            pass
 
     # ------------------------------------------------------------ 找人（抖音号）
     def _click_user_tab(self, timeout: int = 12000) -> bool:
@@ -538,7 +584,8 @@ class Douyin:
                     return t
         return ""
 
-    def _search(self, q: str, expect_hit: bool = True) -> list[dict]:
+    def _search(self, q: str, expect_hit: bool = True,
+                want_ids: Optional[list[str]] = None) -> list[dict]:
         """像真人一样用搜索框搜。
 
         实测（2026-11）：直接 goto /search/{q}?type=user 页面是空的（SPA 路由不认），
@@ -553,6 +600,10 @@ class Douyin:
 
         ``expect_hit=False`` 是**探针模式**：不等「搜到目标」，
         只要接口吐出任何一个用户就算成功（用来判断接口死没死）。
+
+        ``want_ids`` = 目标人的抖音号。传了它就会**往下翻页**去找，
+        直到找到目标 / 抖音说没下一页了（抖音一次只给 6~10 个人，
+        目标常常在第 2、3 页）。
         """
         def do_search() -> None:
             self._goto(f"{DOUYIN}/")
@@ -601,10 +652,27 @@ class Douyin:
         #   这个代价还不止是慢：搜到人之后会把这一页十几个用户的 sec_uid
         #   一起缓存下来，后面十几条线索就能直接开主页、完全不用搜。
         #   搜失败 → 缓存不起来 → 每条每轮都重复付这 20 秒（死循环）。
+        # 目标人的抖音号（要翻页找的就是它）
+        want = {str(x).strip().lower() for x in (want_ids or []) if str(x or "").strip()}
+
+        def _hit_target(parsed: list[dict]) -> bool:
+            """目标是不是已经在结果里了"""
+            if not want:
+                return False
+            for u in self._extract_users(parsed):
+                ids = {str(u.get("unique_id") or "").lower(),
+                       str(u.get("short_id") or "").lower()}
+                if want & ids:
+                    return True
+            return False
+
         data = self._capture(
             ("discover/search", "general/search"),
             do_search, timeout=40000, expect=hit, settle=1500,
             mid_hook=self._click_user_tab,
+            pager=self._scroll_more_users if want else None,
+            found=_hit_target if want else None,
+            page_budget=15000,
         )
         # 首屏没命中时再多等一会儿（分几段推过来的）
         if not self._extract_users(data):
@@ -783,7 +851,11 @@ class Douyin:
                 f"搜索接口被限流（探针结论还在有效期内，这次不搜了）：{q}"
             )
         self.log(f"  搜索：{q}")
-        data = self._search(q)
+        # 传目标抖音号 → 第一页没命中就往下翻页找
+        # （抖音一次只给 6~10 个人，目标常常在第 2、3 页；
+        #   实测 93176319901 在 cursor=30 那页才出现）
+        want = [want_dy] if (by_nickname and want_dy) else [q]
+        data = self._search(q, want_ids=want)
         users = self._extract_users(data)
         # 留着这一页的用户，worker 会顺手把 sec_uid 存下来
         # （抖音一次搜索返回一页十几个用户，每个都带 sec_uid，
@@ -920,13 +992,102 @@ class Douyin:
                 nickname = w["author_nickname"]
             if aweme_count is None and w.get("author_aweme_count") is not None:
                 aweme_count = w["author_aweme_count"]
+        # 个人简介：这条快路径**不搜索**，所以手上没有简介，得单独去取
+        signature = ""
+        pinfo = self.fetch_profile_info(sec_uid)
+        if pinfo:
+            signature = pinfo.get("signature") or ""
+            if not nickname:
+                nickname = pinfo.get("nickname") or ""
+            # 作品接口的 author 里**没有** aweme_count（实测那个字段压根不在），
+            # 所以这条快路径的作品数一直是 None，日志里显示「作品 None 条」。
+            # 拿老接口的补上——只认正的，0 不采信（宁可 None 也不要误判成「没作品」
+            # 而错杀一个其实有作品的人）。
+            if aweme_count is None and (pinfo.get("aweme_count") or 0) > 0:
+                aweme_count = pinfo["aweme_count"]
+        if not signature:
+            # 老接口调不通 → 退到主页 DOM（那份是截断的，好歹能捞到没被吃掉的）
+            signature = self._read_profile_signature_dom()
         return {
             "sec_uid": sec_uid,
             "nickname": nickname,
             "unique_id": "",
-            "signature": "",
+            "signature": signature,
             "aweme_count": aweme_count,
         }
+
+    # 抖音的**老** web 接口：拿用户资料（含完整个人简介）
+    #
+    # 为什么不用主页 DOM（2026-11-13 实测）：
+    #   DOM 里那份简介被平台**截断 + 掩码**了 ——
+    #   同一个号，DOM 是「…171专业000施工...」（末尾省略号），
+    #   这个接口给的是「…171专业000施工52👍🏻222」（完整原文）。
+    #   号码被吃掉的话，这个功能就白做了。
+    #
+    # 为什么不用新接口（/aweme/v1/web/user/profile/other/）：
+    #   它要 a_bogus 签名，没签直接回 {"status_code":0,"status_msg":"blocked"}。
+    #   老接口不要签名，实测连着调 25 条 0 失败、每次 0.2 秒左右。
+    _OLD_USER_INFO_API = (
+        "https://www.iesdouyin.com/web/api/v2/user/info/"
+        "?sec_uid={sec}&aid=1128&_signature=_02B4Z6wo00f01"
+    )
+
+    def fetch_profile_info(self, sec_uid: str) -> dict | None:
+        """拿用户资料：昵称 / **完整个人简介** / 抖音号 / 作品数
+
+        为什么必须单独去取（2026-11-13 实测）：
+        - 作品接口（``/aweme/v1/web/aweme/post/``）的 ``author`` 里
+          **没有简介字段**：实测 author 只有 nickname / sec_uid / uid 等，
+          ``signature_extra`` 和 ``profile_signature_components`` 都是 null。
+        - 主页 DOM 里那份是**截断**的（见上面那个常量上面的注释）。
+        - 搜索路径倒是能拿到完整简介（搜索响应 ``user_list[].user_info.signature``，
+          跟这个接口给的**一模一样**），但「已知 sec_uid 直接开主页」这条快路径
+          根本不搜索 → 手上没有简介。
+
+        拿不到就返回 None，**不抛异常**：
+        简介只是补充信息，拿不到不该让整条线索的触达失败。
+        """
+        sec_uid = str(sec_uid or "").strip()
+        if not sec_uid:
+            return None
+        try:
+            resp = self.page.request.get(
+                self._OLD_USER_INFO_API.format(sec=sec_uid), timeout=20000)
+            j = json.loads(resp.text())
+        except Exception as e:
+            self.log(f"  （取个人简介失败：{str(e)[:60]}）")
+            return None
+        u = j.get("user_info") or j.get("user") or {}
+        if not isinstance(u, dict) or not u:
+            return None
+        return {
+            "sec_uid": u.get("sec_uid") or sec_uid,
+            "nickname": (u.get("nickname") or "").strip(),
+            "unique_id": u.get("unique_id") or u.get("short_id") or "",
+            "signature": (u.get("signature") or "").strip(),
+            "aweme_count": u.get("aweme_count"),
+        }
+
+    def _read_profile_signature_dom(self) -> str:
+        """从主页 DOM 里读个人简介（**兜底**用）
+
+        为什么不把它当主路径：抖音在这份 DOM 里**截断 + 掩码**了简介，
+        号码基本读不出来。只有老接口调不通时才用它，
+        好歹能捞到没被吃掉的微信 / QQ。
+        """
+        try:
+            txt = self.page.evaluate(
+                """() => {
+                  const box = document.querySelector('[data-e2e="user-info"]');
+                  if (!box || !box.lastElementChild) return '';
+                  let t = (box.lastElementChild.innerText || '').trim();
+                  t = t.replace(/\\s*更多\\s*$/, '');
+                  return t.trim();
+                }"""
+            ) or ""
+        except Exception:
+            return ""
+        return str(txt).strip()
 
     @staticmethod
     def _extract_users(data: list[dict]) -> list[dict]:

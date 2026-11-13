@@ -364,3 +364,108 @@ def test_限流不进暂停状态(cfg_continuous):
     s = AutoScheduler(r)
     asyncio.run(s.maybe_run())
     assert s.paused is False
+
+
+# ============================================================
+# 「我验证好了，继续」要能顺手解除验证造成的暂停
+# ============================================================
+
+def test_按种类解除暂停能解验证(cfg_continuous):
+    """网页上那个「我验证好了，继续」按钮会调它"""
+    r = _FakeRunner()
+    r.result = {
+        "ok": True, "sent": 0, "dry": 0, "failed": 1, "total": 1,
+        "stopped": "触发风控：抖音要求验证本人操作",
+        "stop_kind": "verify",
+    }
+    s = AutoScheduler(r)
+    asyncio.run(s.maybe_run())
+    assert s.paused is True
+    assert s.clear_pause("人工验证完成", only_kind="verify") is True
+    assert s.paused is False
+
+
+def test_按种类解除暂停不会误伤每日上限(cfg_continuous):
+    """「今天已发满」不能被「我验证好了」顺手解除——那会提前开跑"""
+    r = _FakeRunner()
+    r.result = {
+        "ok": True, "sent": 0, "dry": 0, "failed": 0, "total": 0,
+        "stopped": "今天已发 100 条，达到每日上限 100，收工",
+        "daily_limit_reached": True,
+    }
+    s = AutoScheduler(r)
+    asyncio.run(s.maybe_run())
+    assert s.paused is True
+    assert s.clear_pause("人工验证完成", only_kind="verify") is False
+    assert s.paused is True, "每日上限的暂停不该被验证按钮解除"
+
+
+def test_不指定种类就是全都解(cfg_continuous):
+    """网页上那个显式的「解除暂停」按钮：什么暂停都能解"""
+    r = _FakeRunner()
+    r.result = {
+        "ok": True, "sent": 0, "dry": 0, "failed": 0, "total": 0,
+        "stopped": "今天已发 100 条，达到每日上限 100，收工",
+        "daily_limit_reached": True,
+    }
+    s = AutoScheduler(r)
+    asyncio.run(s.maybe_run())
+    assert s.paused is True
+    assert s.clear_pause("网页上手动解除") is True
+    assert s.paused is False
+
+
+def test_搜索限流会暂停自动触达(cfg_continuous):
+    """搜索被限流还每分钟空撞一轮 = 拿限流去撞限流，窗口一直续着
+
+    实测（2026-11-13）：连续模式下一轮接一轮地撞，
+    一小时把 100 多条完全有效的线索全撞死了。
+    """
+    r = _FakeRunner()
+    r.result = {
+        "ok": True, "sent": 0, "dry": 0, "failed": 3, "total": 3,
+        "stopped": "搜索接口连续 3 次返回空（疑似被抖音限流），主动停手",
+        "stop_kind": "search",
+    }
+    s = AutoScheduler(r)
+    asyncio.run(s.maybe_run())
+    assert s.paused is True
+    assert "限流" in s.status().get("paused_reason", "")
+
+
+def test_搜索限流的暂停到点自动恢复(cfg_continuous):
+    r = _FakeRunner()
+    r.result = {
+        "ok": True, "sent": 0, "dry": 0, "failed": 3, "total": 3,
+        "stopped": "搜索接口连续 3 次返回空（疑似被抖音限流），主动停手",
+        "stop_kind": "search",
+    }
+    s = AutoScheduler(r)
+    asyncio.run(s.maybe_run())
+    assert s.paused is True
+    # 把暂停时间挪到过去 → 下次轮询应该自动恢复并跑一轮
+    s._paused_until = datetime.now() - timedelta(minutes=1)
+    # 这一轮搜索恢复了（不再撞限流）
+    r.result = {"ok": True, "sent": 2, "dry": 0, "failed": 0, "total": 2}
+    assert asyncio.run(s.maybe_run()) is True
+    assert s.paused is False
+    assert len(r.calls) == 2
+
+
+def test_搜索限流没恢复就继续暂停(cfg_continuous):
+    """暂停时间到了但搜索还在限流 → 恢复一轮、然后又暂停
+
+    这正是「不硬撞」：宁可一轮一轮慢慢试，也不空转刷搜索。
+    """
+    r = _FakeRunner()
+    r.result = {
+        "ok": True, "sent": 0, "dry": 0, "failed": 3, "total": 3,
+        "stopped": "搜索接口连续 3 次返回空（疑似被抖音限流），主动停手",
+        "stop_kind": "search",
+    }
+    s = AutoScheduler(r)
+    asyncio.run(s.maybe_run())
+    s._paused_until = datetime.now() - timedelta(minutes=1)
+    assert asyncio.run(s.maybe_run()) is True
+    assert len(r.calls) == 2
+    assert s.paused is True, "搜索还在限流就该继续停着"

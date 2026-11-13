@@ -87,9 +87,19 @@ class AutoScheduler:
         self._paused_until = until
         log.info(f"🤖 自动触达已暂停：{reason}")
 
-    def clear_pause(self, reason: str = "手动解除暂停") -> bool:
-        """解除暂停（人在网页上点「解除暂停」或手动跑一轮时调用）"""
+    def clear_pause(self, reason: str = "手动解除暂停",
+                    only_kind: str = "") -> bool:
+        """解除暂停（人在网页上点「解除暂停」或手动跑一轮时调用）
+
+        Args:
+            only_kind: 只解除这一种原因的暂停（留空 = 任何原因都解除）。
+
+                「我验证好了，继续」那个按钮应该只解除**验证**导致的暂停——
+                「今天已发满」那种不能顺手解除，否则点一下就提前开跑了。
+        """
         if not self._paused:
+            return False
+        if only_kind and (self._paused_kind or "") != only_kind:
             return False
         self._paused = False
         self._paused_reason = ""
@@ -263,6 +273,7 @@ class AutoScheduler:
 
     def _after_round(self, result: dict) -> None:
         """一轮跑完之后：判断要不要暂停"""
+        o = get_config().outreach
         # 撞了验证码 / 登录失效 → 停下来等人，不硬撞。
         # 判据用结构化的 stop_kind，不靠解析文案（文案会漂）。
         kind = str(result.get("stop_kind") or "")
@@ -282,7 +293,23 @@ class AutoScheduler:
             )
             return
         if kind == KIND_SEARCH:
-            self.last_error = "抖音网页版搜索被限流，等它自己恢复"
+            # 搜索接口限流 → 暂停一段时间，到点自动重试。
+            #
+            # 为什么不能继续每分钟空跑一轮：搜索被限流本身就是
+            # 「你搜太频繁了」的信号，这时候接着搜只会让限流窗口一直续着。
+            # 实测（2026-11-13）：连续模式下一轮接一轮地撞，
+            # 一小时下来把 100 多条**完全有效**的线索全撞死了。
+            #
+            # 抖音这个限流一般 30 分钟~几小时自己恢复，到点自动接着跑。
+            # 线索都在队列里（不会丢），暂停期间也不影响采集和上表。
+            minutes = max(1, int(getattr(o, "search_pause_minutes", 30) or 30))
+            until = datetime.now() + timedelta(minutes=minutes)
+            self._pause(
+                f"抖音网页版搜索接口被限流，{minutes} 分钟后自动重试"
+                f"（线索没丢，都还在队列里）",
+                kind,
+                until=until,
+            )
             return
 
         # 今天已发满 → 暂停到明天（否则调度器会每分钟空跑一轮）
