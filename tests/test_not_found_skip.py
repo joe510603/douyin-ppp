@@ -74,11 +74,21 @@ def _读(db, lead_id=1):
 
 
 class _假飞书:
-    def __init__(self):
-        self.pushed: list[tuple[str, dict]] = []
+    """假飞书写入器
 
-    def push(self, record_id, fields):
+    ``ok=False`` 模拟「飞书写失败」——这时同步标记**不能**对齐，
+    否则回拉会把飞书端那个还没更新的旧值当成「销售改的」采纳，
+    把刚跳过的线索又放回队列（实测 2026-11-13 发生过）。
+    """
+
+    def __init__(self, ok: bool = True):
+        self.pushed: list[tuple[str, dict]] = []
+        self.ok = ok
+
+    def push(self, record_id, fields, on_ok=None):
         self.pushed.append((record_id, dict(fields)))
+        if self.ok and on_ok is not None:
+            on_ok()
 
     def flush(self, timeout: float = 30.0) -> bool:
         return True
@@ -181,11 +191,12 @@ def test_reset_not_found_count清零(tmp_path):
     assert _读(db)[1] == 0
 
 
-def test_set_outreach_status能对齐同步标记(tmp_path):
+def test_set_synced_status能更新同步标记(tmp_path):
     db = _建库(tmp_path)
     _加线索(db)
     st = OutreachStore(db)
-    st.set_outreach_status(1, "skipped", "跳过了", synced_status="待处理|已跳过")
+    st.set_outreach_status(1, "skipped", "跳过了")
+    st.set_synced_status(1, "待处理|已跳过")
     status, _cnt, synced, _note = _读(db)
     assert status == "skipped"
     assert synced == "待处理|已跳过"
@@ -249,15 +260,34 @@ def test_跳过之后不再进待触达队列(tmp_path, monkeypatch):
 def test_跳过时同步标记对齐人工能放回(tmp_path, monkeypatch):
     """回拉靠「上次同步进飞书的状态」判断本地改没改过
 
-    不对齐 → 回拉永远认为「本地改过」→ 人工在飞书里把它改回「待触达」
-    永远不生效。这个状态的意义就是「留给人工验证」，必须能放回去。
+    飞书**写成功**之后标记要对齐 —— 这样人工在飞书里把它改回
+    「待触达」，回拉才能采纳（这个状态的意义就是「留给人工验证」）。
     """
     db = _建库(tmp_path)
     _加线索(db)
     w = _worker(tmp_path, db, not_found_skip_threshold=1)
-    _跑一轮(w, _线索(), monkeypatch)
+    _跑一轮(w, _线索(record_id="rec1"), monkeypatch)
     _status, _cnt, synced, _note = _读(db)
     assert synced == "待处理|已跳过", synced
+
+
+def test_飞书写失败就不对齐标记(tmp_path, monkeypatch):
+    """⚠ 防回归（2026-11-13 真实发生过）
+
+    标记提前对齐 → 回拉以为「本地没改过」→ 采纳飞书端**还没更新**的旧值
+    （比如「待触达」）→ 把刚跳过的线索又放回队列 → 下一轮又去搜一个
+    抖音上根本不存在的人。
+
+    所以：飞书写失败 → 标记**保持旧值** → 回拉不采纳。
+    """
+    db = _建库(tmp_path)
+    _加线索(db)
+    w = _worker(tmp_path, db, not_found_skip_threshold=1)
+    w._feishu = _假飞书(ok=False)  # 模拟飞书写失败
+    _跑一轮(w, _线索(record_id="rec1"), monkeypatch)
+    status, _cnt, synced, _note = _读(db)
+    assert status == "skipped", "本地状态照旧要写"
+    assert not synced, f"飞书没写成功就不能对齐标记：{synced}"
 
 
 def test_跳过会写飞书触达状态(tmp_path, monkeypatch):

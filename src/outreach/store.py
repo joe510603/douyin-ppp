@@ -331,31 +331,31 @@ class OutreachStore:
         status: str,
         error: str = "",
         sec_uid: str = "",
-        synced_status: str = "",
     ) -> None:
-        """更新线索的触达状态（同时清掉旧错误信息）
+        """更新线索的触达状态（同时清掉旧错误信息）"""
+        self._conn.execute(
+            "UPDATE leads SET outreach_status = ?, "
+            "outreach_note = ?, outreach_at = datetime('now','localtime') "
+            "WHERE id = ?",
+            [status, (error or "")[:300], lead_id],
+        )
+        self._conn.commit()
 
-        ``synced_status``：可选，把「上次同步进飞书的状态」一起对齐。
-        为什么要对齐：回拉判断「本地这次有没有自己改过」全靠这个标记。
-        本地刚把状态改成 X、而标记还停在旧值 → 回拉永远认为「本地改过」，
-        于是销售在飞书表里手动改回去（比如把「已跳过」改回「待触达」）
-        永远不生效。跳过是**留给人工验证**的状态，人工要能放回队列，
-        所以跳过时要把标记对齐到当前值。
+    def set_synced_status(self, lead_id: int, synced: str) -> None:
+        """更新「上次同步进飞书的状态」标记
+
+        这个标记是回拉判断「本地这次有没有自己改过」的**唯一依据**：
+          · 标记 == 本地当前值 → 本地没改过 → 回拉采纳飞书的值（销售改的）
+          · 标记 != 本地当前值 → 本地改过   → 回拉不采纳（本地说了算）
+
+        ⚠ 只能在**飞书真的写成功之后**调它（见 worker._push_feishu_status）：
+        早对齐 → 飞书端还写着旧值 → 回拉会把这个旧值当成「销售改的」采纳 →
+        把刚跳过的线索又放回队列（实测 2026-11-13 发生过）。
         """
-        if synced_status:
-            self._conn.execute(
-                "UPDATE leads SET outreach_status = ?, "
-                "outreach_note = ?, outreach_at = datetime('now','localtime'), "
-                "bitable_synced_status = ? WHERE id = ?",
-                [status, (error or "")[:300], synced_status, lead_id],
-            )
-        else:
-            self._conn.execute(
-                "UPDATE leads SET outreach_status = ?, "
-                "outreach_note = ?, outreach_at = datetime('now','localtime') "
-                "WHERE id = ?",
-                [status, (error or "")[:300], lead_id],
-            )
+        self._conn.execute(
+            "UPDATE leads SET bitable_synced_status = ? WHERE id = ?",
+            [synced, lead_id],
+        )
         self._conn.commit()
 
     def bump_not_found(self, lead_id: int) -> int:

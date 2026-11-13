@@ -186,8 +186,16 @@ class _FeishuStatusPusher:
             target=self._loop, name="feishu-status", daemon=True)
         self._thread.start()
 
-    def push(self, record_id: str, fields: dict) -> None:
-        """排队写一条状态，立刻返回，不等网络"""
+    def push(self, record_id: str, fields: dict,
+             on_ok: Optional[Callable[[], None]] = None) -> None:
+        """排队写一条状态，立刻返回，不等网络
+
+        ``on_ok``：**写成功之后**才调用的回调（失败不调）。
+        用来在「飞书确实已经是这个状态了」之后，再去更新本地的
+        「上次同步进飞书的状态」标记 —— 那个标记是回拉判断
+        「本地改过没有」的唯一依据，标记早了会让回拉误判（见
+        ``_set_status`` 里的说明）。
+        """
         if not record_id or not fields:
             return
         # ⚠ 顺序很重要：**先入队、再起线程**。
@@ -197,7 +205,7 @@ class _FeishuStatusPusher:
         #   _pending 也永远差 1，flush 会一直等到超时。
         with self._lock:
             self._pending += 1
-        self._q.put((record_id, dict(fields)))
+        self._q.put((record_id, dict(fields), on_ok))
         self._ensure_thread()
 
     def _loop(self) -> None:
@@ -215,12 +223,20 @@ class _FeishuStatusPusher:
                 if self._stopping:
                     return
                 continue
-            record_id, fields = item
+            record_id, fields, on_ok = item
+            ok = False
             try:
                 _run_coro_blocking(writer.patch_fields(record_id, fields), timeout=90)
+                ok = True
             except Exception as e:
                 self._log(f"  ⚠️ 飞书状态回写失败（不影响触达）：{str(e)[:80]}")
             finally:
+                # 只在**真的写成功**之后才对齐同步标记
+                if ok and on_ok is not None:
+                    try:
+                        on_ok()
+                    except Exception as e:
+                        self._log(f"  ⚠️ 同步标记更新失败: {str(e)[:80]}")
                 with self._lock:
                     self._pending -= 1
                 try:
@@ -841,21 +857,26 @@ class OutreachWorker:
         下一轮真跑时这些线索就再也不会被处理。
         多机共用一张飞书表时更危险：干跑会把另一台机器写的真实触达状态盖掉。
 
-        ``synced_status``：把「上次同步进飞书的状态」一起对齐（见 store 里的说明）。
-        只在「跳过、留给人工验证」这种**希望人工能放回队列**的状态上用。
+        ``synced_status``：把「上次同步进飞书的状态」对齐到当前值。
+
+        ⚠️ 对齐**必须等飞书真的写成功**（见 ``_push_feishu_status`` 的 on_ok）：
+        那个标记是回拉判断「本地改过没有」的唯一依据。
+        早对齐（本地刚改、飞书还是旧值）会让回拉以为「本地没改过」→
+        采纳飞书端那个**还没更新**的旧值 → 把刚跳过的线索又放回队列。
+
+        实测 2026-11-13：一条刚跳过的线索在下一轮又被搜了一遍
+        （计数 1→2），就是因为本地已对齐、飞书异步还没写进去。
         """
         if self._dry:
             return
 
         try:
-            self.st.set_outreach_status(
-                lead["id"], status, error, synced_status=synced_status
-            )
+            self.st.set_outreach_status(lead["id"], status, error)
         except Exception as e:
             self.log(f"  ⚠️ 本地状态回写失败: {e}")
 
         try:
-            self._push_feishu_status(lead, status)
+            self._push_feishu_status(lead, status, synced_status)
         except Exception as e:
             # 飞书写失败不影响主流程继续跑
             self.log(f"  ⚠️ 飞书状态回写失败: {e}")
@@ -873,7 +894,8 @@ class OutreachWorker:
         st = STATUS_LABELS.get(lead.get("status") or "", "待处理")
         return f"{st}|{FEISHU_STATUS.get(outreach_status, outreach_status)}"
 
-    def _push_feishu_status(self, lead: dict, status: str) -> None:
+    def _push_feishu_status(self, lead: dict, status: str,
+                            synced_status: str = "") -> None:
         """把「触达状态」写回飞书多维表格（**异步**，不阻塞触达）
 
         复用 notify.bitable 的写入器，用 patch_fields 只改这一个字段——
@@ -881,12 +903,25 @@ class OutreachWorker:
 
         ⚠ 为什么不是直接同步调：飞书走 lark-cli 子进程，实测一次 1.4 秒，
         每条线索要写 3 次 → 每条白等 4.2 秒。改成后台线程排队写。
+
+        ``synced_status`` 非空时，**写成功之后**才把本地的同步标记对齐
+        （对齐早了会被回拉误判成「本地没改过」→ 采纳飞书的旧值）。
         """
         record_id = lead.get("bitable_record_id") or ""
         if not record_id:
             return
         text = FEISHU_STATUS.get(status, status)
-        self._feishu.push(record_id, {"触达状态": text})
+        marker = synced_status
+
+        def _on_ok() -> None:
+            if not marker:
+                return
+            try:
+                self.st.set_synced_status(lead["id"], marker)
+            except Exception as e:
+                self.log(f"  ⚠️ 同步标记更新失败: {e}")
+
+        self._feishu.push(record_id, {"触达状态": text}, on_ok=_on_ok)
 
     # ================================================================
     # 主流程
