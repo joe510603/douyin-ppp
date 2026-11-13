@@ -784,6 +784,34 @@ class OutreachWorker:
             f"到 {until} 为止"
         )
 
+    def _enter_verify_cooldown(self, reason: str) -> None:
+        """撞了验证、这一轮又没人管 → 进验证冷却
+
+        冷却期内系统**不发起任何搜索**（runner 开轮前会检查），
+        到点自动重试。
+
+        跟「慢档」的区别：
+        - 慢档 = 间隔拉长（90-120 秒），请求照发
+        - 冷却 = 干脆不发请求（抖音还在冷却期里，搜了也是白搜）
+        """
+        o = self.cfg.outreach
+        minutes = int(getattr(o, "verify_cooldown_minutes", 45) or 0)
+        if minutes <= 0:
+            return
+        try:
+            until = self.st.set_verify_cooldown(minutes, reason)
+        except Exception as e:
+            self.log(f"  ⚠️ 记不住验证冷却状态: {str(e)[:60]}")
+            return
+        self.log(
+            f"  ❄️ 进入验证冷却，{minutes} 分钟内不再搜索（到 {until} 为止）"
+        )
+        self.log(
+            "     冷却到点会自动重试；想现在就试，"
+            "在网页「抖音触达」点「开始触达」手动跑一轮"
+            "（手动跑会绕过冷却，系统会把浏览器开起来等你过拼图）"
+        )
+
     def _maybe_exit_slow_mode(self) -> None:
         """连续 N 条都干干净净 → 撤掉慢档，回到快档"""
         o = self.cfg.outreach
@@ -1142,6 +1170,14 @@ class OutreachWorker:
                                     )
                                 continue
                             self.stop_reason = f"验证码未人工处理：{e}"
+                            # 没人管 → 进「验证冷却」：接下来一段时间不搜任何东西。
+                            #
+                            # 为什么（2026-11-13 实测）：
+                            #   17:41 撞验证 → 18:00 超时结束
+                            #   18:09 立刻重开一轮 → 18:10 又撞（抖音还在冷却期里）
+                            #   两轮全白跑。冷却期内硬冲只是重复撞墙，
+                            #   还会把冷却期越拖越长。
+                            self._enter_verify_cooldown(str(e))
                         else:
                             # 限流/软风控：直接停，而且**必须通知人**。
                             # 以前只有验证码分支发飞书，软风控停了却一声不吭，

@@ -164,11 +164,19 @@ class AutoScheduler:
             "last_error": self.last_error,
             "running": bool(self.runner.is_running),
             "cooldown": int(self.runner.risk_cooldown_left() or 0),
+            "verify_cooldown": int(self._verify_cooldown_left()),
             "paused": self._paused,
             "paused_reason": self._paused_reason,
             "paused_kind": self._paused_kind,
             "state": state,
         }
+
+    def _verify_cooldown_left(self) -> int:
+        """验证冷却还剩几分钟（拿不到就当没有）"""
+        try:
+            return int(self.runner.verify_cooldown_left() or 0)
+        except Exception:
+            return 0
 
     def trigger_now(self) -> None:
         """立刻跑一轮（跳过间隔限制）
@@ -219,6 +227,15 @@ class AutoScheduler:
         left = int(self.runner.risk_cooldown_left() or 0)
         if left > 0:
             self.last_error = f"限流冷却中，还剩 {left} 分钟"
+            return False
+
+        # 验证冷却中不跑（撞了拼图没人过 → 抖音还在冷却期里，硬冲只会再撞）
+        vleft = self._verify_cooldown_left()
+        if vleft > 0:
+            self.last_error = (
+                f"验证冷却中，还剩 {vleft} 分钟"
+                f"（撞了抖音拼图、这一轮没人过；到点自动重试）"
+            )
             return False
 
         # 暂停中：等人处理
@@ -279,10 +296,23 @@ class AutoScheduler:
         kind = str(result.get("stop_kind") or "")
         if kind in (KIND_VERIFY, KIND_LOGIN):
             label = "抖音要求验证本人操作" if kind == KIND_VERIFY else "登录态失效"
+            # 撞验证 → 暂停到「验证冷却」结束，而不是无限期暂停。
+            #
+            # 为什么（2026-11-13 实测）：
+            #   无限期暂停 = 只要人不点「解除暂停」，自动触达就再也不跑了；
+            #   而抖音的验证冷却本来就该自己过去（一般 30~60 分钟）。
+            #   worker 已经把冷却时间记进 DB 了，这里直接拿来当暂停截止时间。
+            until = None
+            if kind == KIND_VERIFY:
+                vleft = self._verify_cooldown_left()
+                if vleft > 0:
+                    until = datetime.now() + timedelta(minutes=vleft)
             self._pause(
                 f"{label}，触达已停下等你处理。"
-                f"去网页「抖音触达」验证完点「解除暂停」就能接着跑",
+                f"去网页「抖音触达」验证完点「解除暂停」就能接着跑"
+                + (f"（{vleft} 分钟后也会自动重试）" if until else ""),
                 kind,
+                until=until,
             )
             return
         if kind == KIND_LIMIT:

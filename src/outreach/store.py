@@ -125,7 +125,11 @@ CREATE TABLE IF NOT EXISTS outreach_speed (
     id INTEGER PRIMARY KEY CHECK (id = 1),
     slow_until TEXT DEFAULT '',      -- 慢档生效到什么时候（空 = 快档）
     reason TEXT DEFAULT '',          -- 为什么慢（给人看）
-    updated_at TEXT DEFAULT ''
+    updated_at TEXT DEFAULT '',
+    -- 验证冷却：撞了抖音的拼图验证、这一轮没人管 → 冷却到什么时候为止。
+    -- 跟「慢档」分开：慢档是「间隔拉长」，冷却是「先别搜了」。
+    verify_until TEXT DEFAULT '',    -- 验证冷却到什么时候（空 = 没在冷却）
+    verify_reason TEXT DEFAULT ''    -- 为什么进冷却（给人看）
 );
 """
 
@@ -170,6 +174,20 @@ class OutreachStore:
                 self._conn.execute(sql)
             # 自适应间隔的状态表（单行）
             self._conn.executescript(CREATE_TABLE_OUTREACH_SPEED_SQL)
+            # 速度表补列：验证冷却是后来加的，老库没有 → 自己补（幂等）
+            sp_cols = {r[1] for r in
+                       self._conn.execute("PRAGMA table_info(outreach_speed)")}
+            for col, ddl2 in (
+                ("verify_until", "TEXT DEFAULT ''"),
+                ("verify_reason", "TEXT DEFAULT ''"),
+            ):
+                if col not in sp_cols:
+                    try:
+                        self._conn.execute(
+                            f"ALTER TABLE outreach_speed ADD COLUMN {col} {ddl2}"
+                        )
+                    except sqlite3.OperationalError:
+                        pass
             cols = {r[1] for r in
                     self._conn.execute("PRAGMA table_info(outreach_runs)")}
             if "kind" not in cols:
@@ -659,18 +677,86 @@ class OutreachStore:
                 "SELECT * FROM outreach_speed WHERE id = 1"
             ).fetchone()
         except Exception:
-            return {"slow": False, "until": "", "reason": ""}
+            return {"slow": False, "until": "", "reason": "",
+                    "verify_until": "", "verify_reason": "", "verify_active": False}
         if not row:
-            return {"slow": False, "until": "", "reason": ""}
+            return {"slow": False, "until": "", "reason": "",
+                    "verify_until": "", "verify_reason": "", "verify_active": False}
         until = str(row["slow_until"] or "")
         if not until:
-            return {"slow": False, "until": "", "reason": str(row["reason"] or "")}
+            slow = False
+        else:
+            try:
+                slow = datetime.strptime(until, "%Y-%m-%d %H:%M:%S") > datetime.now()
+            except Exception:
+                slow = False
+        # 验证冷却：同样在读取的时候判断，到期自然失效
+        v_until = str(row["verify_until"] or "")
+        v_reason = str(row["verify_reason"] or "")
+        v_active = False
+        if v_until:
+            try:
+                v_active = (
+                    datetime.strptime(v_until, "%Y-%m-%d %H:%M:%S") > datetime.now()
+                )
+            except Exception:
+                v_active = False
+        return {
+            "slow": slow,
+            "until": until if slow else "",
+            "reason": str(row["reason"] or ""),
+            "verify_until": v_until if v_active else "",
+            "verify_reason": v_reason,
+            "verify_active": v_active,
+        }
+
+    # ============================================================
+    # 验证冷却
+    # ============================================================
+    #
+    # 为什么要有这个（2026-11-13 实测）：
+    #   17:41 撞拼图验证 → 人工没管，18:00 超时结束这一轮
+    #   18:09 立刻重开一轮 → 18:10 又撞验证
+    #   也就是说「超时 → 20 分钟后重开」这个节奏，正好在抖音的
+    #   风控冷却期里硬冲，**两轮全白跑**（一轮 15 分钟干等，
+    #   一轮 1 分钟就撞墙）。
+    #
+    # 抖音的拼图验证不是「立刻就能好」的东西：它要的是你过验证，
+    # 过了之后账号还有一段冷却。这段冷却里再搜，就是重复撞墙。
+    #
+    # 所以：撞了验证、这一轮又没人管 → 记一段「验证冷却」，
+    # 冷却期内**根本不发起搜索**（省 CPU、省请求、也不加重风控），
+    # 到点自动重试。
+
+    def set_verify_cooldown(self, minutes: int, reason: str = "") -> str:
+        """进验证冷却（记到什么时候为止），返回截止时间"""
+        until = datetime.now() + timedelta(minutes=max(1, int(minutes or 1)))
+        ts = until.strftime("%Y-%m-%d %H:%M:%S")
         try:
-            t = datetime.strptime(until, "%Y-%m-%d %H:%M:%S")
+            self._conn.execute(
+                "INSERT INTO outreach_speed (id, slow_until, reason, updated_at, "
+                "verify_until, verify_reason) "
+                "VALUES (1, '', '', datetime('now','localtime'), ?, ?) "
+                "ON CONFLICT(id) DO UPDATE SET verify_until=excluded.verify_until, "
+                "verify_reason=excluded.verify_reason, "
+                "updated_at=datetime('now','localtime')",
+                [ts, (reason or "")[:120]],
+            )
+            self._conn.commit()
         except Exception:
-            return {"slow": False, "until": "", "reason": ""}
-        slow = t > datetime.now()
-        return {"slow": slow, "until": until if slow else "", "reason": str(row["reason"] or "")}
+            pass
+        return ts
+
+    def clear_verify_cooldown(self) -> None:
+        """验证过了 / 冷却结束 → 解除冷却"""
+        try:
+            self._conn.execute(
+                "UPDATE outreach_speed SET verify_until='', verify_reason='', "
+                "updated_at=datetime('now','localtime') WHERE id=1"
+            )
+            self._conn.commit()
+        except Exception:
+            pass
 
     def set_slow_delay(self, minutes: int, reason: str = "") -> str:
         """切到慢档（记到什么时候为止），返回截止时间

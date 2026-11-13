@@ -102,14 +102,111 @@ class OutreachRunner:
         """人工验证完了，继续跑
 
         网页上那个「我验证好了，继续」按钮调它。
+
+        顺带把「验证冷却」也解掉：
+        冷却是因为「撞了验证又没人管」才记上的；
+        用户都手动过了，再冷却着就是白白等。
         """
+        cleared = self.clear_verify_cooldown()
         if not self._waiting_human:
+            if cleared:
+                self._append_log("▶ 已解除验证冷却，自动触达可以继续了")
             return False
         self._append_log("▶ 收到人工验证完成信号，继续触达")
         self._waiting_human = False
         self._captcha_reason = ""
         self._resume.set()
         return True
+
+    def verify_cooldown_left(self) -> int:
+        """验证冷却还剩多少分钟（0 = 可以跑）
+
+        跟 ``risk_cooldown_left`` 是两回事：
+        - risk_cooldown：账号**被限流**了 → 冷却 120 分钟
+        - verify_cooldown：撞了**拼图验证**、没人管 → 冷却 45 分钟
+
+        为什么验证也要冷却（2026-11-13 实测）：
+        17:41 撞验证 → 18:00 超时结束 → 18:09 重开一轮 → 18:10 又撞。
+        抖音的验证不是「等一下就好」，它有一段冷却期，
+        在这段冷却里硬冲只是重复撞墙，两轮全白跑。
+        """
+        try:
+            st = OutreachStore(self._db_path())
+            try:
+                state = st.speed_state()
+            finally:
+                st.close()
+        except Exception:
+            return 0
+        if not state.get("verify_active"):
+            return 0
+        until = str(state.get("verify_until") or "")
+        try:
+            t = datetime.strptime(until, "%Y-%m-%d %H:%M:%S")
+        except Exception:
+            return 0
+        left = (t - datetime.now()).total_seconds() / 60
+        return int(left) if left > 0 else 0
+
+    def clear_verify_cooldown(self) -> bool:
+        """解除验证冷却（人工验证过了 / 手动放行）"""
+        try:
+            st = OutreachStore(self._db_path())
+            try:
+                st.clear_verify_cooldown()
+            finally:
+                st.close()
+        except Exception:
+            return False
+        return True
+
+    async def _expire_verify_cooldown(self) -> None:
+        """验证冷却刚到期 → 清掉记录 + 告诉你一声
+
+        为什么要有这一下：
+        冷却期间系统一声不吭（这是故意的，不搜就不该有动静），
+        用户回头一看「怎么没动静了」会以为程序挂了。
+        冷却到点自动恢复时给一张绿卡片，他就知道系统在正常跑。
+        """
+        try:
+            st = OutreachStore(self._db_path())
+            try:
+                state = st.speed_state()
+                if state.get("verify_active"):
+                    return          # 还在冷却中
+                if not state.get("verify_reason"):
+                    return          # 没有待清除的冷却记录
+                st.clear_verify_cooldown()
+            finally:
+                st.close()
+        except Exception:
+            return
+
+        self._append_log("▶ 验证冷却结束，重新开始触达")
+        n = self.config.notify
+        if not (getattr(n, "risk_webhook_enabled", False)
+                and (n.risk_webhook_url or "").strip()):
+            return
+        try:
+            from ..notify.feishu import FeishuNotifier
+
+            notifier = FeishuNotifier(
+                webhook_url=n.risk_webhook_url,
+                secret=getattr(n, "risk_webhook_secret", "") or "",
+            )
+            ok, err = await notifier.send_info_card(
+                title="▶️ 验证冷却结束，触达已恢复",
+                lines=[
+                    "抖音的验证冷却期过了，系统已经重新开始搜索和留言。",
+                    "**不需要**你做任何操作；线索都还在队列里，没丢。",
+                ],
+            )
+        except Exception as e:
+            ok, err = False, str(e)
+        if ok:
+            self._append_log("  📣 已在飞书群里告诉你「冷却结束，继续发」")
+        else:
+            self._append_log(f"  （群机器人没发出去：{err}）")
 
     def _mark_waiting_human(self, reason: str) -> None:
         self._waiting_human = True
@@ -131,6 +228,7 @@ class OutreachRunner:
             p = dict(self._progress)
         p["running"] = self._running
         p["cooldown"] = self.risk_cooldown_left()
+        p["verify_cooldown"] = self.verify_cooldown_left()
         p["waiting_human"] = self._waiting_human
         p["captcha_reason"] = self._captcha_reason
         p["risk_stop"] = self.last_risk_stop()
@@ -286,6 +384,7 @@ class OutreachRunner:
         delay_min: Optional[float] = None,
         delay_max: Optional[float] = None,
         sort_by: Optional[str] = None,
+        bypass_verify_cooldown: bool = False,
     ) -> dict:
         """跑一轮触达任务
 
@@ -296,6 +395,13 @@ class OutreachRunner:
             delay_min / delay_max: 本轮的两条之间间隔（秒），
                 留空就用配置里的 min_delay / max_delay
             sort_by: 本轮排序（recent / intent），留空用配置里的
+            bypass_verify_cooldown: 跳过「验证冷却」检查。
+
+                **只有人手动点的才该传 True**：
+                冷却期里自动轮不发请求（省事、不加重风控），
+                但人手动点「开始触达」=「我人在电脑前」，
+                这时候应该把浏览器开起来、让他把拼图过了，
+                而不是把他挡在门外干等到冷却结束。
 
         Returns:
             {"ok", "total", "sent", "failed", "skipped", "dry", "stopped"}
@@ -319,6 +425,24 @@ class OutreachRunner:
             self._append_log(f"🛑 {msg}")
             return {"ok": False, "error": msg, "total": 0,
                     "sent": 0, "failed": 0, "skipped": 0}
+
+        # 验证冷却：撞了拼图验证、没人管 → 这段时间不搜任何东西。
+        #
+        # 为什么必须挡在开轮之前（2026-11-13 实测）：
+        #   17:41 撞验证 → 18:00 超时结束 → 18:09 重开一轮 → 18:10 又撞
+        # 两轮全白跑（一轮干等、一轮 1 分钟撞墙）。
+        # 冷却期内硬冲 = 在抖音的风控冷却期里反复撞，只会让冷却越拖越长。
+        # 到点自动重试；用户手动过了验证 → 点「我验证好了，继续」也能立刻放行。
+        await self._expire_verify_cooldown()
+        vleft = 0 if bypass_verify_cooldown else self.verify_cooldown_left()
+        if vleft > 0:
+            msg = (f"抖音验证冷却中，还剩 {vleft} 分钟（这一轮没人过拼图）。"
+                   f"系统这期间不发起搜索，到点自动重试；"
+                   f"你也可以现在在网页点「开始触达」手动跑一轮"
+                   f"（会绕过冷却，把浏览器开起来等你过拼图）")
+            self._append_log(f"❄️ {msg}")
+            return {"ok": False, "error": msg, "total": 0,
+                    "sent": 0, "failed": 0, "skipped": 0, "cooldown": vleft}
 
         self._running = True
         self._logs = []

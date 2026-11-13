@@ -98,6 +98,9 @@ def create_outreach_page():
         from ..outreach.runner import get_outreach_runner
 
         runner = get_outreach_runner()
+        # 先记一下「点之前是不是在验证冷却里」——
+        # 冷却中点这个按钮 = 「我手动把拼图过了」，要把冷却也解掉。
+        had_cooldown = int(runner.verify_cooldown_left() or 0) > 0
         woke = runner.resume()
 
         unpaused = False
@@ -114,6 +117,11 @@ def create_outreach_page():
             ui.notify("已继续，触达接着跑", type="positive")
         elif unpaused:
             ui.notify("已解除暂停，自动触达接着跑", type="positive")
+        elif had_cooldown:
+            ui.notify(
+                "已解除验证冷却，自动触达接着跑（抖音的验证冷却期已过）",
+                type="positive",
+            )
         else:
             ui.notify(
                 "现在没有在等验证（自动触达也没在暂停）——"
@@ -211,7 +219,11 @@ def create_outreach_page():
         try:
             result = await runner.run(limit=limit, dry_run=dry,
                                       delay_min=delay_min, delay_max=delay_max,
-                                      sort_by=str(outreach_sort_by.value or "recent"))
+                                      sort_by=str(outreach_sort_by.value or "recent"),
+                                      # 人手动点的 → 允许硬闯验证冷却：
+                                      # 冷却期里自动轮不发请求，但人既然在电脑前，
+                                      # 就该把浏览器开起来让他把拼图过了。
+                                      bypass_verify_cooldown=True)
         except Exception as e:
             log.error(f"触达任务失败: {e}", exc_info=True)
             outreach_status.text = f"触达失败: {e}"
@@ -397,6 +409,11 @@ def create_outreach_page():
                         bits.append(f"下次 {st['next_run_at']}")
                     if st["cooldown"]:
                         bits.append(f"⚠️ 限流冷却中，还剩 {st['cooldown']} 分钟，等冷却完再跑")
+                    elif st.get("verify_cooldown"):
+                        bits.append(
+                            f"❄️ 验证冷却中，还剩 {st['verify_cooldown']} 分钟"
+                            f"（撞了抖音拼图、没人过；到点自动重试）"
+                        )
                     elif st["last_error"]:
                         bits.append(f"（{st['last_error']}）")
                     auto_status.text = "　".join(bits)
@@ -645,6 +662,9 @@ def create_outreach_page():
                     if cooldown:
                         # 只有真限流才会 >0（要本人验证不算限流）
                         bits.append(f"🛑 账号限流冷却剩 {cooldown} 分钟")
+                    vcooldown = int(p.get("verify_cooldown") or 0)
+                    if vcooldown:
+                        bits.append(f"❄️ 验证冷却剩 {vcooldown} 分钟（不搜索，到点自动重试）")
                     if p.get("waiting_human"):
                         bits.append("⏸ 等你人工验证")
                     if p.get("sent"):
