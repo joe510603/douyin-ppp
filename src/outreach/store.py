@@ -50,6 +50,18 @@ STATUS_NOT_FOUND = "not_found"
 # 拿到电话/微信的人就别再留言了（用户 2026-11-13 明确要求）。
 # 这是一个**终态**：不在待触达队列里，回拉认它、也不再把它改回 pending。
 STATUS_CONVERTED = "converted"
+# 已私信 —— 走了私信兜底（用户 2026-11-14 要求）
+#
+# 什么时候会走到私信：
+#   这个人**没有可留言的作品**（作品数为 0，或作品全是私密）。
+#   留言是前提，没作品就没法留言 —— 但人还在直播间问过价，
+#   直接跳过就白白丢一个客户，所以改发私信。
+#
+# 跟「已留言」分开的原因：
+#   1. 销售在飞书表里看到的触达状态不一样（「已留言」vs「已私信」），
+#      两条路径的跟进动作不同（私信要等对方通过）；
+#   2. 私信的额度、间隔、熔断都跟留言**分开算**（陌生人私信风控严得多）。
+STATUS_MESSAGED = "messaged"
 
 
 # ================================================================
@@ -602,13 +614,25 @@ class OutreachStore:
         ).fetchone()
         return bool(row and row["n"])
 
-    def sent_today(self) -> int:
-        """今天真实发出去了几条（干跑不算）"""
-        row = self._conn.execute(
-            "SELECT COUNT(*) AS n FROM outreach_records "
-            "WHERE status = 'sent' AND date(created_at) = date('now','localtime')"
-        ).fetchone()
+    def sent_today(self, channel: str = "") -> int:
+        """今天真实发出去了几条（干跑不算）
+
+        ``channel`` 用来分开算额度：
+        私信（陌生人私信）风控比留言严得多，**不能跟留言共用一个额度**，
+        否则留言跑满 100 条的同时把私信也发出去，账号会被限制私信功能。
+        """
+        sql = ("SELECT COUNT(*) AS n FROM outreach_records "
+               "WHERE status = 'sent' AND date(created_at) = date('now','localtime')")
+        params: list[Any] = []
+        if channel:
+            sql += " AND channel = ?"
+            params.append(channel)
+        row = self._conn.execute(sql, params).fetchone()
         return int(row["n"] if row else 0)
+
+    def dm_sent_today(self) -> int:
+        """今天发了几条私信（额度判定用）"""
+        return self.sent_today(channel="dm")
 
     def recent_touches(self, limit: int = 100) -> list[dict]:
         rows = self._conn.execute(

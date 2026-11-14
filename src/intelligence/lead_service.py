@@ -444,6 +444,8 @@ _FEISHU_OUTREACH_TO_LOCAL = {
     "搜不到": "not_found",
     # 「已留资」→ 终态，不再进触达队列
     "已留资": "converted",
+    # 「已私信」= 私信兜底（没作品 → 改发私信），终态
+    "已私信": "messaged",
 }
 
 

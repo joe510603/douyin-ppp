@@ -473,7 +473,8 @@ class OutreachRunner:
 
         self._last_result = result
         summary = (
-            f"发 {result.get('sent', 0)}　干跑 {result.get('dry', 0)}　"
+            f"发 {result.get('sent', 0)}　私信 {result.get('messaged', 0)}　"
+            f"干跑 {result.get('dry', 0)}　"
             f"失败 {result.get('failed', 0)}　跳过 {result.get('skipped', 0)}"
         )
         self._append_log(f"■ 触达任务结束：{summary}")
@@ -534,16 +535,18 @@ class OutreachRunner:
                     "current": "",
                     "mode": "干跑" if event.get("dry_run") else "真发",
                     "sent": 0, "failed": 0, "skipped": 0, "dry": 0,
+                    "messaged": 0,
                 }
             elif t == "current":
                 self._progress["index"] = int(event.get("index") or 0)
                 self._progress["current"] = (
                     f"{lead.get('display_id') or ''} {lead.get('nickname') or ''}".strip()
                 )
-            elif t in ("sent", "failed", "skipped", "dry", "unshown"):
+            elif t in ("sent", "failed", "skipped", "dry", "unshown", "messaged"):
                 self._progress["done"] = int(self._progress.get("done") or 0) + 1
                 key = {"sent": "sent", "failed": "failed", "skipped": "skipped",
-                       "dry": "dry", "unshown": "sent"}[t]
+                       "dry": "dry", "unshown": "sent",
+                       "messaged": "messaged"}[t]
                 self._progress[key] = int(self._progress.get(key) or 0) + 1
                 self._progress["current"] = ""
         if t == "need_login":
@@ -573,6 +576,8 @@ class OutreachRunner:
                 )
         elif t == "sent":
             self._append_log(f"✅ 已留言：{event.get('text', '')[:40]}")
+        elif t == "messaged":
+            self._append_log(f"💬 已私信（没作品，改私信）：{event.get('text', '')[:40]}")
         elif t == "captcha_wait":
             self._mark_waiting_human(str(event.get("error") or ""))
             self._append_log(

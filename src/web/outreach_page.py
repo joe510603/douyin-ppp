@@ -686,6 +686,8 @@ def create_outreach_page():
                         bits.append("⏸ 等你人工验证")
                     if p.get("sent"):
                         bits.append(f"已留言 {p['sent']}")
+                    if p.get("messaged"):
+                        bits.append(f"已私信 {p['messaged']}")
                     if p.get("dry"):
                         bits.append(f"干跑 {p['dry']}")
                     if p.get("failed"):

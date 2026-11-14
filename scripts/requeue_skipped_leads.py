@@ -62,23 +62,31 @@ def _connect(db: str) -> sqlite3.Connection:
     return conn
 
 
-def pick_leads(conn: sqlite3.Connection, limit: int) -> list[sqlite3.Row]:
-    """挑出「搜不到」跳过的线索
+def pick_leads(conn: sqlite3.Connection, limit: int, reason: str) -> list[sqlite3.Row]:
+    """挑出被跳过的线索
+
+    ``reason``:
+    - ``搜不到``：搜索没搜到人（可能是搜索逻辑修好之前被误跳过的）
+    - ``作品``：搜到了但**没有可留言的作品** → 这些是私信兜底的候选
 
     排序：最近跳过的优先（last_hit_at 倒序）——
     最近在直播间冒过头的客户，成功率最高。
     """
+    if reason == "作品":
+        note_like = "%作品%"
+    else:
+        note_like = "%搜不到%"
     sql = """
         SELECT id, display_id, nickname, store, outreach_note,
                outreach_at, not_found_count, last_hit_at, created_at
           FROM leads
          WHERE outreach_status = 'skipped'
-           AND outreach_note LIKE '%搜不到%'
+           AND outreach_note LIKE ?
            AND display_id != ''
          ORDER BY COALESCE(NULLIF(last_hit_at, ''), created_at) DESC
          LIMIT ?
     """
-    return list(conn.execute(sql, [limit]).fetchall())
+    return list(conn.execute(sql, [note_like, limit]).fetchall())
 
 
 def has_douyin_id(conn: sqlite3.Connection, display_id: str) -> int:
@@ -95,6 +103,9 @@ def main() -> int:
     ap.add_argument("--db", default=DB_PATH, help="数据库路径")
     ap.add_argument("--apply", action="store_true", help="真正改（默认只干跑）")
     ap.add_argument("--limit", type=int, default=50, help="一次最多放回多少条")
+    ap.add_argument("--reason", default="搜不到",
+                    choices=["搜不到", "作品"],
+                    help="放回哪一批：搜不到=搜索误跳过；作品=没作品（私信兜底的候选）")
     args = ap.parse_args()
 
     if not os.path.exists(args.db):
@@ -103,12 +114,12 @@ def main() -> int:
 
     conn = _connect(args.db)
     try:
-        rows = pick_leads(conn, args.limit)
+        rows = pick_leads(conn, args.limit, args.reason)
         if not rows:
-            print("✅ 没有「搜不到」跳过的线索要放回")
+            print(f"✅ 没有「{args.reason}」跳过的线索要放回")
             return 0
 
-        print(f"找到 {len(rows)} 条「搜不到」跳过的线索：\n")
+        print(f"找到 {len(rows)} 条「{args.reason}」跳过的线索：\n")
         changed = 0
         for r in rows:
             did = str(r["display_id"] or "")

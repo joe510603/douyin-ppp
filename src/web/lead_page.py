@@ -47,6 +47,8 @@ OUTREACH_LABELS = {
     "skipped": "已跳过",
     "not_found": "搜不到",
     "converted": "已留资",
+    # 私信兜底（没作品 → 改发私信）
+    "messaged": "已私信",
 }
 
 

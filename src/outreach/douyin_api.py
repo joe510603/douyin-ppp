@@ -210,6 +210,9 @@ class Douyin:
         self.verify_flow = ""
         self.verify_flow_at = 0.0
         self.verify_ways: list[str] = []
+        # 这个人是不是「私密账号」（作品仅自己可见）
+        # 只在**打开他的主页之后**才有意义 —— 别的页面上判断是假的。
+        self.is_private_account = False
         # ---- 搜索接口的健康状态 ----
         # 抖音 web 端搜索会**静默限流**：不报错、不提示，就是给你一个空的
         # user_list（实测 status_code=0、cursor=10、user_list=[]）。
@@ -1986,6 +1989,24 @@ class Douyin:
         except Exception:
             return ""
 
+    def detect_private_account(self) -> bool:
+        """当前页面上是不是「私密账号」（作品设为仅自己可见）
+
+        判据：主页上有一行字「**私密账号**」。
+
+        ⚠ **必须在用户主页上判**：搜索结果页上不会有这行字，
+        判了就是 False（假的「不是私密账号」）。
+        所以 open_dm 打开主页之后要再判一次。
+
+        ⚠ 页面上的「私密作品」是另一回事（某几条作品设了私密），
+        跟「私密账号」不是一回事，所以这里精确匹配「私密账号」四个字。
+        """
+        try:
+            body = self._body_text() or ""
+        except Exception:
+            return False
+        return "私密账号" in body
+
     def open_dm(self, sec_uid: str):
         """打开某人的私信面板，返回输入框元素（失败返回 None 并给出原因）。
 
@@ -1995,6 +2016,8 @@ class Douyin:
         self._goto(f"{DOUYIN}/user/{sec_uid}")
         self.page.wait_for_timeout(random.randint(3500, 5200))
         self.check_risk()
+        # 私密账号要**在主页上**才判断得准（搜索结果页上没有那行字）
+        self.is_private_account = self.detect_private_account()
 
         loc = self.page.locator('button:has-text("私信")')
         picked = None
@@ -2045,7 +2068,8 @@ class Douyin:
         self.ensure_login()
         el, why = self.open_dm(sec_uid)
         if el is None:
-            return {"ok": False, "msg": why}
+            return {"ok": False, "msg": why,
+                    "is_private": bool(self.is_private_account)}
 
         # 私信编辑器是 Slate，点一下必须真的拿到焦点，否则 keyboard.type 会打进虚空。
         # 所以要显式校验 document.activeElement，没焦点就再点/整段插入，最多试 3 轮。
@@ -2098,7 +2122,8 @@ class Douyin:
             self.log(f"  ⚠️ 私信输入第 {attempt} 次没进去，重试")
         if not typed:
             self._shot("dm_type_fail")
-            return {"ok": False, "msg": "私信内容没输进去"}
+            return {"ok": False, "msg": "私信内容没输进去",
+                    "is_private": bool(self.is_private_account)}
 
         before = self._dm_panel_text()
 
@@ -2149,11 +2174,14 @@ class Douyin:
 
         if bad:
             shot = self._shot("dm_fail")
-            return {"ok": False, "msg": f"私信被拦：{bad[0]}", "shot": shot}
+            return {"ok": False, "msg": f"私信被拦：{bad[0]}", "shot": shot,
+                    "is_private": bool(self.is_private_account)}
         # 点过发送键就认为「已尝试投递」，不再二次点击；
         # 页面没清空也只记「未确认」，由 pipeline 决定怎么留痕。
         if how or not left:
             self.log(f"  ✓ 私信已发出（{how or 'input-cleared'}）")
-            return {"ok": True, "msg": "已发送"}
+            return {"ok": True, "msg": "已发送",
+                    "is_private": bool(self.is_private_account)}
 
-        return {"ok": True, "msg": "已发送（未确认：输入框没清空，按不重发处理）"}
+        return {"ok": True, "msg": "已发送（未确认：输入框没清空，按不重发处理）",
+                "is_private": bool(self.is_private_account)}

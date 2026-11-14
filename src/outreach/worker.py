@@ -43,6 +43,7 @@ from .store import (
     STATUS_CONVERTED,
     STATUS_FAILED,
     STATUS_FOUND,
+    STATUS_MESSAGED,
     STATUS_NOT_FOUND,
     STATUS_PENDING,
     STATUS_SEARCHING,
@@ -61,6 +62,8 @@ FEISHU_STATUS = {
     STATUS_SKIPPED: "已跳过",
     STATUS_NOT_FOUND: "搜不到",
     STATUS_CONVERTED: "已留资",
+    # 私信兜底（没作品 → 改发私信）
+    STATUS_MESSAGED: "已私信",
 }
 
 
@@ -292,6 +295,10 @@ class OutreachWorker:
         self._dry = True
         # 连续「发出去但回查不到」的次数（软风控信号）
         self._silent_blocks = 0
+        # 连续「私信发不出去」的次数（私信功能被限的信号）
+        self._dm_failed = 0
+        # 上一条走的是哪个渠道（私信之后要等更久）
+        self._last_channel = ""
         # 撞验证码时用它跟主线程同步「人工验证完了，继续」
         # （worker 在专用线程里跑，主进程是 asyncio，跨不过去，只能靠 Event）
         self.resume_event = resume_event
@@ -748,6 +755,15 @@ class OutreachWorker:
             self.log(f"  ⏳ 干跑，等 {sec}s 看下一条")
             self._sleep(sec)
             return
+        # 私信之后要多等一会儿 —— 陌生人私信比留言敏感得多，
+        # 紧挨着发两条很容易被判定为「骚扰」。
+        if self._last_channel == "dm":
+            lo = int(getattr(o, "dm_delay_min", 90) or 90)
+            hi = int(getattr(o, "dm_delay_max", 150) or 150)
+            sec = random.randint(lo, hi)
+            self.log(f"  ⏳ 私信后多等一会儿（{sec}s，私信比留言敏感）")
+            self._sleep(sec)
+            return
         lo, hi, why = self._pick_delay()
         sec = random.randint(lo, hi)
         self.log(f"  ⏳ 等 {sec}s 再找下一个（{why}）")
@@ -1045,7 +1061,7 @@ class OutreachWorker:
         summary = {
             "ok": True, "total": len(picked), "sent": 0, "failed": 0,
             "skipped": skipped, "dry": 0, "dry_run": dry, "stopped": "",
-            "not_found": 0,
+            "not_found": 0, "messaged": 0,
         }
         if not picked:
             self.log("没有要处理的线索，结束")
@@ -1676,8 +1692,159 @@ class OutreachWorker:
         if record_id:
             self._feishu.push(record_id, {"联系方式": m_value})
 
+    # ============================================================
+    # 私信兜底：没作品 → 改发私信
+    # ============================================================
+    #
+    # 用户 2026-11-14：「如果一个抖音号没有作品，那就发私信」。
+    #
+    # 为什么这个兜底值得做：
+    #   留言的载体是**作品**。没作品（作品数 0，或作品全是私密）的人
+    #   压根没法留言 —— 以前一律「跳过」，等于白捡的客户白丢掉。
+    #   而这些人**确实在直播间问过价**，私信照样发得出去。
+    #
+    # 为什么私信的额度/间隔/熔断要跟留言**分开**：
+    #   陌生人私信是抖音管得最严的动作（对方回复/关注前只能发一条，
+    #   内容还会被审核、可能进「陌生人消息」列表对方暂时看不到）。
+    #   跟留言共用额度 → 留言跑满的同时把私信也发出去 → 私信功能被限
+    #   → 连留言一起废。
+
+    def _dm_quota_left(self) -> int:
+        """今天还能发多少条私信"""
+        o = self.cfg.outreach
+        limit = int(getattr(o, "dm_daily_limit", 10) or 0)
+        if limit <= 0:
+            return 0
+        try:
+            return max(0, limit - self.st.dm_sent_today())
+        except Exception:
+            return 0
+
+    def _fallback_to_dm(self, dy: Douyin, lead: dict, summary: dict,
+                        why: str = "") -> None:
+        """没作品 → 改发私信
+
+        失败了就退回「跳过」（终态，留给人工）——
+        跟「没搜到人」不一样，私信发不出去通常是对方关了私信，
+        重试也没用。
+        """
+        o = self.cfg.outreach
+        dry = self._dry
+
+        if not bool(getattr(o, "dm_fallback", True)):
+            raise NoWorks(why or "该用户没有公开作品")
+
+        # ---- 额度 ----
+        left = self._dm_quota_left()
+        if left <= 0:
+            self.log(f"  ⏭️ 没有作品，私信额度也用完了（今天 {int(o.dm_daily_limit)} 条）")
+            raise NoWorks(f"{why}；私信额度已用完".strip("；"))
+
+        # ---- 私密账号：先认出来，销售那边要区别对待 ----
+        #
+        # ⚠ 发送**前**的判断只作参考：这时页面可能还停在搜索结果页，
+        #   搜索结果页上没有「私密账号」那行字 → 会判成「不是」。
+        #   真正准的判断在 ``send_dm`` 里（它一定打开过对方主页）。
+        private = self._detect_private_account(dy, lead)
+
+        # ---- 话术（私信版：120 字，一次说清来意）----
+        c = self.cw.generate(self._as_copywriter_lead(lead), channel="dm")
+        if not c.get("ok"):
+            raise NoWorks(f"{why}；私信文案不合格：{c.get('reason')}")
+        text = c["text"]
+        self.log(f"  ✍️ [私信/{c['template_id']}] {text}")
+
+        if dry:
+            self.st.add_touch(
+                lead_id=lead["id"], record_id=lead.get("bitable_record_id") or "",
+                display_id=lead["display_id"], nickname=lead.get("nickname") or "",
+                sec_uid=lead["sec_uid"], comment_text=text,
+                template_id=c["template_id"], channel="dm", status="dry_run",
+            )
+            summary["dry"] += 1
+            self._emit(type="dry", lead=lead, text=text)
+            self.log("  🧪 干跑，不发送、不回写")
+            return
+
+        # ---- 发 ----
+        self.log(f"  💬 没有作品，改发私信（今天还剩 {left} 条额度）")
+        res = dy.send_dm(lead["sec_uid"], text)
+        # 发送过程一定打开过对方主页 → 这时的私密判断才是准的
+        if res.get("is_private"):
+            private = True
+            lead["is_private_account"] = True
+        if not res.get("ok"):
+            self._dm_failed += 1
+            thr = int(getattr(o, "dm_fail_threshold", 2) or 2)
+            self.st.add_touch(
+                lead_id=lead["id"], record_id=lead.get("bitable_record_id") or "",
+                display_id=lead["display_id"], nickname=lead.get("nickname") or "",
+                sec_uid=lead["sec_uid"], comment_text=text,
+                template_id=c["template_id"], channel="dm", status="failed",
+                error=str(res.get("msg") or "")[:200],
+            )
+            self.log(f"  ❌ 私信没发出去：{res.get('msg')}")
+            if self._dm_failed >= thr:
+                raise RiskControl(
+                    f"连续 {self._dm_failed} 条私信发不出去，多半是私信功能被限了，"
+                    f"已停手。冷却 {int(getattr(o, 'dm_pause_minutes', 60) or 60)} 分钟后再试"
+                )
+            raise NoWorks(f"{why}；私信也没发出去（{res.get('msg')}）".strip("；"))
+
+        # ---- 成功 ----
+        self._dm_failed = 0
+        self.st.add_touch(
+            lead_id=lead["id"], record_id=lead.get("bitable_record_id") or "",
+            display_id=lead["display_id"], nickname=lead.get("nickname") or "",
+            sec_uid=lead["sec_uid"], comment_text=text,
+            template_id=c["template_id"], channel="dm", status="sent",
+        )
+        summary["messaged"] = summary.get("messaged", 0) + 1
+        self._last_channel = "dm"
+        note = "已私信（对方需通过陌生人消息才能看到）"
+        if private:
+            note += "；私密账号·网页版加不了好友，销售要用抖音 App 手动加"
+        self._set_status(lead, STATUS_MESSAGED, note)
+        self._emit(type="messaged", lead=lead, text=text)
+        self.log(f"  ✅ 已私信（陌生人消息，对方通过后才互看得到）")
+        if private:
+            self.log("  🔒 这是私密账号：网页版没有「加好友」按钮，"
+                     "需要销售用抖音 App 手动加好友")
+
+    def _detect_private_account(self, dy: Douyin, lead: dict) -> bool:
+        """这个人是不是「私密账号」（作品设为仅自己可见）
+
+        怎么判（2026-11-14 实测）：
+        - 主页上有一行字「**私密账号**」→ 就是它
+        - **没有**「加好友 / 添加朋友」按钮 —— 抖音的好友功能只在 App 里，
+          网页版根本没有这个入口（实测 8 个主页 0 个有）。
+          所以「加好友」这条路在当前架构下走不通，
+          私密账号只能靠私信 + 销售手动用 App 加。
+
+        判据要**精确匹配**：页面上还有「私密作品」这类别的文案，
+        跟「私密账号」不是一回事。
+
+        ⚠ 必须在**用户主页**上判才有意义 —— 搜索结果页上没有那行字，
+        判了就是「不是」。所以 send_dm 打开主页之后还会再判一次。
+        """
+        sec = str(lead.get("sec_uid") or "").strip()
+        if not sec:
+            return False
+        try:
+            is_private = bool(dy.detect_private_account())
+        except Exception:
+            return False
+        if is_private:
+            lead["is_private_account"] = True
+            self.log("  🔒 私密账号（作品仅自己可见，网页版没法留言）")
+            return True
+        return False
+
     def _handle_one(self, dy: Douyin, lead: dict, summary: dict) -> None:
-        """处理一条线索：找人 → 挑作品 → 生成话术 → 发送 → 回查"""
+        """处理一条线索：找人 → 挑作品 → 生成话术 → 发送 → 回查
+
+        没作品的人走**私信兜底**（见 ``_fallback_to_dm``）。
+        """
         o = self.cfg.outreach
         dry = self._dry
 
@@ -1722,12 +1889,15 @@ class OutreachWorker:
 
         # b. 挑作品
         if info.get("aweme_count") == 0:
-            raise NoWorks("该用户没有公开作品（主页作品数为 0）")
+            # 没有作品 → 留言这条路走不通 → 改发私信
+            self._fallback_to_dm(dy, lead, summary, why="该用户没有公开作品（主页作品数为 0）")
+            return
         works = dy.fetch_works(lead["sec_uid"], limit=20)
         dy.check_risk()
         work = self._pick_work(works)
         if not work:
-            raise NoWorks("该用户没有可用的公开作品")
+            self._fallback_to_dm(dy, lead, summary, why="该用户没有可用的公开作品")
+            return
         self.log(
             f"  ✓ 选中作品 {work['aweme_id']}　{(work.get('desc') or '')[:24]}"
         )
@@ -1821,6 +1991,7 @@ class OutreachWorker:
 
         self._set_status(lead, STATUS_COMMENTED)
         summary["sent"] += 1
+        self._last_channel = "comment"
         self._emit(type="sent", lead=lead, text=text, res=res)
         self.log(f"     ⏱ 本条合计 {time.time() - t_lead:.1f}s")
 
