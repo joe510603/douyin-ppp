@@ -91,10 +91,14 @@ def pick_leads(conn: sqlite3.Connection, limit: int, reason: str) -> list[sqlite
 
 def has_douyin_id(conn: sqlite3.Connection, display_id: str) -> int:
     """弹幕原始表里有没有这个抖音号（= 这个号确实存在过）"""
-    row = conn.execute(
-        "SELECT COUNT(*) FROM live_comments WHERE user_display_id = ?",
-        [display_id],
-    ).fetchone()
+    try:
+        row = conn.execute(
+            "SELECT COUNT(*) FROM live_comments WHERE user_display_id = ?",
+            [display_id],
+        ).fetchone()
+    except sqlite3.OperationalError:
+        # 表不存在（老库 / 测试库）→ 当作「查不到」，不该让整个脚本崩掉
+        return 0
     return int(row[0]) if row else 0
 
 
@@ -128,6 +132,21 @@ def main() -> int:
             print(f"  #{r['id']:<5} {did:<20} {(r['nickname'] or '')[:16]:<18} "
                   f"跳过于 {r['outreach_at'] or '?'}　{mark}")
             if args.apply:
+                # ⚠⚠ 同步标记必须一起处理，否则放回会被「飞书回拉」冲掉。
+                #
+                # 回拉的判据（lead_service.pull_bitable_status）：
+                #   「本地状态 == 上次同步进飞书的状态」→ 认为本地没改过 → 采纳飞书的值。
+                # 我们把本地改成 pending（待触达），而飞书上还写着「已跳过」——
+                #   如果同步标记是**空**的，回拉会走「从没同步过」的分支，
+                #   判定「本地是默认值」→ 采纳飞书的「已跳过」→ **放回被冲掉**。
+                #   （实测 2026-11-14：放回 30 条，26 条在 5 分钟内被回拉改回 skipped。）
+                #
+                # 所以这里把同步标记设成**放回前的状态**（待处理|已跳过）：
+                #   · 标记 ≠ 当前值 → 回拉认为「本地改过」→ 保护本地，不覆盖 ✓
+                #   · 语义也对：飞书上确实还写着「已跳过」，
+                #     下次这条线索被触达时，写回飞书成功后会重新对齐标记，
+                #     销售在飞书里手动改状态的通道随之恢复 ✓
+                synced = "待处理|已跳过"
                 if args.reason == "作品":
                     # 标记「确认没作品」：下次进队列**直接转私信**，
                     # 不用再拉一遍作品列表确认（他们早就有 sec_uid，
@@ -136,17 +155,19 @@ def main() -> int:
                         "UPDATE leads SET outreach_status='pending', "
                         "not_found_count=0, outreach_note='', "
                         "no_works=1, outreach_at='', "
+                        "bitable_synced_status=?, "
                         "updated_at=datetime('now','localtime') "
                         "WHERE id = ?",
-                        [r["id"]],
+                        [synced, r["id"]],
                     )
                 else:
                     conn.execute(
                         "UPDATE leads SET outreach_status='pending', "
                         "not_found_count=0, outreach_note='', "
-                        "outreach_at='', updated_at=datetime('now','localtime') "
+                        "outreach_at='', bitable_synced_status=?, "
+                        "updated_at=datetime('now','localtime') "
                         "WHERE id = ?",
-                        [r["id"]],
+                        [synced, r["id"]],
                     )
                 changed += 1
         if args.apply:
