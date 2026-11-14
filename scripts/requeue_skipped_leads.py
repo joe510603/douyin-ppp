@@ -128,17 +128,34 @@ def main() -> int:
             print(f"  #{r['id']:<5} {did:<20} {(r['nickname'] or '')[:16]:<18} "
                   f"跳过于 {r['outreach_at'] or '?'}　{mark}")
             if args.apply:
-                conn.execute(
-                    "UPDATE leads SET outreach_status='pending', "
-                    "not_found_count=0, outreach_note='', "
-                    "outreach_at='', updated_at=datetime('now','localtime') "
-                    "WHERE id = ?",
-                    [r["id"]],
-                )
+                if args.reason == "作品":
+                    # 标记「确认没作品」：下次进队列**直接转私信**，
+                    # 不用再拉一遍作品列表确认（他们早就有 sec_uid，
+                    # 也不会触发搜索）。
+                    conn.execute(
+                        "UPDATE leads SET outreach_status='pending', "
+                        "not_found_count=0, outreach_note='', "
+                        "no_works=1, outreach_at='', "
+                        "updated_at=datetime('now','localtime') "
+                        "WHERE id = ?",
+                        [r["id"]],
+                    )
+                else:
+                    conn.execute(
+                        "UPDATE leads SET outreach_status='pending', "
+                        "not_found_count=0, outreach_note='', "
+                        "outreach_at='', updated_at=datetime('now','localtime') "
+                        "WHERE id = ?",
+                        [r["id"]],
+                    )
                 changed += 1
         if args.apply:
             conn.commit()
-            print(f"\n✅ 已放回 {changed} 条 → 下一轮会再搜一次他们")
+            tip = "下一轮会再搜一次他们"
+            if args.reason == "作品":
+                tip = ("下一轮会**直接开主页转私信**（有 sec_uid 的不搜索），"
+                       "不用再拉作品列表确认")
+            print(f"\n✅ 已放回 {changed} 条 → {tip}")
         else:
             print(f"\n（干跑，没有改任何东西。要真放回就加 --apply）")
     finally:

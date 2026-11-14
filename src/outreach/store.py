@@ -248,6 +248,17 @@ class OutreachStore:
                     # 处理状态（销售在飞书里标的「已跟进/已留资」）
                     # pending_leads 要读它来生成「上次同步进飞书的状态」标记
                     ("status", "TEXT DEFAULT ''"),
+                    # 「已确认没有作品」——私信兜底的候选
+                    #
+                    # 为什么单独一列（而不是靠 outreach_note 认）：
+                    #   outreach_note 会被改写、会被清空，拿它当判据不可靠。
+                    #
+                    # 为什么这个标记值钱：
+                    #   这些人**已经有 sec_uid**（我们找到过他们），
+                    #   所以下次触达可以**直接开主页**、完全不用搜索 ——
+                    #   搜索是抖音风控最敏感的动作，能省一次是一次。
+                    #   开主页发现「还是没作品」→ 直接转私信。
+                    ("no_works", "INTEGER DEFAULT 0"),
                 ):
                     if col not in lead_cols:
                         self._conn.execute(
@@ -298,7 +309,8 @@ class OutreachStore:
             "SELECT id, lead_key, display_id, nickname, car_model, store, ",
             "intent_level, intent_score, intent_reason, evidence, monitor_name, ",
             "bitable_record_id, outreach_status, created_at, last_hit_at, ",
-            "contact_type, contact_value, sec_uid, status, not_found_count ",
+            "contact_type, contact_value, sec_uid, status, not_found_count, "
+            "no_works ",
             "FROM leads WHERE outreach_status IN (?, ?) AND display_id != ''"
         ]
         params: list[Any] = [STATUS_PENDING, STATUS_NOT_FOUND]
@@ -333,10 +345,11 @@ class OutreachStore:
         except sqlite3.OperationalError as e:
             # 补不上的列（老库 + ALTER 失败）别让整轮瘫掉：
             # 退回不带这些列的查询，少用一次「跳过搜索」而已。
-            if not any(c in str(e) for c in ("sec_uid", "status", "not_found_count")):
+            if not any(c in str(e) for c in ("sec_uid", "status", "not_found_count",
+                                              "no_works")):
                 raise
             fallback = sql
-            for col in (", sec_uid ", ", status ", ", not_found_count "):
+            for col in (", sec_uid ", ", status ", ", not_found_count ", ", no_works "):
                 fallback = [s.replace(col, " ") for s in fallback]
             rows = self._conn.execute("".join(fallback), params).fetchall()
             out = []
@@ -345,6 +358,7 @@ class OutreachStore:
                 d.setdefault("sec_uid", "")
                 d.setdefault("status", "")
                 d.setdefault("not_found_count", 0)
+                d.setdefault("no_works", 0)
                 out.append(d)
             return out
         out = []
@@ -353,6 +367,7 @@ class OutreachStore:
             d.setdefault("sec_uid", "")
             d.setdefault("status", "")
             d.setdefault("not_found_count", 0)
+            d.setdefault("no_works", 0)
             out.append(d)
         return out
 
@@ -394,6 +409,26 @@ class OutreachStore:
             [synced, lead_id],
         )
         self._conn.commit()
+
+    def mark_no_works(self, lead_id: int, is_no_works: bool = True) -> None:
+        """标记「这个人已确认没有可留言的作品」
+
+        为什么要记这个（2026-11-14）：
+        这些人**已经有 sec_uid**，下次触达可以**直接开主页、不用搜索**。
+        搜索是抖音风控最敏感的动作（一次 20 秒 + 容易被限流），
+        而「开主页 → 看看有没有作品 → 转私信」几乎不消耗搜索额度。
+
+        有了这个标记，他们下次进队列就是**私信快路径**：
+        不搜、不找作品，直接私信。
+        """
+        try:
+            self._conn.execute(
+                "UPDATE leads SET no_works = ? WHERE id = ?",
+                [1 if is_no_works else 0, lead_id],
+            )
+            self._conn.commit()
+        except sqlite3.OperationalError:
+            pass
 
     def bump_not_found(self, lead_id: int) -> int:
         """记一次「这次没搜到这个人」，返回累计次数

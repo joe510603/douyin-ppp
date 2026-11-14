@@ -58,17 +58,36 @@ UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
 
 
 def fetch_profile(sec_uid: str, timeout: float = 15.0) -> dict | None:
-    """拉一个人的资料（不要签名、不要登录态）"""
+    """拉一个人的资料（不要签名、不要登录态）
+
+    返回 None 有两种含义，**要分开看**：
+    - ``None`` + 抛异常 → 网络/解析问题
+    - **HTTP 200 但 body 为空** → 抖音的**静默限流**（实测 2026-11-14：
+      连续扫 225 条之后就开始返空，隔一段时间才恢复）
+
+    所以这里把「空 body」单独标出来，让调用方能**立刻停手**，
+    别继续扫（继续扫只会加重限流，还白等）。
+    """
     req = urllib.request.Request(
         OLD_API.format(sec=sec_uid),
         headers={"User-Agent": UA, "Referer": "https://www.douyin.com/"},
     )
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
-            data = json.loads(resp.read().decode("utf-8", "ignore"))
+            raw = resp.read().decode("utf-8", "ignore")
+    except Exception:
+        return None
+    if not raw.strip():
+        raise _RateLimited("接口返回空 body（HTTP 200）——抖音静默限流了")
+    try:
+        data = json.loads(raw)
     except Exception:
         return None
     return data.get("user_info") or None
+
+
+class _RateLimited(Exception):
+    """接口开始返空 → 被限流了，歇一会儿再来"""
 
 
 def main() -> int:
@@ -99,12 +118,20 @@ def main() -> int:
         has_sig = 0
         has_contact = 0
         failed = 0
+        limited = False
         hits = []
         new_contacts = []
 
         for i, r in enumerate(rows, 1):
             total += 1
-            info = fetch_profile(r["sec_uid"])
+            try:
+                info = fetch_profile(r["sec_uid"])
+            except _RateLimited as e:
+                print(f"\n🛑 {e}")
+                print(f"   已查 {i-1}/{len(rows)} 条就撞上限流了 —— 歇一会儿再跑，")
+                print("   继续扫只会加重限流。已经查到的结果不受影响。")
+                limited = True
+                break
             if not info:
                 failed += 1
                 time.sleep(args.delay)
@@ -134,6 +161,8 @@ def main() -> int:
             conn.commit()
 
         print(f"\n===== 统计 =====")
+        if limited:
+            print("  ⚠️ 撞上限流，提前收工")
         print(f"  查了            {total} 条")
         print(f"  接口失败        {failed} 条")
         print(f"  简介非空        {has_sig} 条（{has_sig * 100 // max(total, 1)}%）")

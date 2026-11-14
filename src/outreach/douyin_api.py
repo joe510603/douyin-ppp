@@ -1283,7 +1283,15 @@ class Douyin:
         try:
             resp = self.page.request.get(
                 self._OLD_USER_INFO_API.format(sec=sec_uid), timeout=20000)
-            j = json.loads(resp.text())
+            text = resp.text()
+            if not text or not text.strip():
+                # ⚠ HTTP 200 但**空 body** —— 这是抖音的静默限流，
+                #   不是报错（跟搜索接口「返回空 user_list」一个性质）。
+                #   实测 2026-11-14：连续扫 225 条之后，这个接口就开始返空，
+                #   隔一段时间才恢复。所以扫多了要歇，别硬扫。
+                self.log("  （取个人简介失败：接口返回空，多半是被限流了，歇一会儿再试）")
+                return None
+            j = json.loads(text)
         except Exception as e:
             self.log(f"  （取个人简介失败：{str(e)[:60]}）")
             return None

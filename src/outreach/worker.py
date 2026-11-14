@@ -1731,6 +1731,14 @@ class OutreachWorker:
         o = self.cfg.outreach
         dry = self._dry
 
+        # 记下「这个人确认没作品」——下次进队列直接转私信，
+        # 不用再拉一遍作品列表确认。
+        try:
+            self.st.mark_no_works(lead["id"], True)
+            lead["no_works"] = 1
+        except Exception:
+            pass
+
         if not bool(getattr(o, "dm_fallback", True)):
             raise NoWorks(why or "该用户没有公开作品")
 
@@ -1888,6 +1896,14 @@ class OutreachWorker:
         _mark("找人")
 
         # b. 挑作品
+        #
+        # ⚠ 已确认「没有作品」的人（no_works=1）**不用再拉作品列表**确认一遍：
+        #   ① 他们的 sec_uid 早就有了 → 这条路本来就不会触发搜索
+        #   ② 再拉一次作品列表只是白花时间（还可能撞上作品接口的不稳定）
+        #   ③ 他们的归宿本来就是私信
+        if lead.get("no_works"):
+            self._fallback_to_dm(dy, lead, summary, why="该用户没有公开作品（已确认）")
+            return
         if info.get("aweme_count") == 0:
             # 没有作品 → 留言这条路走不通 → 改发私信
             self._fallback_to_dm(dy, lead, summary, why="该用户没有公开作品（主页作品数为 0）")
