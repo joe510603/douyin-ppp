@@ -647,6 +647,59 @@ def main():
     )
 
 
+async def _notify_blind(recovered: bool, rendered: int = 0, total: int = 0) -> None:
+    """检测器自检结果 → 飞书群机器人。
+
+    盲了 = 红卡片 + @你（手机强提醒）；恢复了 = 绿卡片（不 @，不打扰）。
+
+    为什么必须发这张卡：检测器瞎掉的时候，**弹幕采集是静默停摆**的 ——
+    日志上只有「未检测到直播」，看起来跟「今天门店没开播」一模一样。
+    2026-11-14 就是这样白丢了一整天的弹幕，没人收到任何提示。
+    """
+    try:
+        from src.config import get_config
+        from src.notify.feishu import FeishuNotifier
+
+        cfg = get_config()
+        n = cfg.notify
+        if not (getattr(n, "risk_webhook_enabled", False)
+                and (getattr(n, "risk_webhook_url", "") or "").strip()):
+            return
+        notifier = FeishuNotifier(
+            webhook_url=n.risk_webhook_url,
+            secret=getattr(n, "risk_webhook_secret", "") or "",
+        )
+        at = (getattr(n, "risk_at_open_id", "") or "").strip()
+        if recovered:
+            ok, err = await notifier.send_info_card(
+                title="✅ 直播检测已恢复",
+                lines=[
+                    f"现在能看见 **{rendered}/{total}** 个门店账号了，弹幕采集已恢复。",
+                    "（之前是登录态过期，检测器看不见直播间）",
+                ],
+                at_open_id=at,
+            )
+        else:
+            ok, err = await notifier.send_risk_card(
+                title="🚨 直播检测失灵：弹幕采集可能已经停摆",
+                reason=(
+                    f"连续 2 轮检测，**{total}** 个门店账号一个都看不见"
+                    f"（接口返回空 = 登录态过期）。\n\n"
+                    f"这段时间**开播的直播间弹幕一条都收不到**，也不会有线索。"
+                ),
+                steps=(
+                    "1. 打开**触达用的那个 Edge 浏览器**登录一次抖音"
+                    "（登录态会自动续期，程序每 15 分钟自动同步一次）\n"
+                    "2. 或者手动把浏览器里的 cookie 粘到「配置管理 → 抖音 Cookie」\n"
+                    "3. 恢复后程序会发绿色卡片告诉你"
+                ),
+                at_open_id=at,
+            )
+        log.info(f"[检测自检] 飞书通知已发送: ok={ok} err={err}")
+    except Exception as e:
+        log.warning(f"[检测自检] 发飞书通知失败: {e}")
+
+
 async def on_startup():
     """NiceGUI 启动后回调 — 初始化业务组件并启动调度"""
     await initialize()
@@ -666,6 +719,44 @@ async def on_startup():
         log.info("飞书表状态回拉任务已启动")
     else:
         log.info("飞书表状态回拉任务未启动（多维表格未启用）")
+
+    # ---- 登录态续命（2026-11-14 加）----
+    #
+    # 检测器判开播靠抖音 Web 端用户接口，那接口**必须登录态**；
+    # 登录态过期 → 接口返回 0 字节 → 检测器全瞎 → 弹幕全丢（当天就是这么丢的）。
+    # 登录态的源头是触达那个真浏览器的 profile（用户在 Edge 里用抖音，
+    # sessionid 由抖音自动续期），这里定期把它读出来给检测器用。
+    try:
+        from src.utils.loggedin_cookie import apply_to_config, get_provider
+
+        provider = get_provider()
+        # 启动时先同步一次（检测器第一轮就能用上，不浪费一轮）
+        _cookie = await asyncio.to_thread(provider.refresh, True)
+        if _cookie:
+            await asyncio.to_thread(apply_to_config, _cookie)
+            log.info("登录态 cookie 已就绪")
+        else:
+            log.warning("⚠️ 没读到登录态 cookie（Edge profile 里可能没登录），"
+                        "检测器可能看不见直播间")
+    except Exception as e:
+        log.warning(f"登录态 cookie 初始化失败: {e}")
+
+    async def _cookie_refresh_loop():
+        """定期把登录态 cookie 从源 profile 续上（后台悄悄做，不打扰用户）"""
+        while True:
+            try:
+                await asyncio.sleep(provider.ttl_seconds)
+                cookie = await asyncio.to_thread(provider.refresh, True)
+                if cookie:
+                    await asyncio.to_thread(apply_to_config, cookie)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                log.error(f"登录态续命失败: {e}")
+
+    state._cookie_refresh_task = loop.create_task(
+        _cookie_refresh_loop(), name="cookie-refresh-loop"
+    )
 
     # 【核心修复】检测循环在独立线程中运行
     # 避免 Playwright 的 sync_playwright() 阻塞 uvicorn 事件循环导致 NiceGUI WebSocket 断连
@@ -700,11 +791,47 @@ async def on_startup():
                 stagger_delay = config.live_detection.interval / max(len(accounts), 1)
                 return await detector.batch_detect(accounts, stagger_delay=stagger_delay)
 
+            # ---- 自检：检测器是不是「瞎了」----
+            #
+            # 判据（2026-11-14 实测踩过的坑）：
+            #   抖音 Web 端用户接口**必须登录态**。登录态一过期，
+            #   接口返回 0 字节的 body → 检测器对所有账号一律「未检测到直播」→
+            #   采集器永不启动 → 一整天的弹幕全丢，而日志上一片正常。
+            #
+            #   所以「一个账号都没检测到」**不能**直接当成「今天没人开播」。
+            #   要看「我们到底看不看得见这些账号」——
+            #   info.rendered 就是这个证据（页面/接口真的把这个账号渲染出来了吗）。
+            #
+            # 连续 2 轮一个都看不见 → 判定检测器故障 → 立刻告警，
+            # 而不是默默丢一整天。
+            blind_rounds = 0
+
+            async def _check_blind(results):
+                nonlocal blind_rounds
+                total = len(results)
+                if not total:
+                    return
+                rendered = sum(1 for info in results.values() if getattr(info, "rendered", False))
+                if rendered > 0:
+                    if blind_rounds:
+                        log.info(f"[检测自检] 恢复正常：{rendered}/{total} 个账号可见")
+                        blind_rounds = 0
+                        await _notify_blind(recovered=True, rendered=rendered, total=total)
+                    return
+
+                blind_rounds += 1
+                log.error(f"[检测自检] 第 {blind_rounds} 轮：{total} 个账号一个都看不见"
+                          f"（登录态可能又过期了）")
+                if blind_rounds >= 2:
+                    blind_rounds = 0
+                    await _notify_blind(recovered=False, rendered=0, total=total)
+
             while True:
                 try:
                     results = await _detect_once()
                     if results:
                         q.put(("detection_results", results))
+                        await _check_blind(results)
                     config = get_config()
                     await asyncio.sleep(config.live_detection.interval)
                 except asyncio.CancelledError:

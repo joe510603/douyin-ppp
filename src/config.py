@@ -81,6 +81,29 @@ class LiveDetectionConfig(BaseModel):
     #   这是业务取舍：多等 40 秒 = 可能漏掉直播间最前面那批弹幕。
     max_concurrency: int = 4
 
+    # ---- 检测器的「登录态」从哪来（2026-11-14 加）----
+    #
+    # 背景：检测靠抖音 Web 端用户接口判定开播，而那个接口**必须登录态**：
+    #   未登录 cookie → HTTP 200 但 body 0 字节（什么都拿不到）
+    #   登录态 cookie → 25KB，含 room_data.status=2
+    #
+    # 而登录态是会过期的 —— 一过期，检测器对所有账号一律「未检测到直播」，
+    # 采集器永不启动，**一整天的弹幕全丢**，日志上却一片正常
+    # （因为 get_cookie_status() 只查 ttwid 那个匿名令牌）。
+    #
+    # 所以检测器不再依赖 config 里那份会过期的 cookie，
+    # 而是从触达那个**真浏览器**的 profile 里复制一份登录态过来用
+    # （用户在 Edge 里正常用抖音，sessionid 会自己续期）。
+    #
+    # profile_source: 源 profile 目录（默认用触达那个）
+    profile_source: str = ""
+    # profile_slots: 准备几份副本（并发检测时一人一份，避免抢 profile 锁）
+    profile_slots: int = 4
+    # seed_refresh_minutes: 副本多久重新复制一次（登录态会换新，要跟上）
+    seed_refresh_minutes: int = 30
+    # cookie_refresh_minutes: 多久从源 profile 重读一次明文 cookie（防止登录态过期）
+    cookie_refresh_minutes: int = 15
+
 
 class WebSocketConfig(BaseModel):
     """WebSocket 连接配置"""

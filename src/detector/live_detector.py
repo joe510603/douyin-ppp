@@ -13,8 +13,10 @@ import httpx
 
 from ..config import get_config
 from ..models.comment import MonitorAccount, MessageType
+from src.utils import browser_identity
 from src.utils.logger import get_logger
 from src.utils.cookie_manager import get_cookie_status
+from src.utils.profile_seed import SeededProfiles
 
 log = get_logger("detector")
 
@@ -33,6 +35,17 @@ class LiveRoomInfo:
     stream_url: str = ""              # 推流地址
     raw_data: dict = field(default_factory=dict)
     user_unique_id: str = ""          # 主播 user_unique_id（数值ID，WebSocket 连接需要）
+    # 页面**真的把这个账号渲染出来了吗**（2026-11-14 加）
+    #
+    # 为什么需要这个字段：未登录/环境异常时，抖音会把主页降级成「通用壳页」，
+    # 壳页里既没有直播间入口、也没有这个账号的信息 —— 这时候「没检测到直播」
+    # 和「我们看不见这个账号」长得一模一样，整场直播的弹幕就全丢了，
+    # 而日志上一片正常。
+    #
+    # 所以必须把「看不见」和「没开播」分成两件事：
+    #   rendered=False → 检测器自己瞎了（该告警、该修登录态）
+    #   rendered=True  + status=False → 这个账号确实没开播（正常）
+    rendered: bool = False
 
 
 class LiveDetector:
@@ -60,9 +73,44 @@ class LiveDetector:
         self._client: Optional[httpx.AsyncClient] = None
         # 浏览器数据目录（在 __init__ 里解析一次，避免 nested function 作用域问题）
         self._browser_data_dir = str(Path("data/browser_data"))
+        # 「登录态副本」管理器（2026-11-14 加）
+        #
+        # 背景：检测器的 cookie 是**未登录态**，抖音会把主页降级成通用壳页，
+        # 壳页里没有直播间入口 → 检测器永远报「未检测到直播」→
+        # 采集器永远不启动 → 一整天的弹幕全丢，而日志看不出异常。
+        #
+        # 修法：把触达那个**真浏览器**的登录态复制一份给检测器用
+        # （见 src/utils/profile_seed.py 的实测数据）。
+        self._seeded = None
+        try:
+            from ..config import get_config
+            cfg = get_config()
+            det_cfg = getattr(cfg, "live_detection", None)
+            src = getattr(det_cfg, "profile_source", "") or getattr(cfg.outreach, "profile_dir", "") \
+                or "data/outreach_profile"
+            slots = int(getattr(det_cfg, "profile_slots", 4) or 4)
+            refresh = int(getattr(det_cfg, "seed_refresh_minutes", 60) or 60)
+            self._seeded = SeededProfiles(src, "data/detect_profiles", slots, refresh)
+        except Exception as e:
+            log.warning(f"初始化登录态 profile 管理器失败（将退回旧 profile）: {e}")
 
     def _get_effective_cookie(self) -> str:
-        """获取有效的 Cookie，优先使用有 ttwid 的"""
+        """获取有效的 Cookie，优先用带 ttwid 的
+
+        【2026-11-14】优先用「从真浏览器 profile 续命来的登录态 cookie」。
+        为什么：检测器判开播靠抖音 Web 端用户接口，那个接口**必须登录态** ——
+        未登录 cookie 会返回 0 字节的 body，检测器对所有账号一律「未检测到直播」，
+        采集器永不启动，一整天的弹幕全丢，而日志上一片正常。
+        登录态会过期，所以由 src/utils/loggedin_cookie.py 定期从 Edge profile 续命。
+        """
+        try:
+            from ..utils.loggedin_cookie import get_provider
+            fresh = get_provider().get()
+            if fresh and "sessionid" in fresh:
+                return fresh
+        except Exception as e:
+            log.debug(f"取登录态 cookie 失败，改用 config 里的: {e}")
+
         config = get_config()
         douyin_cookie = config.douyin.cookie or ""
         video_cookie = config.douyin_video.cookie or ""
@@ -151,39 +199,22 @@ class LiveDetector:
             log.info(f"[{sec_user_id[:15]}...] {'API无昵称' if not api_has_nickname else 'API无room_id'}，强制浏览器检测")
             await self._try_browser_detection(sec_user_id, info)
 
-        # 如果浏览器检测已经确定在播（status=True）但没有 room_id，
-        # 不使用 Cookie-Fallback 的历史数据，因为那个房间可能已下播
-        # 只有当 browser 检测完全无法确定直播状态时，才用 Cookie-Fallback
-        # 【关键】browser 检测设置了 status=True，说明用户在播但拿不到 room_id
-        # Cookie 的历史 room_id 很可能已失效，采集会失败
-        browser_found_live = info.status and not info.room_id
-        if not browser_found_live and not info.room_id:
-            import re
-            import urllib.parse
-            config = get_config()
-            douyin_cookie = config.douyin.cookie or ""
-            video_cookie = config.douyin_video.cookie or ""
-            for cookie_name, cookie_val in [("douyin", douyin_cookie), ("video", video_cookie)]:
-                if not cookie_val or "live_debug_info" not in cookie_val:
-                    continue
-                try:
-                    live_debug_match = re.search(r'live_debug_info=([^;]+)', cookie_val)
-                    if live_debug_match:
-                        live_debug_decoded = urllib.parse.unquote(urllib.parse.unquote(live_debug_match.group(1)))
-                        room_id_match = re.search(r'"roomId"\s*:\s*"?(\d{18,20})"?', live_debug_decoded)
-                        if room_id_match:
-                            info.room_id = room_id_match.group(1)
-                            log.info(f"[Cookie-Fallback] 从 {cookie_name}.cookie 提取 room_id={info.room_id}（⚠️可能为历史数据）")
-                            break
-                        else:
-                            href_match = re.search(r'live\.douyin\.com/(\d{10,15})', live_debug_decoded)
-                            if href_match:
-                                info.room_id = href_match.group(1)
-                                log.info(f"[Cookie-Fallback] 从 {cookie_name}.cookie 提取 href room_id={info.room_id}（⚠️可能为历史数据）")
-                                break
-                except Exception as e:
-                    log.debug(f"[Cookie] 提取 room_id 失败: {e}")
-
+        # 【2026-11-14】删掉了「Cookie-Fallback」那段兜底
+        #
+        # 它做的是：从 cookie 里的 live_debug_info 抠出「上次看的直播间的 roomId」
+        # 塞给当前账号。这个 hack 有两个要命的问题：
+        #
+        # 1. **串号**：live_debug_info 记的是**你上次看的那场直播**，
+        #    跟当前账号没关系。实测没开播的「成都锦江」拿到了
+        #    「成都万象城」的 room_id —— 采集器会连上去，
+        #    把**别人直播间的弹幕**记到这个账号名下。
+        # 2. **来源不一致**：它读的是 config 里的 cookie，
+        #    而真正发请求用的是「登录态 cookie」（见 _get_effective_cookie），
+        #    两份 cookie 已经不是同一份了，这个兜底读到的多半是过期数据。
+        #
+        # 现在 room_id 只有一条来路：**浏览器从直播链接的 query 里直接取**
+        # （live.douyin.com/<web_rid>?room_id=<18位>）。
+        # 取不到就不启动采集 —— 宁可漏一场，也不能把别人的弹幕算成线索。
         return info
 
     async def _try_mobile_api(self, sec_user_id: str, info: LiveRoomInfo) -> None:
@@ -301,6 +332,8 @@ class LiveDetector:
                 if data.get("status_code") == 0 and data.get("user"):
                     user_data = data["user"]
                     info.anchor_nickname = user_data.get("nickname", "")
+                    # API 能拿到这个账号的数据 = 我们「看得见」它（自检依据）
+                    info.rendered = True
 
                     # 检查 room_data
                     room_data_str = user_data.get("room_data")
@@ -398,69 +431,85 @@ class LiveDetector:
                                     'path': '/',
                                 })
 
+                    # ---- 用哪一份 profile ----
+                    #
+                    # 优先用「登录态副本」（每个并发一份，互不抢 profile 锁）。
+                    # 拿不到就退回旧的 data/browser_data（那个是未登录态，
+                    # 页面会降级成壳页 → 看不见直播间，只能当降级方案）。
+                    slot_dir = self._seeded.next_dir() if self._seeded else None
+                    user_data_dir = str(slot_dir or self._browser_data_dir)
+
+                    # ---- 用哪个浏览器 ----
+                    #
+                    # 必须用**系统里的 Edge**：profile 里的 cookie 是用
+                    # 「Microsoft Edge Safe Storage」（macOS 钥匙串）加密的，
+                    # 拿 Playwright 自带的 Chromium 打开只会看到一堆解不开的密文。
+                    # 而且指纹要和触达那边一致 —— 同一个账号一会儿 Chromium
+                    # 一会儿 Edge，在抖音眼里就是两个人。
+                    channel, _app_name = browser_identity.pick()
+
+                    launch_kwargs = {
+                        "user_data_dir": user_data_dir,
+                        "headless": True,
+                        "viewport": {"width": 1400, "height": 900},
+                        "args": ["--no-sandbox", "--disable-setuid-sandbox",
+                                 "--disable-dev-shm-usage", "--disable-blink-features=AutomationControlled"],
+                    }
+                    if channel:
+                        launch_kwargs["channel"] = channel
+
+                    # ⚠ 故意**不覆写 User-Agent**。
+                    #   以前这里写死 "Chrome/125"，而真正的引擎是 Chromium 153 ——
+                    #   Playwright 的 user_agent= 参数只改字符串、不改 Client Hints，
+                    #   抖音读一下 userAgentData.brands 就知道你编了
+                    #   （理由同 outreach/browser.py 顶部那段注释）。
                     try:
-                        context = p.chromium.launch_persistent_context(
-                            user_data_dir=str(self._browser_data_dir),
-                            headless=True,
-                            viewport={"width": 1400, "height": 900},
-                            user_agent=self.WEB_UA,
-                            args=["--no-sandbox", "--disable-setuid-sandbox",
-                                  "--disable-dev-shm-usage", "--disable-blink-features=AutomationControlled"],
-                        )
-                        log.info(f"[浏览器] 持久化上下文启动成功，注入 {len(inject_cookies)} 条 cookie 覆盖 profile...")
-                        # 必须先访问 domain 一次才能 add_cookies
-                        #
-                        # ⚠ 只等「响应头」（commit），不等整页资源（2026-11-13）：
-                        #   这里唯一的目的就是让 origin 建立起来好注入 cookie，
-                        #   等 domcontentloaded 要 15 秒，而检测是 14 个账号并发
-                        #   （每个都启一个 Chromium）→ 实测整个检测器吃掉 216% CPU，
-                        #   把触达的浏览器挤得搜索从 20 秒变成 60+ 秒。
-                        #   改成 commit 后这一步 15 秒 → 1~2 秒。
-                        first_page = context.pages[0] if context.pages else context.new_page()
+                        context = p.chromium.launch_persistent_context(**launch_kwargs)
+                    except Exception as e:
+                        if channel:
+                            log.warning(f"[浏览器] 用 {channel} 启动失败，退回自带 Chromium: {e}")
+                            launch_kwargs.pop("channel", None)
+                            context = p.chromium.launch_persistent_context(**launch_kwargs)
+                        else:
+                            raise
+                    log.info(f"[浏览器] 持久化上下文启动成功（{channel or '自带Chromium'}，profile={user_data_dir}），"
+                             f"注入 {len(inject_cookies)} 条 cookie 覆盖 profile...")
+
+                    # 必须先访问 domain 一次才能 add_cookies
+                    #
+                    # ⚠ 只等「响应头」（commit），不等整页资源（2026-11-13）：
+                    #   这里唯一的目的就是让 origin 建立起来好注入 cookie，
+                    #   等 domcontentloaded 要 15 秒，而检测是 14 个账号并发
+                    #   （每个都启一个 Chromium）→ 实测整个检测器吃掉 216% CPU，
+                    #   把触达的浏览器挤得搜索从 20 秒变成 60+ 秒。
+                    #   改成 commit 后这一步 15 秒 → 1~2 秒。
+                    first_page = context.pages[0] if context.pages else context.new_page()
+                    try:
+                        first_page.goto("https://www.douyin.com/",
+                                       wait_until="commit", timeout=15000)
+                    except Exception:
+                        pass  # 即使失败也继续
+                    if inject_cookies:
+                        added = False
                         try:
-                            first_page.goto("https://www.douyin.com/",
-                                           wait_until="commit", timeout=15000)
-                        except Exception:
-                            pass  # 即使失败也继续
-                        if inject_cookies:
-                            added = False
+                            context.add_cookies(inject_cookies)
+                            added = True
+                        except Exception as e:
+                            log.warning(f"设置 cookies 失败（等页面加载完再试一次）: {e}")
+                        if not added:
+                            # 保险起见：等页面真的加载完再试一次
+                            # （cookie 注入失败 = 用 profile 里的旧 cookie
+                            #   → 可能被重定向到首页 → 误判「没开播」→ 漏掉直播间）
                             try:
+                                first_page.wait_for_load_state(
+                                    "domcontentloaded", timeout=10000)
                                 context.add_cookies(inject_cookies)
                                 added = True
                             except Exception as e:
-                                log.warning(f"设置 cookies 失败（等页面加载完再试一次）: {e}")
-                            if not added:
-                                # 保险起见：等页面真的加载完再试一次
-                                # （cookie 注入失败 = 用 profile 里的旧 cookie
-                                #   → 可能被重定向到首页 → 误判「没开播」→ 漏掉直播间）
-                                try:
-                                    first_page.wait_for_load_state(
-                                        "domcontentloaded", timeout=10000)
-                                    context.add_cookies(inject_cookies)
-                                    added = True
-                                except Exception as e:
-                                    log.warning(f"设置 cookies 仍然失败: {e}")
-                            if added:
-                                log.info(f"[浏览器] ✅ 已注入 {len(inject_cookies)} 条 cookie 覆盖 profile")
-                        page = context.pages[0] if context.pages else context.new_page()
-                    except Exception as e:
-                        log.warning(f"持久化上下文启动失败，回退独立 browser: {e}")
-                        browser = p.chromium.launch(
-                            headless=True,
-                            args=["--no-sandbox", "--disable-setuid-sandbox",
-                                  "--disable-dev-shm-usage", "--disable-blink-features=AutomationControlled"],
-                        )
-                        context = browser.new_context(
-                            viewport={"width": 1400, "height": 900},
-                            user_agent=self.WEB_UA,
-                        )
-                        if inject_cookies:
-                            try:
-                                context.add_cookies(inject_cookies)
-                                log.info(f"[浏览器] ✅ 已注入 {len(inject_cookies)} 条 cookie (独立 browser)")
-                            except Exception as e:
-                                log.warning(f"设置 cookies 失败: {e}")
-                        page = context.new_page()
+                                log.warning(f"设置 cookies 仍然失败: {e}")
+                        if added:
+                            log.info(f"[浏览器] ✅ 已注入 {len(inject_cookies)} 条 cookie 覆盖 profile")
+                    page = context.pages[0] if context.pages else context.new_page()
 
                     # 打开用户主页
                     profile_url = f"https://www.douyin.com/user/{sec_user_id}"
@@ -476,6 +525,20 @@ class LiveDetector:
 
                     # 获取页面内容
                     content = page.content()
+
+                    # 【2026-11-14】判断页面**真的把这个账号渲染出来了吗**
+                    #
+                    # 未登录 / 环境异常时，抖音把主页降级成「通用壳页」——
+                    # 壳页里没有这个锚点的任何信息（连他的 sec_uid 都没有）。
+                    # 这时候「没检测到直播」和「我们看不见这个账号」是同一件事，
+                    # 整场直播的弹幕就全丢了，而日志上一片正常。
+                    #
+                    # 锚点自己的 sec_uid 会出现在**渲染出来的主页 HTML** 里，
+                    # 壳页里没有 —— 这是区分两者的唯一可靠证据。
+                    info.rendered = bool(sec_user_id and sec_user_id in content)
+                    if not info.rendered:
+                        log.info(f"[浏览器] 页面没渲染出该账号（疑似降级/未登录），"
+                                 f"不作为「没开播」依据: {sec_user_id[:15]}...")
 
                     # 提取昵称 - 多种方式
                     if not info.anchor_nickname:
@@ -564,22 +627,32 @@ class LiveDetector:
                         if idstr_match:
                             room_id = idstr_match.group(1)
 
-                    # 方式4: 尝试从直播卡片链接提取 web_rid
+                    # 方式4: 尝试从直播卡片链接提取 web_rid / room_id
+                    #
+                    # 【2026-11-14 改进】链接的 query 里**直接带 room_id**：
+                    #   live.douyin.com/163468593199?...&room_id=7707947305089501961&...
+                    # 以前只取短 ID（web_rid），还得再发一次 HTTP 去直播页里刨 room_id；
+                    # 现在一次就能拿到真正的 room_id（18-19 位），
+                    # 少一次请求、少 3~5 秒，也少一个失败点。
                     if not room_id and not web_rid:
                         try:
-                            # 直播卡片通常有链接 live.douyin.com/xxxxxx
-                            live_link = page.evaluate('''() => {
+                            live_links = page.evaluate('''() => {
+                                const out = [];
                                 const links = document.querySelectorAll('a[href*="live.douyin.com"]');
                                 for (const a of links) {
                                     const m = a.href.match(/live\\.douyin\\.com\\/(\\d+)/);
-                                    if (m) return m[1];
+                                    if (m) out.push({web_rid: m[1], href: a.href});
                                 }
-                                return null;
-                            }''')
-                            if live_link:
-                                web_rid = live_link
-                        except:
-                            pass
+                                return out;
+                            }''') or []
+                            if live_links:
+                                web_rid = live_links[0].get("web_rid") or ""
+                                rm = re.search(r"room_id=(\d{18,})", live_links[0].get("href", ""))
+                                if rm:
+                                    room_id = rm.group(1)
+                                    log.info(f"[浏览器] 从直播链接直接取到 room_id={room_id}")
+                        except Exception as e:
+                            log.debug(f"从直播链接提取失败: {e}")
 
                     # 方式5+6（已删除 - 2026-10-13）：
                     # 之前 detector 用 'page.wait_for_selector("text=直播中")' 当开播判定，

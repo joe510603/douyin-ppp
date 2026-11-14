@@ -1071,7 +1071,17 @@ class LiveCollector:
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36 Edg/126.0.0.0",
                 "Accept": "*/*",
                 "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-                "Accept-Encoding": "gzip, deflate, br",
+                # ⚠ 不要写 "br"（2026-11-14 实测）
+                #
+                # 抖音会按这个头决定用什么压缩。写了 br → 服务器回 brotli 压缩的
+                # protobuf，而这个 venv 里**没装 brotli** → httpx 解不开 →
+                # 报「Not a gzipped file」→ cursor / internal_ext 拿不到，
+                # 每次采集都刷一条 ERROR（虽然有兜底路径还能连上，
+                # 但会丢掉开场前那批消息，而且错误刷屏会盖住真正的错误）。
+                #
+                # 只声明 gzip/deflate 的话，httpx 会自己解压好，
+                # 拿到的就是干净的 protobuf。
+                "Accept-Encoding": "gzip, deflate",
                 "Origin": "https://live.douyin.com",
                 "Referer": f"https://live.douyin.com/{room_id}",
             }
