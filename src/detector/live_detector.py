@@ -46,6 +46,10 @@ class LiveRoomInfo:
     #   rendered=False → 检测器自己瞎了（该告警、该修登录态）
     #   rendered=True  + status=False → 这个账号确实没开播（正常）
     rendered: bool = False
+    # 接口路径（Web 端用户接口）拿到数据了吗？
+    # 接口活着 → 「在播/没开播」这个判断是**权威**的；
+    # 接口死了就只剩浏览器在看页面 —— 那是降级状态，认错的概率更高。
+    api_ok: bool = False
 
 
 class LiveDetector:
@@ -334,6 +338,8 @@ class LiveDetector:
                     info.anchor_nickname = user_data.get("nickname", "")
                     # API 能拿到这个账号的数据 = 我们「看得见」它（自检依据）
                     info.rendered = True
+                    # 接口路径活着 → 「在播/没开播」的判断是权威的
+                    info.api_ok = True
 
                     # 检查 room_data
                     room_data_str = user_data.get("room_data")

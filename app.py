@@ -681,7 +681,7 @@ async def _notify_blind(recovered: bool, rendered: int = 0, total: int = 0) -> N
             )
         else:
             ok, err = await notifier.send_risk_card(
-                title="🚨 直播检测失灵：弹幕采集可能已经停摆",
+                title="🚨 直播检测失灵：弹幕采集已经停摆",
                 reason=(
                     f"连续 2 轮检测，**{total}** 个门店账号一个都看不见"
                     f"（接口返回空 = 登录态过期）。\n\n"
@@ -694,6 +694,7 @@ async def _notify_blind(recovered: bool, rendered: int = 0, total: int = 0) -> N
                     "3. 恢复后程序会发绿色卡片告诉你"
                 ),
                 at_open_id=at,
+                at_note="—— 弹幕采集停摆了，登录一下抖音就能自动恢复",
             )
         log.info(f"[检测自检] 飞书通知已发送: ok={ok} err={err}")
     except Exception as e:
@@ -805,13 +806,29 @@ async def on_startup():
             # 连续 2 轮一个都看不见 → 判定检测器故障 → 立刻告警，
             # 而不是默默丢一整天。
             blind_rounds = 0
+            # 接口路径连续几轮没数据（降级状态：只剩浏览器在看页面）
+            api_dead_rounds = 0
 
             async def _check_blind(results):
-                nonlocal blind_rounds
+                nonlocal blind_rounds, api_dead_rounds
                 total = len(results)
                 if not total:
                     return
                 rendered = sum(1 for info in results.values() if getattr(info, "rendered", False))
+                api_ok = sum(1 for info in results.values() if getattr(info, "api_ok", False))
+
+                # 接口路径死了：只是降级（浏览器还在看），先记着，不群发
+                # —— 因为「接口死 + 门店今天没开播」长得一样，容易误报。
+                if api_ok == 0:
+                    api_dead_rounds += 1
+                    if api_dead_rounds == 3:
+                        log.warning(f"[检测自检] 接口路径连续 3 轮没数据，"
+                                    f"现在只靠浏览器判断在播（认错概率更高）")
+                else:
+                    if api_dead_rounds:
+                        log.info(f"[检测自检] 接口路径恢复了（{api_ok}/{total}）")
+                        api_dead_rounds = 0
+
                 if rendered > 0:
                     if blind_rounds:
                         log.info(f"[检测自检] 恢复正常：{rendered}/{total} 个账号可见")

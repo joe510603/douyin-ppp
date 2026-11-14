@@ -124,6 +124,7 @@ class FeishuNotifier:
         steps: str = "",
         at_open_id: str = "",
         who: str = "",
+        at_note: str = "",
     ) -> tuple[bool, str]:
         """发一张「触达出事了」的告警卡片（红色 + @人）
 
@@ -141,6 +142,7 @@ class FeishuNotifier:
             steps: 怎么办（分步文字）
             at_open_id: 要 @ 的人的 open_id，留空就不 @
             who: 卡在哪条线索上（可选）
+            at_note: @ 那行后面跟的话（不传就用触达那句默认文案）
         """
         if not self.is_configured:
             return False, "未配置飞书 webhook"
@@ -170,7 +172,7 @@ class FeishuNotifier:
                 "text": {
                     "tag": "lark_md",
                     "content": f'<at user_id="{at_open_id}">请处理</at> '
-                               f"—— 触达已经停下来了，等你验证完再继续",
+                               + (at_note or "—— 触达已经停下来了，等你验证完再继续"),
                 },
             })
 
