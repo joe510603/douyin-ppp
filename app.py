@@ -858,6 +858,12 @@ async def on_startup():
             api_dead_rounds = 0
             # 连续几轮「看得见在播却拿不到 room_id」（= 采集器起不来）
             roomless_rounds = 0
+            # ⚠ 告警去重：盲态是**持续**状态，每 2 轮就满足一次「连续 2 轮」，
+            #   不去重的话会每 4 分钟刷你一张卡（实测 15:06/15:10/15:15 连发 3 张）。
+            #   同一个故障反复喊，只会让真正的新故障被淹没。
+            from src.utils.notify_dedupe import NotifyDedupe
+
+            notifier_dedupe = NotifyDedupe(cooldown_seconds=30 * 60)
 
             async def _check_blind(results):
                 nonlocal blind_rounds, api_dead_rounds, roomless_rounds
@@ -892,6 +898,8 @@ async def on_startup():
                     if blind_rounds:
                         log.info(f"[检测自检] 恢复正常：{rendered}/{total} 个账号可见")
                         blind_rounds = 0
+                        # 恢复正常 → 解除冷却：万一等下又坏了，要能立刻再报一次
+                        notifier_dedupe.on_recovered()
                         await _notify_blind(recovered=True, rendered=rendered, total=total)
                     return
 
@@ -901,8 +909,14 @@ async def on_startup():
                           f"{'，或抖音弹了验证码中间页' if verify_hits else ''}）")
                 if blind_rounds >= 2:
                     blind_rounds = 0
-                    await _notify_blind(recovered=False, rendered=0, total=total,
-                                        verify_page=bool(verify_hits))
+                    # 去重：同一个持续故障别反复刷屏
+                    if not notifier_dedupe.should_notify("blind"):
+                        log.info(f"[检测自检] 故障还在持续，"
+                                 f"30 分钟内已报过，暂不重复群发")
+                    else:
+                        notifier_dedupe.mark_sent("blind")
+                        await _notify_blind(recovered=False, rendered=0, total=total,
+                                            verify_page=bool(verify_hits))
 
                 # ---- 第二档：看得见在播，却拿不到 room_id ----
                 # 采集器靠 room_id 才能连上去；拿不到 = 弹幕一条都收不到。
@@ -914,9 +928,14 @@ async def on_startup():
                               f"判定在播，但拿不到 room_id → 采集器起不来，弹幕收不到")
                     if roomless_rounds >= 2:
                         roomless_rounds = 0
-                        await _notify_blind(recovered=False, rendered=rendered, total=total,
-                                            verify_page=bool(verify_hits),
-                                            no_room=live_no_room)
+                        # 同样是持续状态，去重（否则每 4 分钟刷一张）
+                        if not notifier_dedupe.should_notify("no_room"):
+                            log.info(f"[检测自检] room_id 故障还在持续，暂不重复群发")
+                        else:
+                            notifier_dedupe.mark_sent("no_room")
+                            await _notify_blind(recovered=False, rendered=rendered, total=total,
+                                                verify_page=bool(verify_hits),
+                                                no_room=live_no_room)
                 else:
                     if roomless_rounds:
                         log.info(f"[检测自检] room_id 恢复正常")
