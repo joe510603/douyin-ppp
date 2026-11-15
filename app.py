@@ -647,14 +647,20 @@ def main():
     )
 
 
-async def _notify_blind(recovered: bool, rendered: int = 0, total: int = 0) -> None:
+async def _notify_blind(recovered: bool, rendered: int = 0, total: int = 0,
+                        verify_page: bool = False, no_room: int = 0) -> None:
     """检测器自检结果 → 飞书群机器人。
 
-    盲了 = 红卡片 + @你（手机强提醒）；恢复了 = 绿卡片（不 @，不打扰）。
+    盲了 = 红卡片 + @你（手机强提醒）；恢复了 = 绿卡片（不 @）。
 
     为什么必须发这张卡：检测器瞎掉的时候，**弹幕采集是静默停摆**的 ——
     日志上只有「未检测到直播」，看起来跟「今天门店没开播」一模一样。
     2026-11-14 就是这样白丢了一整天的弹幕，没人收到任何提示。
+
+    ``verify_page``：是不是撞了「验证码中间页」。
+    这跟「登录态过期」完全是两回事 ——
+    前者要人工**过一次验证**（拖拼图/扫码），后者要**重新登录**。
+    说错了用户就会去干没用的事。
     """
     try:
         from src.config import get_config
@@ -675,26 +681,63 @@ async def _notify_blind(recovered: bool, rendered: int = 0, total: int = 0) -> N
                 title="✅ 直播检测已恢复",
                 lines=[
                     f"现在能看见 **{rendered}/{total}** 个门店账号了，弹幕采集已恢复。",
-                    "（之前是登录态过期，检测器看不见直播间）",
+                    "（之前是登录态过期或抖音弹了验证页，检测器看不见直播间）",
                 ],
                 at_open_id=at,
             )
         else:
-            ok, err = await notifier.send_risk_card(
-                title="🚨 直播检测失灵：弹幕采集已经停摆",
-                reason=(
+            if verify_page:
+                title = "🚨 抖音弹了验证页：弹幕采集已经停摆"
+                reason = (
+                    f"连续 2 轮检测，**{total}** 个门店账号一个都看不见，"
+                    f"页面标题是「**验证码中间页**」——"
+                    f"抖音给这个账号弹了**人工验证**，不是登录态过期。\n\n"
+                    f"这段时间**开播的直播间弹幕一条都收不到**，也不会有线索。"
+                )
+                steps = (
+                    "1. 回到网页「抖音触达」点橙色提示条里的「**打开浏览器窗口**」\n"
+                    "2. 在那个窗口里按抖音的提示过验证：\n"
+                    "   · **拼图滑块**——把拼图块拖到缺口上\n"
+                    "   · **扫码验证**——用抖音 App 扫\n"
+                    "3. 验证完**自动接着跑**，不用再点「继续」\n\n"
+                    "（这不是账号被限流，也不是登录问题，别去重新扫码登录）"
+                )
+                note = "—— 弹幕采集停摆了，过一次验证就能自动恢复"
+            elif no_room:
+                title = "🚨 看得见在播，却连不上直播间：弹幕采集停摆"
+                reason = (
+                    f"连续 2 轮检测，有 **{no_room}** 个账号判定**正在直播**，"
+                    f"但拿不到直播间号（room_id）→ 采集器起不来。\n\n"
+                    f"这段时间**开播的直播间弹幕一条都收不到**，也不会有线索。\n"
+                    f"（账号本身是好的、也没被限流，是抖音把浏览页面挡了）"
+                )
+                steps = (
+                    "1. 打开**触达用的那个 Edge 浏览器**看一眼抖音首页\n"
+                    "   ——如果弹了**验证/滑块**，过一下就好\n"
+                    "2. 过完验证后程序每 15 分钟会自动同步一次登录态\n"
+                    "3. 恢复后程序会发绿色卡片告诉你"
+                )
+                note = "—— 弹幕采集停摆了，过一次验证就能自动恢复"
+            else:
+                title = "🚨 直播检测失灵：弹幕采集已经停摆"
+                reason = (
                     f"连续 2 轮检测，**{total}** 个门店账号一个都看不见"
                     f"（接口返回空 = 登录态过期）。\n\n"
                     f"这段时间**开播的直播间弹幕一条都收不到**，也不会有线索。"
-                ),
-                steps=(
+                )
+                steps = (
                     "1. 打开**触达用的那个 Edge 浏览器**登录一次抖音"
                     "（登录态会自动续期，程序每 15 分钟自动同步一次）\n"
                     "2. 或者手动把浏览器里的 cookie 粘到「配置管理 → 抖音 Cookie」\n"
                     "3. 恢复后程序会发绿色卡片告诉你"
-                ),
+                )
+                note = "—— 弹幕采集停摆了，登录一下抖音就能自动恢复"
+            ok, err = await notifier.send_risk_card(
+                title=title,
+                reason=reason,
+                steps=steps,
                 at_open_id=at,
-                at_note="—— 弹幕采集停摆了，登录一下抖音就能自动恢复",
+                at_note=note,
             )
         log.info(f"[检测自检] 飞书通知已发送: ok={ok} err={err}")
     except Exception as e:
@@ -808,14 +851,25 @@ async def on_startup():
             blind_rounds = 0
             # 接口路径连续几轮没数据（降级状态：只剩浏览器在看页面）
             api_dead_rounds = 0
+            # 连续几轮「看得见在播却拿不到 room_id」（= 采集器起不来）
+            roomless_rounds = 0
 
             async def _check_blind(results):
-                nonlocal blind_rounds, api_dead_rounds
+                nonlocal blind_rounds, api_dead_rounds, roomless_rounds
                 total = len(results)
                 if not total:
                     return
                 rendered = sum(1 for info in results.values() if getattr(info, "rendered", False))
                 api_ok = sum(1 for info in results.values() if getattr(info, "api_ok", False))
+                # 是不是撞了「验证码中间页」（= 要人工过的验证，不是登录态过期）
+                verify_hits = sum(1 for info in results.values() if getattr(info, "verify_page", False))
+                # 「看得见在播，却拿不到 room_id」—— 采集器就是靠 room_id 起连接的，
+                # 拿不到 = 采集器起不来 = 弹幕一条都收不到。
+                # 这是「接口活着、浏览器瞎了」那一档的信号，
+                # 光看 rendered 抓不到（接口活着时 rendered 就是 True）。
+                live_no_room = sum(1 for info in results.values()
+                                   if getattr(info, "status", False)
+                                   and not getattr(info, "room_id", ""))
 
                 # 接口路径死了：只是降级（浏览器还在看），先记着，不群发
                 # —— 因为「接口死 + 门店今天没开播」长得一样，容易误报。
@@ -838,10 +892,30 @@ async def on_startup():
 
                 blind_rounds += 1
                 log.error(f"[检测自检] 第 {blind_rounds} 轮：{total} 个账号一个都看不见"
-                          f"（登录态可能又过期了）")
+                          f"（登录态可能又过期了"
+                          f"{'，或抖音弹了验证码中间页' if verify_hits else ''}）")
                 if blind_rounds >= 2:
                     blind_rounds = 0
-                    await _notify_blind(recovered=False, rendered=0, total=total)
+                    await _notify_blind(recovered=False, rendered=0, total=total,
+                                        verify_page=bool(verify_hits))
+
+                # ---- 第二档：看得见在播，却拿不到 room_id ----
+                # 采集器靠 room_id 才能连上去；拿不到 = 弹幕一条都收不到。
+                # 这种情况「账号可见」是正常的（接口活着），
+                # 所以第一档（全都看不见）抓不到它，得单独盯。
+                if live_no_room:
+                    roomless_rounds += 1
+                    log.error(f"[检测自检] 第 {roomless_rounds} 轮：{live_no_room} 个账号"
+                              f"判定在播，但拿不到 room_id → 采集器起不来，弹幕收不到")
+                    if roomless_rounds >= 2:
+                        roomless_rounds = 0
+                        await _notify_blind(recovered=False, rendered=rendered, total=total,
+                                            verify_page=bool(verify_hits),
+                                            no_room=live_no_room)
+                else:
+                    if roomless_rounds:
+                        log.info(f"[检测自检] room_id 恢复正常")
+                        roomless_rounds = 0
 
             while True:
                 try:

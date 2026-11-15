@@ -23,6 +23,7 @@ from __future__ import annotations
 import pathlib
 import sqlite3
 import sys
+import time
 
 import pytest
 
@@ -240,15 +241,22 @@ def test_连续私信失败到阈值就停手(tmp_path):
 
     跟留言的「软风控」一个道理，但计数**分开**：
     留言发不出去不代表私信发不出去，反之亦然。
+
+    【2026-11-15 改了行为】以前私信连续失败到阈值会**停掉整个触达**，
+    现在改成**只暂停私信通道**（评论照发）——
+    因为 2026-11-15 实测那 4 次失败全是「对方关了私信」，
+    账号好得很，停手纯属白停（详见 tests/test_outreach_dm_fail_class.py）。
     """
     w, _ = _worker(tmp_path, dm_fail_threshold=2)
     try:
         dy = _FakeDouyin(dm_ok=False, msg="私信功能已关闭")
         with pytest.raises(Exception):
             w._fallback_to_dm(dy, _lead(), {"dry": 0})      # 第 1 次
-        with pytest.raises(Exception) as ei:
-            w._fallback_to_dm(dy, _lead(), {"dry": 0})      # 第 2 次 → 停手
-        assert "私信功能被限" in str(ei.value), str(ei.value)
+        with pytest.raises(Exception):
+            w._fallback_to_dm(dy, _lead(), {"dry": 0})      # 第 2 次 → 刹车
+        # 刹车在：私信通道暂停，但**整个触达不停**（评论照发）
+        assert w._dm_paused_until > time.time(), "私信通道该被暂停"
+        assert "RiskControl" not in str(type(w)), "不该抛停整个触达的异常"
     finally:
         w.st.close()
 

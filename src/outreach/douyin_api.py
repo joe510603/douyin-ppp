@@ -82,10 +82,34 @@ KIND_VERIFY = "verify"
 KIND_LIMIT = "limit"
 KIND_LOGIN = "login"
 KIND_SEARCH = "search"
+# 私信通道单独被限（2026-11-15 加）
+#
+# 为什么要单独一种：私信被限 ≠ 账号被限 ≠ 评论发不出去。
+# 以前私信熔断直接抛 RiskControl → 整个触达停手，
+# 告警还用的是「评论被静默吞」那段文案 → 又是误导又是白停。
+# 现在私信熔断只停私信通道，评论照发，告警也只说私信的事。
+KIND_DM = "dm"
+
+# ---- 私信失败的三种分类（2026-11-15 加）----
+#
+# 为什么��要分：以前私信发不出去只有「成功/失败」两种，
+# 连续 2 条失败就判「私信功能被限了」并**停掉整个触达**。
+# 但实测 2026-11-15 那 4 条失败全是「对方主页上没有私信按钮」
+# —— 那是**对方**关了私信，跟我们的账号一点关系没有，
+# 而账号好得很：停手之后又连发 3 条评论全部成功。
+#
+# 停手 = 白白放弃当轮所有评论触达机会，这个代价比跳过一条线索大得多。
+#
+#   target_unavailable → 对方关了私信 → 这条永远发不出去 → 跳过，**不计数、不停手**
+#   env_issue          → 我们的环境问题（输入框没渲染等）→ 跳过，**不计数、不停手**
+#   platform_blocked   → 平台把私信拦了 → **只有这一种**才可能是账号被限流
+DM_FAIL_TARGET = "target_unavailable"
+DM_FAIL_ENV = "env_issue"
+DM_FAIL_BLOCKED = "platform_blocked"
 
 
 def normalize_kind(kind: str) -> str:
-    """把各种写法统一成 verify / limit / login / search"""
+    """把各种写法统一成 verify / limit / login / search / dm"""
     k = (kind or "").strip().lower()
     if k in ("verify", "captcha", "验证码", "验证"):
         return KIND_VERIFY
@@ -93,6 +117,8 @@ def normalize_kind(kind: str) -> str:
         return KIND_LOGIN
     if k in ("search", "搜索", "搜索接口"):
         return KIND_SEARCH
+    if k in ("dm", "私信", "私信被限"):
+        return KIND_DM
     return KIND_LIMIT
 
 
@@ -308,6 +334,37 @@ class Douyin:
         if "/verify" in url or "captcha" in url:
             self._shot("risk_captcha")
             raise RiskControl("跳转到安全验证页", kind="verify")
+
+        # 【2026-11-15】抖音的「验证码中间页」——整页被换成验证页，
+        # 但它**三个特征都不匹配**旧判据，于是全都漏掉了：
+        #   · URL 还是 https://www.douyin.com/（没有 /verify）
+        #   · 正文是**空的**（VERIFY_TEXTS 那套关键词匹配不到）
+        #   · 没有可见的验证码 iframe（只有 8KB 的壳）
+        # 结果：触达以为页面正常，接着往下跑，最后在主页上找不到
+        # 「私信」按钮 → 被误判成「对方关了私信」→ 又被误判成「私信被限流」。
+        #
+        # 判据用它的**标题**（实测就是「验证码中间页」），
+        # 外加 HTML 里那个**精确**的字样。
+        #
+        # ⚠ 不要用「正文空 + HTML 提到 captcha」这种宽判据：
+        #   抖音页面**常驻**一个隐藏的 nocaptcha iframe（src 里就有 captcha），
+        #   页面还没渲染完时正文也可能是空的 → 那样会天天误报「要人工验证」，
+        #   触达动不动就停下来叫人。而「验证码中间页」这五个字
+        #   是抖音这个中间页的专属名，正常页面上不会出现。
+        try:
+            title = self.page.title() or ""
+        except Exception:
+            title = ""
+        try:
+            html = self.page.content() or ""
+        except Exception:
+            html = ""
+        if ("验证" in title) or ("验证码" in title) or ("验证码中间页" in html):
+            self._shot("risk_verify_page")
+            raise RiskControl(
+                f"抖音弹了「{title or '验证码中间页'}」（会话被风控，需要人工过一次验证）",
+                kind=KIND_VERIFY)
+
         # 平台自己的裁决最准：account_flow=verify 就是「要本人验证」
         # 只认刚判的（60 秒内），过期的裁决不该继续拦后面的动作
         if self._verify_pending():
@@ -2016,7 +2073,9 @@ class Douyin:
         return "私密账号" in body
 
     def open_dm(self, sec_uid: str):
-        """打开某人的私信面板，返回输入框元素（失败返回 None 并给出原因）。
+        """打开某人的私信面板，返回 (输入框元素, 失败原因, 失败分类)。
+
+        失败分类见 ``send_dm`` 的说明：是谁的问题，决定了要不要停手。
 
         抖音主页上有两个「私信」按钮，第一个是 0×0 隐藏的，
         直接 locator('button:has-text("私信")').first.click() 会一直等可见性超时。
@@ -2039,7 +2098,21 @@ class Douyin:
                 continue
         if picked is None:
             self._shot("no_dm_button")
-            return None, "主页上没找到可见的「私信」按钮（可能对方关闭了私信）"
+            # 【2026-11-15】找不到私信按钮有两种完全不同的原因，
+            # 必须分开：对方关了私信（对方侧）vs 我们的页面根本没渲染出来（我们侧）。
+            # 混在一起的后果很具体：2026-11-15 抖音给我们的会话弹了验证码中间页，
+            # 主页渲染成空白 → 找不到私信按钮 → 被当成「对方关了私信」→
+            # 又被当成「私信被限流」→ 停掉整个触达，还发了一张
+            # 自相矛盾的红卡片（「原因：私信被限；怎么办：评论被静默吞」）。
+            body = self._body_text() or ""
+            title = self.page.title() or ""
+            if "验证" in title or "验证码" in title or "用户不存在" in body \
+                    or len(body.strip()) < 60:
+                return None, (
+                    f"主页没渲染出来（标题「{title or '空'}」），"
+                    f"多半是抖音给这个会话弹了验证页，不是对方的问题",
+                    DM_FAIL_ENV)
+            return None, "主页上没找到可见的「私信」按钮（可能对方关闭了私信）", DM_FAIL_TARGET
         try:
             picked.scroll_into_view_if_needed(timeout=2000)
         except Exception:
@@ -2060,23 +2133,33 @@ class Douyin:
                     for i in range(min(cand.count(), 4)):
                         el = cand.nth(i)
                         if el.is_visible():
-                            return el, ""
+                            return el, "", ""
                 except Exception:
                     continue
             self.page.wait_for_timeout(500)
         self._shot("no_dm_input")
-        return None, "私信输入框没渲染出来（无头模式下常见，必须用有头模式跑）"
+        return None, "私信输入框没渲染出来（无头模式下常见，必须用有头模式跑）", DM_FAIL_ENV
 
     def send_dm(self, sec_uid: str, text: str) -> dict:
-        """给指定用户发一条私信。返回 {ok, msg, shot}。
+        """给指定用户发一条私信。返回 {ok, msg, shot, kind}。
 
         平台限制：对方回复或关注你之前，只能发送一条文字消息。
         所以调用方必须自己保证「同一个人只发一次」。
+
+        ``kind`` 告诉调用方**这次失败是谁的问题**（2026-11-15 加）：
+        - ``target_unavailable``：对方主页上没有私信按钮 → **对方**关了私信，
+          我们永远发不出去，但账号一点事都没有
+        - ``env_issue``：输入框没渲染 / 内容没输进去 → 我们自己的环境问题
+        - ``platform_blocked``：平台把私信拦了 → **只有这一种**才可能是账号被限流
+
+        以前这三种混在一起，都算「私信发不出去」，连续 2 条就判定
+        「私信功能被限了」并停手 —— 2026-11-15 实测就是这么误停的：
+        4 条失败全是「对方关了私信」，而那之后评论照样连发 3 条全成功。
         """
         self.ensure_login()
-        el, why = self.open_dm(sec_uid)
+        el, why, fail_kind = self.open_dm(sec_uid)
         if el is None:
-            return {"ok": False, "msg": why,
+            return {"ok": False, "msg": why, "kind": fail_kind or DM_FAIL_TARGET,
                     "is_private": bool(self.is_private_account)}
 
         # 私信编辑器是 Slate，点一下必须真的拿到焦点，否则 keyboard.type 会打进虚空。
@@ -2130,7 +2213,7 @@ class Douyin:
             self.log(f"  ⚠️ 私信输入第 {attempt} 次没进去，重试")
         if not typed:
             self._shot("dm_type_fail")
-            return {"ok": False, "msg": "私信内容没输进去",
+            return {"ok": False, "msg": "私信内容没输进去", "kind": DM_FAIL_ENV,
                     "is_private": bool(self.is_private_account)}
 
         before = self._dm_panel_text()
@@ -2183,6 +2266,7 @@ class Douyin:
         if bad:
             shot = self._shot("dm_fail")
             return {"ok": False, "msg": f"私信被拦：{bad[0]}", "shot": shot,
+                    "kind": DM_FAIL_BLOCKED,
                     "is_private": bool(self.is_private_account)}
         # 点过发送键就认为「已尝试投递」，不再二次点击；
         # 页面没清空也只记「未确认」，由 pipeline 决定怎么留痕。

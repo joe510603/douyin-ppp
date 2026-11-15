@@ -50,6 +50,10 @@ class LiveRoomInfo:
     # 接口活着 → 「在播/没开播」这个判断是**权威**的；
     # 接口死了就只剩浏览器在看页面 —— 那是降级状态，认错的概率更高。
     api_ok: bool = False
+    # 页面是不是「验证码中间页」（2026-11-15 加）
+    # 这跟「登录态过期」是两回事：要人工过的**验证** ≠ 重新登录，
+    # 告警里得说清楚，不然用户会去扫一个没用的码。
+    verify_page: bool = False
 
 
 class LiveDetector:
@@ -540,10 +544,40 @@ class LiveDetector:
                     # 整场直播的弹幕就全丢了，而日志上一片正常。
                     #
                     # 锚点自己的 sec_uid 会出现在**渲染出来的主页 HTML** 里，
-                    # 壳页里没有 —— 这是区分两者的唯一可靠证据。
-                    info.rendered = bool(sec_user_id and sec_user_id in content)
+                    # 壳页里没有 —— 这是区分两者的主要证据。
+                    #
+                    # ⚠ 但光看 sec_uid 不够（2026-11-15 实测踩到）：
+                    #   抖音弹「验证码中间页」时，整页被换成验证页，
+                    #   但那个壳页里**也有** sec_uid（跳回原地址用的），
+                    #   → 只看 sec_uid 会把「我们被验证页挡住了」当成「页面正常」，
+                    #     自检就永远不告警，等于又瞎了一天。
+                    # 所以还要排掉两种「假渲染」：
+                    #   ① 标题里带「验证 / 验证码」→ 验证中间页
+                    #   ② 正文说「用户不存在」/ 正文空 → 页面被降级
+                    try:
+                        page_title = page.title() or ""
+                    except Exception:
+                        page_title = ""
+                    try:
+                        body_text = page.inner_text("body") or ""
+                    except Exception:
+                        body_text = ""
+                    verify_page = ("验证" in page_title) or ("验证码" in page_title)
+                    degraded_page = ("用户不存在" in body_text) or (len(body_text.strip()) < 60)
+                    if verify_page:
+                        # 抖音弹了「验证码中间页」—— 这是**要人工过的验证**，
+                        # 不是登录态过期。告警必须分开说，不然用户会去扫没用的码。
+                        info.verify_page = True
+                    info.rendered = bool(
+                        sec_user_id and sec_user_id in content
+                        and not verify_page and not degraded_page)
                     if not info.rendered:
-                        log.info(f"[浏览器] 页面没渲染出该账号（疑似降级/未登录），"
+                        why = []
+                        if verify_page:
+                            why.append(f"标题「{page_title}」")
+                        if degraded_page:
+                            why.append(f"正文{len(body_text.strip())}字/「用户不存在」")
+                        log.info(f"[浏览器] 页面没渲染出该账号（{', '.join(why) or 'sec_uid 不在页面里'}），"
                                  f"不作为「没开播」依据: {sec_user_id[:15]}...")
 
                     # 提取昵称 - 多种方式

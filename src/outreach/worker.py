@@ -34,7 +34,8 @@ from typing import Callable, Optional
 from .browser import Browser, Session
 from .copywriter import Copywriter
 from .douyin_api import (
-    Douyin, DouyinError, KIND_LIMIT, KIND_LOGIN, KIND_SEARCH, KIND_VERIFY,
+    Douyin, DouyinError, KIND_DM, KIND_LIMIT, KIND_LOGIN, KIND_SEARCH, KIND_VERIFY,
+    DM_FAIL_BLOCKED, DM_FAIL_ENV, DM_FAIL_TARGET,
     LeadNotFound, NoWorks, NotLoggedIn, RiskControl, SearchNotReady,
     SearchUnavailable, VERIFY_TEXTS, normalize_kind,
 )
@@ -296,7 +297,11 @@ class OutreachWorker:
         # 连续「发出去但回查不到」的次数（软风控信号）
         self._silent_blocks = 0
         # 连续「私信发不出去」的次数（私信功能被限的信号）
+        # ⚠ 只统计「平台拦了」那一种（对方关了私信 / 环境问题都不算）
         self._dm_failed = 0
+        # 私信通道暂停到什么时候（0 = 没暂停）
+        # 只停私信，不停整个触达 —— 评论是另一个通道
+        self._dm_paused_until = 0.0
         # 上一条走的是哪个渠道（私信之后要等更久）
         self._last_channel = ""
         # 撞验证码时用它跟主线程同步「人工验证完了，继续」
@@ -434,6 +439,19 @@ class OutreachWorker:
                 "3. 系统已经记下了每个线索的抖音 ID，\n"
                 "   下次**不用再搜**，直接开主页留言（所以搜不到也不影响触达）\n"
                 "4. 急着要的话，用抖音 App 手动发一条试试（App 端不受影响）"
+            )
+        elif kind == KIND_DM:
+            title = "🚫 抖音私信被限了（**评论照发，不受影响**）"
+            steps = (
+                "**不是账号被限流，也不是验证码，扫码没用。**\n"
+                "只是**私信**这个通道被抖音限了（陌生人私信本来就最容易踩风控）。\n"
+                f"系统已经自动暂停私信 {int(getattr(self.cfg.outreach, 'dm_pause_minutes', 60) or 60)} 分钟，\n"
+                "**评论留言照常在发**，不用你做任何事。\n\n"
+                "接下来：\n"
+                "1. 不用管，冷却完私信会自动恢复\n"
+                "2. 想马上私信就用抖音 App 手动发（App 端不受网页端的限制）\n"
+                "3. 如果连评论也开始发不出去，那才说明账号真被限了，\n"
+                "   届时会另发一张卡片提醒你"
             )
         else:
             title = "🛑 抖音触达撞上账号限流，已停手"
@@ -1727,9 +1745,30 @@ class OutreachWorker:
         失败了就退回「跳过」（终态，留给人工）——
         跟「没搜到人」不一样，私信发不出去通常是对方关了私信，
         重试也没用。
+
+        【2026-11-15 修正】失败要**分清是谁的问题**：
+
+          对方主页上没有「私信」按钮 → 对方关了私信 → 这条永远发不出去
+            → 跳过这条，**不计数、不停手**（账号好得很）
+          输入框没渲染 / 内容没输进去 → 我们自己的环境问题
+            → 跳过这条，**不计数、不停手**
+          平台把私信拦了（页面提示限流/操作频繁）
+            → **只有这一种**才可能是账号被限流 → 连续 N 次才暂停私信通道
+
+        以前不分这三种，连续 2 条失败就「判定私信被限」并**停掉整个触达**：
+        2026-11-15 实测那 4 条失败全是「对方关了私信」，
+        而停手之后评论照样连发 3 条全成功 —— 停手纯属白停。
         """
         o = self.cfg.outreach
         dry = self._dry
+
+        # ---- 私信通道暂停中？（平台把私信限了）----
+        # 只停私信，**评论照发** —— 这跟「私信被限会连留言一起废」正好相反：
+        # 陌生人私信和评论是两个通道，账号被限私信不代表评论也发不出去。
+        if self._dm_paused_until > time.time():
+            left_min = int((self._dm_paused_until - time.time()) // 60) + 1
+            self.log(f"  ⏭️ 私信通道暂停中（还剩 {left_min} 分钟），这条先跳过，评论不受影响")
+            raise NoWorks(f"{why}；私信通道暂停中（抖音把私信限了）".strip("；"))
 
         # 记下「这个人确认没作品」——下次进队列直接转私信，
         # 不用再拉一遍作品列表确认。
@@ -1782,22 +1821,40 @@ class OutreachWorker:
             private = True
             lead["is_private_account"] = True
         if not res.get("ok"):
-            self._dm_failed += 1
-            thr = int(getattr(o, "dm_fail_threshold", 2) or 2)
+            # 【2026-11-15】分清是谁的问题 —— 只有「平台拦了」才可能是我们被限流
+            fail_kind = res.get("kind") or DM_FAIL_BLOCKED
+            msg = str(res.get("msg") or "")
+            if fail_kind == DM_FAIL_TARGET:
+                self.log(f"  ⏭️ 私信发不出去：{msg}"
+                         f"（对方侧的问题，账号没事，这条跳过）")
+            elif fail_kind == DM_FAIL_ENV:
+                self.log(f"  ⏭️ 私信发不出去：{msg}（我们自己的环境问题，这条跳过）")
+            else:
+                self._dm_failed += 1
+                self.log(f"  ❌ 私信被拦：{msg}"
+                         f"（连续 {self._dm_failed} 次，账号的私信功能可能被限）")
+
             self.st.add_touch(
                 lead_id=lead["id"], record_id=lead.get("bitable_record_id") or "",
                 display_id=lead["display_id"], nickname=lead.get("nickname") or "",
                 sec_uid=lead["sec_uid"], comment_text=text,
                 template_id=c["template_id"], channel="dm", status="failed",
-                error=str(res.get("msg") or "")[:200],
+                error=msg[:200],
             )
-            self.log(f"  ❌ 私信没发出去：{res.get('msg')}")
-            if self._dm_failed >= thr:
-                raise RiskControl(
-                    f"连续 {self._dm_failed} 条私信发不出去，多半是私信功能被限了，"
-                    f"已停手。冷却 {int(getattr(o, 'dm_pause_minutes', 60) or 60)} 分钟后再试"
-                )
-            raise NoWorks(f"{why}；私信也没发出去（{res.get('msg')}）".strip("；"))
+            if fail_kind == DM_FAIL_BLOCKED:
+                thr = int(getattr(o, "dm_fail_threshold", 2) or 2)
+                if self._dm_failed >= thr:
+                    # 只暂停**私信通道**，整个触达不停 —— 评论是另一个通道，
+                    # 账号被限私信不代表评论也发不出去。
+                    pause_min = int(getattr(o, "dm_pause_minutes", 60) or 60)
+                    self._dm_paused_until = time.time() + pause_min * 60
+                    self._dm_failed = 0
+                    reason = (f"连续 {thr} 条私信被平台拦了，私信功能多半被限了，"
+                              f"已暂停私信 {pause_min} 分钟（**评论照发，不影响留言**）")
+                    self.log(f"  🛑 {reason}")
+                    self._emit(type="risk", lead=lead, error=reason, kind=KIND_DM)
+                    self._notify_risk(KIND_DM, reason, lead)
+            raise NoWorks(f"{why}；私信也没发出去（{msg}）".strip("；"))
 
         # ---- 成功 ----
         self._dm_failed = 0
