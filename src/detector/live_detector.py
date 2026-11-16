@@ -434,27 +434,19 @@ class LiveDetector:
                         # 否则用 data/browser_data 里失效的 ttwid 打开用户主页会被重定向到首页。
                         # 策略：先尝试持久化上下文（保留浏览器其他状态），启动后立即 add_cookies
                         # 用 config 里的新 cookie 覆盖；持久化失败才回退到独立 browser（手动注入）。
-                        effective_cookie = self._get_effective_cookie()
-                        inject_cookies = []
-                        if effective_cookie:
-                            from urllib.parse import unquote
-                            for part in effective_cookie.split(";"):
-                                part = part.strip()
-                                if "=" in part:
-                                    k, v = part.split("=", 1)
-                                    inject_cookies.append({
-                                        'name': k.strip(),
-                                        'value': unquote(v.strip()),
-                                        'domain': '.douyin.com',
-                                        'path': '/',
-                                    })
+                        #
+                        # ⚠【2026-11-16】登录态 cookie **已经在 profile 里**
+                        #   （seed_profile 复制的就是真浏览器的 cookie 库），
+                        #   所以这里不需要 add_cookies，也**绝不能先访问抖音首页**
+                        #   （实测：先开首页 → 验证页 5/5；直接开用户页 → 0/5）。
 
                         # ---- 用哪一份 profile ----
                         #
                         # 优先用「登录态副本」（每个并发一份，互不抢 profile 锁）。
                         # 拿不到就退回旧的 data/browser_data（那个是未登录态，
                         # 页面会降级成壳页 → 看不见直播间，只能当降级方案）。
-                        slot_dir = self._seeded.next_dir() if self._seeded else None
+                        slot_dir = (self._seeded.slot_path(slot_idx)
+                                    if self._seeded and slot_idx is not None else None)
                         user_data_dir = str(slot_dir or self._browser_data_dir)
 
                         # ---- 用哪个浏览器 ----
@@ -490,43 +482,30 @@ class LiveDetector:
                                 context = p.chromium.launch_persistent_context(**launch_kwargs)
                             else:
                                 raise
-                        log.info(f"[浏览器] 持久化上下文启动成功（{channel or '自带Chromium'}，profile={user_data_dir}），"
-                                 f"注入 {len(inject_cookies)} 条 cookie 覆盖 profile...")
+                        log.info(f"[浏览器] 持久化上下文启动成功（{channel or '自带Chromium'}，profile={user_data_dir}）")
+                        # ⚠ 登录态 cookie **已经在 profile 里**（seed_profile 复制的就是
+                        #   真浏览器的 cookie 库），所以这里不需要、也不应该 add_cookies。
+                        #   覆盖注入反而会跟 profile 自带的 cookie 打架。
+                        #   （2026-11-16 实测：先访问首页 + 注入 cookie → 验证页 5/5；
+                        #     直接开用户页不碰首页 → 验证页 0/5）
 
-                        # 必须先访问 domain 一次才能 add_cookies
+                        # 【2026-11-16 关键修复】**不要先访问抖音首页**
                         #
-                        # ⚠ 只等「响应头」（commit），不等整页资源（2026-11-13）：
-                        #   这里唯一的目的就是让 origin 建立起来好注入 cookie，
-                        #   等 domcontentloaded 要 15 秒，而检测是 14 个账号并发
-                        #   （每个都启一个 Chromium）→ 实测整个检测器吃掉 216% CPU，
-                        #   把触达的浏览器挤得搜索从 20 秒变成 60+ 秒。
-                        #   改成 commit 后这一步 15 秒 → 1~2 秒。
-                        first_page = context.pages[0] if context.pages else context.new_page()
-                        try:
-                            first_page.goto("https://www.douyin.com/",
-                                           wait_until="commit", timeout=15000)
-                        except Exception:
-                            pass  # 即使失败也继续
-                        if inject_cookies:
-                            added = False
-                            try:
-                                context.add_cookies(inject_cookies)
-                                added = True
-                            except Exception as e:
-                                log.warning(f"设置 cookies 失败（等页面加载完再试一次）: {e}")
-                            if not added:
-                                # 保险起见：等页面真的加载完再试一次
-                                # （cookie 注入失败 = 用 profile 里的旧 cookie
-                                #   → 可能被重定向到首页 → 误判「没开播」→ 漏掉直播间）
-                                try:
-                                    first_page.wait_for_load_state(
-                                        "domcontentloaded", timeout=10000)
-                                    context.add_cookies(inject_cookies)
-                                    added = True
-                                except Exception as e:
-                                    log.warning(f"设置 cookies 仍然失败: {e}")
-                            if added:
-                                log.info(f"[浏览器] ✅ 已注入 {len(inject_cookies)} 条 cookie 覆盖 profile")
+                        # 以前这里先 goto("https://www.douyin.com/")，理由是
+                        # 「必须先访问 domain 一次才能 add_cookies」。
+                        # 但实测（同一时段、同一批账号、同一套 profile 副本）：
+                        #   先开首页 + 注入 cookie + 再开用户页 → 验证页 5/5
+                        #   直接开用户页（不碰首页）           → 验证页 0/5
+                        # 访问首页这个动作本身就会让抖音给会话弹「验证码中间页」，
+                        # 一半账号直接瞎掉 → 检测器以为「没开播」→ 弹幕全丢。
+                        #
+                        # 而 profile 副本里**本来就带着登录态 cookie**
+                        # （seed_profile 复制的就是真浏览器的 cookie），
+                        # 所以「必须先访问才能加 cookie」这个前提根本不成立 ——
+                        # 根本不需要 add_cookies，也不需要先访问首页。
+                        #
+                        # ⚠ 万一真要注入 cookie（配置里的比 profile 里的新），
+                        #   也在**用户页**上注入，不要为了注入而先访问首页。
                         page = context.pages[0] if context.pages else context.new_page()
 
                         # 打开用户主页
