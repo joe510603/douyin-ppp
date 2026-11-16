@@ -70,14 +70,29 @@ def test_seed_profile_missing_source(tmp_path):
 
 
 def test_seeded_profiles_rotates_slots(tmp_path):
-    """并发检测要一人一份 profile（同一个目录开第二个浏览器会被锁）。"""
+    """并发检测要一人一份 profile（同一个目录开第二个浏览器会被锁）。
+
+    【2026-11-15】slot 现在是「占用中」语义：取到的 slot 在用完回收前
+    不会再分配给别人（否则两个线程会抢同一个目录 → Chromium 报 profile 被锁）。
+    """
     src = _make_source_profile(tmp_path)
     provider = SeededProfiles(str(src), str(tmp_path / "slots"), slots=3, refresh_minutes=60)
 
-    dirs = [provider.next_dir() for _ in range(6)]
+    dirs = [provider.next_dir() for _ in range(3)]
     assert all(d is not None for d in dirs)
     assert len({str(d) for d in dirs}) == 3          # 3 个 slot 轮着用
     assert (tmp_path / "slots" / "slot0" / "Default" / "Cookies").exists()
+
+
+def test_seeded_profiles_slot_busy_is_not_reassigned(tmp_path):
+    """slot 还在用 → 不再分配给别人（3 个 slot 用完后第 4 次应该是 None）。"""
+    src = _make_source_profile(tmp_path)
+    provider = SeededProfiles(str(src), str(tmp_path / "slots"), slots=3, refresh_minutes=60)
+
+    assert provider.next_dir() is not None
+    assert provider.next_dir() is not None
+    assert provider.next_dir() is not None
+    assert provider.next_dir() is None, "slot 都占着时应返回 None，而不是硬塞给别人"
 
 
 def test_provider_rejects_cookie_without_sessionid(tmp_path):

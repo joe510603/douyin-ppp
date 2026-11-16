@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import pathlib
 import shutil
+import threading
 import time
 from typing import Optional
 
@@ -110,6 +111,12 @@ class SeededProfiles:
 
     为什么要 N 份：检测是并发的（默认 4 个浏览器同时跑），
     同一个 profile 目录开第二个浏览器会被 Chromium 锁住。
+
+    【2026-11-15】限流是**按 profile 目录**记的，不是按 IP：
+    实测同一目录第 1 个账号正常渲染，第 2 个开始就被降级成壳页；
+    等 75 秒也不恢复；而**删掉目录重建**（或换个全新目录）立刻恢复正常。
+    → 所以 slot 用过一轮之后要**整个删掉重建**，不能只覆盖复制
+      （覆盖复制会保留 Edge 运行时写进去的降级标记，删掉重建才会清干净）。
     """
 
     def __init__(self, src: str, base_dir: str, slots: int = 4,
@@ -121,6 +128,13 @@ class SeededProfiles:
         self._seeded_at: float = 0.0
         self._counter = 0
         self._ok = False
+        # 每个 slot 上次用完的时刻（0 = 还没用过）
+        self._used_at: dict[int, float] = {}
+        # 🔒 并发安全：检测是 4 个线程同时跑的。
+        #   轮转取号可能让两个线程拿到同一个 slot（→ 抢 profile 锁 → 一启动就失败）。
+        #   所以这里用锁 + 「占用中」集合：正在用的 slot 不再分配给别人。
+        self._lock = threading.Lock()
+        self._in_use: set[int] = set()
 
     def _slot_dir(self, index: int) -> pathlib.Path:
         return self.base / f"slot{index % self.slots}"
@@ -150,13 +164,113 @@ class SeededProfiles:
 
     def next_dir(self) -> Optional[pathlib.Path]:
         """轮换取一个 slot 目录（并发检测时各自一份，避免抢锁）。"""
+        idx = self.next_index()
+        return self.slot_path(idx) if idx is not None else None
+
+    def next_index(self) -> Optional[int]:
+        """取一个**没人占用**的 slot 序号（并发安全）。
+
+        找不到空闲 slot 时返回 None —— 调用方宁可这次不用副本，
+        也不要两个线程抢同一个目录（Chromium 会直接报 profile 被锁）。
+        """
         if not self.ensure():
             return None
-        idx = self._counter % self.slots
-        self._counter += 1
-        return self._slot_dir(idx)
+        with self._lock:
+            for _ in range(self.slots):
+                idx = self._counter % self.slots
+                self._counter += 1
+                if idx not in self._in_use:
+                    self._in_use.add(idx)
+                    return idx
+        return None
+
+    def release(self, index: int) -> None:
+        """用完了：把这个 slot 标记为可再用（**不删目录**）。"""
+        with self._lock:
+            self._in_use.discard(index)
+
+    def slot_path(self, index: int) -> pathlib.Path:
+        """slot 序号 → 目录路径。"""
+        return self._slot_dir(index)
+
+    def recycle_slot(self, index: int) -> bool:
+        """这个 slot 用过了 → **整个删掉重建**，清掉 Edge 写进去的降级标记。
+
+        【2026-11-15 实测】限流是按 profile 目录记的：
+          · 同一目录第 1 个账号正常渲染，第 2 个开始被降级成壳页
+          · 等 75 秒也不恢复（不是时间窗口）
+          · 删掉目录重建 → 立刻恢复正常
+        所以每次用完一个 slot 就重建它，让每个账号都用干净 profile 上场。
+
+        重建失败不致命（下次还会再试），返回是否成功。
+        """
+        try:
+            ok = self.reset_slot(index)
+            if ok:
+                log.debug(f"slot{index} 已重建（清掉上一次的降级标记）")
+            else:
+                log.warning(f"slot{index} 重建失败（限流标记可能没清掉）")
+        except Exception as e:
+            log.warning(f"重建 slot{index} 失败: {e}")
+            ok = False
+        finally:
+            # 无论重建成功与否都要释放占用，否则这个 slot 永远分配不出去
+            self.release(index)
+        return ok
+
+    def reset_slot(self, index: int) -> bool:
+        """把某个 slot **整个删掉重建**（清掉 Edge 写进去的降级标记）。
+
+        为什么必须删目录而不是覆盖复制：
+        Edge 运行时会在 profile 里写下这次会话的痕迹（降级标记就在里头），
+        覆盖复制只换掉那 6 个种子文件，**残留的痕迹还在** →
+        实测覆盖复制后依然被限，删目录重建才恢复。
+
+        Args:
+            index: slot 序号。
+
+        Returns:
+            是否重建成功。
+        """
+        dst = self._slot_dir(index)
+        try:
+            if dst.exists():
+                # ⚠ 不能用 ignore_errors=True —— 删不掉时会被**静默吞掉**，
+                #   表现就是「以为回收了，其实 slot 里还留着上次的降级标记」，
+                #   而日志上一片正常（跟当初那个「登录态有效但其实没登录」一个毛病）。
+                #   这里如实报告删了多少、剩多少。
+                shutil.rmtree(dst)
+        except Exception as e:
+            log.warning(f"删除旧 profile 目录失败（{dst}）: {e}")
+            # 删不掉就退一步：至少把里面的缓存/Service Worker 清掉，
+            # 降级标记主要就写在 Local Storage 和缓存里。
+            try:
+                for sub in ("Default/Cache", "Default/Code Cache",
+                            "Default/Service Worker", "Default/GPUCache"):
+                    p = dst / sub
+                    if p.exists():
+                        shutil.rmtree(p, ignore_errors=True)
+                log.info(f"slot{index} 目录删不掉，已清理缓存目录（降级标记可能仍在）")
+            except Exception as e2:
+                log.debug(f"清理 slot{index} 缓存也失败: {e2}")
+            return False
+        ok = seed_profile(self.src, dst)
+        if ok:
+            self._used_at[index] = time.time()
+        return ok
+
+    def reset_all(self) -> int:
+        """把所有 slot 删掉重建（检测大面积降级时的自愈手段）。"""
+        n = 0
+        for i in range(self.slots):
+            if self.reset_slot(i):
+                n += 1
+        self._seeded_at = time.time() if n else 0.0
+        self._ok = bool(n)
+        return n
 
     def refresh(self) -> bool:
         """强制重新复制（登录态换了、或检测不出来的时候调）。"""
         self._ok = False
         return self.ensure(force=True)
+

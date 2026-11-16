@@ -909,6 +909,22 @@ async def on_startup():
                           f"{'，或抖音弹了验证码中间页' if verify_hits else ''}）")
                 if blind_rounds >= 2:
                     blind_rounds = 0
+                    # ---- 自愈：重建检测用的 profile 副本 ----
+                    #
+                    # 【2026-11-15 实测】限流是按 profile 目录记的：
+                    #   同一目录第 1 个账号正常渲染，第 2 个开始被降级成壳页，
+                    #   等 75 秒也不恢复，**删目录重建**才恢复。
+                    # 所以全盲时先把副本全删掉重建 —— 很多时候不用等人，
+                    # 下一轮自己就恢复了。
+                    try:
+                        from src.detector.live_detector import get_detector
+                        det = get_detector()
+                        if getattr(det, "_seeded", None):
+                            n = det._seeded.reset_all()
+                            log.info(f"[检测自检] 已重建 {n} 份检测用 profile 副本"
+                                     f"（限流按 profile 目录记，重建可解除）")
+                    except Exception as e:
+                        log.debug(f"[检测自检] 重建 profile 副本失败: {e}")
                     # 去重：同一个持续故障别反复刷屏
                     if not notifier_dedupe.should_notify("blind"):
                         log.info(f"[检测自检] 故障还在持续，"
