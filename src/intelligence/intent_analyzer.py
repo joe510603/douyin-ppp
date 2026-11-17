@@ -52,12 +52,27 @@ _NOISE_PATTERNS = (
 _VALID_LEVELS = {l.value for l in IntentLevel}
 
 # 昵称归一化：去掉空白与各种分隔符，用于比对
-_NAME_NOISE_RE = re.compile(r"[\s|｜\-_·•,，.。、:：]+")
+#
+# 分隔符清单里要带 **丨**（U+4E28 竖线）和 **｜**（U+FF5C 全角竖线）——
+# 2026-11-17 实测：门店配置名和弹幕昵称里的竖线**字形不同**
+# （配置写「小米汽车丨成都万象城店」，有的弹幕写「小米汽车｜合肥滨湖悦方体验店」），
+# 不一起归一化就只有「字形撞巧相同」的那几家能匹配上。
+_NAME_NOISE_RE = re.compile(r"[\s|｜丨\-_·•,，.。、:：]+")
+
+# 账号认证后缀：配置里带、弹幕里不带 → 归一化后对不上
+#
+# 2026-11-17 实测踩到的坑：配置名「小米汽车-成都金牛凯德体验店 **认证徽章**」，
+# 弹幕昵称是「小米汽车-成都金牛凯德体验店」（没有后缀）→ 昵称排除失效。
+# 去掉后缀后两边就一致了（昵称这道防线也跟着完整了）。
+_NAME_BADGE_RE = re.compile(
+    r"(认证徽章|认证|企业号|官方号|官方|蓝v|蓝V)$"
+)
 
 
 def _normalize_name(name: str) -> str:
     """昵称归一化，便于比对"""
-    return _NAME_NOISE_RE.sub("", (name or "").lower())
+    n = _NAME_NOISE_RE.sub("", (name or "").lower())
+    return _NAME_BADGE_RE.sub("", n)
 
 
 def _build_self_names(config) -> set[str]:
@@ -187,6 +202,8 @@ class IntentAnalyzer:
                 "user_id": g["user_id"],
                 "display_id": g["display_id"],
                 "nickname": g["nickname"],
+                # 弹幕里就带着这个人的 secUid —— 存下来，触达时跳过搜索
+                "sec_uid": g.get("sec_uid") or "",
                 "messages": messages,
                 "_key": key,
             })
@@ -347,6 +364,7 @@ class IntentAnalyzer:
             user_id=item.get("user_id") or "",
             display_id=item.get("display_id") or "",
             nickname=item.get("nickname") or "",
+            sec_uid=item.get("sec_uid") or "",
             room_id=item.get("room_id") or "",
             monitor_name=item.get("monitor_name") or "",
             live_room=item.get("live_room") or "",

@@ -525,8 +525,22 @@ class DBStorage:
             lead 的数据库主键
         """
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        # ⚠ SELECT 里的列必须**覆盖**下面 row[...] 的每一次引用。
+        #
+        # 踩过的坑（2026-11-17 定位）：这里原来只 SELECT 了 8 列，
+        # 下面合并分支却读 row["car_model"] / row["intent_reason"] →
+        # sqlite3.Row 读不到就抛 IndexError("No item with that key")
+        # → upsert_lead 整个抛掉 → lead_service 记一句 ERROR 就返回
+        # → **这条线索的更新被静默丢弃**（证据不累加、last_hit_at 不刷新）。
+        # 生产日志里真实炸过 23 次（旧日志 17 + 新日志 6）。
+        #
+        # 触发条件：老线索已在池里（走 UPDATE 分支）且新评论的意向等级**更低**
+        # → 走 else 分支 → 读 car_model → 炸。
+        # 危害是「越活跃的人越容易被丢掉更新」——他说了更多话，
+        # 线索却因为第一次判定分高而不再更新热度，排序时被压到队尾。
         existing = await self._db.execute(
-            "SELECT id, intent_level, intent_score, contact_type, contact_value, "
+            "SELECT id, intent_level, intent_score, intent_reason, car_model, "
+            "contact_type, contact_value, "
             "evidence_count, comment_count, evidence FROM leads WHERE lead_key = ?",
             [lead.lead_key],
         )
@@ -547,8 +561,8 @@ class DBStorage:
                     contact_type, contact_value,
                     evidence, evidence_count, comment_count, last_hit_at,
                     status, pushed_at, outreach_status, outreach_at, outreach_note,
-                    source, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    source, created_at, updated_at, sec_uid
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 [
                     lead.lead_key, lead.user_id, lead.display_id, lead.nickname, lead.avatar,
                     lead.room_id, lead.monitor_name, lead.live_room, store,
@@ -558,6 +572,7 @@ class DBStorage:
                     (lead.last_hit_at or now),
                     lead.status, lead.pushed_at, lead.outreach_status, lead.outreach_at, lead.outreach_note,
                     lead.source or "rule", now, now,
+                    lead.sec_uid or "",
                 ],
             )
             if commit:
@@ -610,6 +625,9 @@ class DBStorage:
                 monitor_name = COALESCE(NULLIF(?, ''), monitor_name),
                 store = COALESCE(NULLIF(?, ''), store),
                 live_room = COALESCE(NULLIF(?, ''), live_room),
+                sec_uid = CASE WHEN sec_uid IS NULL OR sec_uid = ''
+                               THEN COALESCE(NULLIF(?, ''), sec_uid)
+                               ELSE sec_uid END,
                 intent_level = ?, intent_score = ?, intent_reason = ?, car_model = ?,
                 contact_type = ?, contact_value = ?,
                 evidence = ?, evidence_count = ?, comment_count = ?,
@@ -619,6 +637,7 @@ class DBStorage:
             [
                 lead.user_id, lead.display_id, lead.nickname, lead.avatar,
                 lead.room_id, lead.monitor_name, store, lead.live_room,
+                lead.sec_uid,
                 new_level, new_score, new_reason, new_model,
                 new_contact_type, new_contact_value,
                 new_evidence, old_evidence_count + lead.evidence_count,
@@ -903,6 +922,7 @@ class DBStorage:
                    MAX(user_avatar) AS avatar,
                    MAX(room_id) AS room_id,
                    MAX(monitor_name) AS monitor_name,
+                   MAX(NULLIF(user_sec_id, '')) AS sec_uid,
                    COUNT(*) AS cnt,
                    MAX(create_time) AS last_at,
                    GROUP_CONCAT(content, '|||') AS msgs
@@ -930,6 +950,9 @@ class DBStorage:
                 "avatar": r["avatar"] or "",
                 "room_id": r["room_id"] or "",
                 "monitor_name": r["monitor_name"] or "",
+                # 这个人的 sec_uid（弹幕里就带着）→ 建线索时直接存下来，
+                # 触达时就不用再搜索了
+                "sec_uid": r["sec_uid"] or "",
                 "count": r["cnt"],
                 "messages": messages,
                 # 这个用户最后一次发言的时间（用来排「最近抓取优先」）

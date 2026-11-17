@@ -89,6 +89,16 @@ class Lead(BaseModel):
     nickname: str = Field(default="", description="用户昵称")
     avatar: str = Field(default="", description="头像 URL")
 
+    # 抖音 sec_uid（永久不变、唯一）
+    #
+    # 为什么建线索时就要带上（2026-11-17）：
+    # 采集器拿到弹幕的**第一条**就知道这个人的 secUid
+    # （排除自家账号就是靠它判的），白白丢掉太亏。
+    # 而抖音 web 端搜索接口最脆弱：一次要 20 秒，还经常静默限流
+    # （返回空 user_list、不报错）。记住 sec_uid → 触达时直接开主页，
+    # **完全跳过搜索**，每条省 17-20 秒，还少一次被限流的机会。
+    sec_uid: str = Field(default="", description="抖音 sec_uid（知道就不用再搜索）")
+
     # 来源直播间
     room_id: str = Field(default="", description="直播间 ID")
     monitor_name: str = Field(default="", description="监控账号名称")

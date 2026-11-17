@@ -99,6 +99,8 @@ async def scan_by_rules(
             user_id=g["user_id"],
             display_id=g["display_id"],
             nickname=g["nickname"],
+            # 弹幕里就带着这个人的 secUid —— 存下来，触达时跳过搜索
+            sec_uid=g.get("sec_uid") or "",
             room_id=g["room_id"],
             monitor_name=g["monitor_name"],
             intent_level=best.level,

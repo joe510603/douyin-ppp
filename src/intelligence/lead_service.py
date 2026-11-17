@@ -229,6 +229,9 @@ class LeadService:
             user_id=comment.user_id or "",
             display_id=comment.user_display_id or "",
             nickname=comment.user_nickname or "",
+            # 弹幕里就带着这个人的 secUid —— 直接存下来，
+            # 触达时就能跳过搜索（搜索要 20 秒且最容易被限流）
+            sec_uid=(getattr(comment, "user_sec_id", "") or "").strip(),
             room_id=comment.room_id or "",
             monitor_name=comment.monitor_name or "",
             intent_level=result.level,
