@@ -648,7 +648,8 @@ def main():
 
 
 async def _notify_blind(recovered: bool, rendered: int = 0, total: int = 0,
-                        verify_page: bool = False, no_room: int = 0) -> None:
+                        verify_page: bool = False, no_room: int = 0,
+                        degraded: bool = False) -> None:
     """检测器自检结果 → 飞书群机器人。
 
     盲了 = 红卡片 + @你（手机强提醒）；恢复了 = 绿卡片（不 @）。
@@ -661,6 +662,10 @@ async def _notify_blind(recovered: bool, rendered: int = 0, total: int = 0,
     这跟「登录态过期」完全是两回事 ——
     前者要人工**过一次验证**（拖拼图/扫码），后者要**重新登录**。
     说错了用户就会去干没用的事。
+
+    ``degraded``：是不是被**限流降级**了（主页变成「用户不存在」壳页）。
+    这个跟验证页也不同：降级是「我们被限速了」，
+    程序能靠重建 profile + 降频自己恢复，人不用管。
     """
     try:
         from src.config import get_config
@@ -874,6 +879,9 @@ async def on_startup():
                 api_ok = sum(1 for info in results.values() if getattr(info, "api_ok", False))
                 # 是不是撞了「验证码中间页」（= 要人工过的验证，不是登录态过期）
                 verify_hits = sum(1 for info in results.values() if getattr(info, "verify_page", False))
+                # 是不是被**限流降级**了（= 能自己修：重建 profile + 降频）
+                degraded_hits = sum(1 for info in results.values()
+                                    if getattr(info, "degraded_page", False))
                 # 「看得见在播，却拿不到 room_id」—— 采集器就是靠 room_id 起连接的，
                 # 拿不到 = 采集器起不来 = 弹幕一条都收不到。
                 # 这是「接口活着、浏览器瞎了」那一档的信号，
@@ -904,9 +912,22 @@ async def on_startup():
                     return
 
                 blind_rounds += 1
+                # 两种「看不见」必须分开处理：
+                #   · **降级**（正文含「用户不存在」）→ 我们被限流了，
+                #     能自己修（重建 profile + 降频），先修再叫人；
+                #   · **验证**（标题「验证码中间页」）→ 必须人工过，代码修不了。
+                # 混在一起的后果很具体：把「能自己修」当成「要人管」，
+                # 用户白扫码；或者反过来，一直不叫人，弹幕默默丢一天。
+                if verify_hits and not degraded_hits:
+                    blind_kind = "verify"
+                elif degraded_hits and not verify_hits:
+                    blind_kind = "degraded"
+                elif verify_hits:
+                    blind_kind = "verify"      # 验证优先（验证更致命）
+                else:
+                    blind_kind = "unknown"
                 log.error(f"[检测自检] 第 {blind_rounds} 轮：{total} 个账号一个都看不见"
-                          f"（登录态可能又过期了"
-                          f"{'，或抖音弹了验证码中间页' if verify_hits else ''}）")
+                          f"（{blind_kind}：验证 {verify_hits} / 降级 {degraded_hits}）")
                 if blind_rounds >= 2:
                     blind_rounds = 0
                     # ---- 自愈：重建检测用的 profile 副本 ----
@@ -932,7 +953,8 @@ async def on_startup():
                     else:
                         notifier_dedupe.mark_sent("blind")
                         await _notify_blind(recovered=False, rendered=0, total=total,
-                                            verify_page=bool(verify_hits))
+                                            verify_page=bool(verify_hits),
+                                            degraded=bool(degraded_hits))
 
                 # ---- 第二档：看得见在播，却拿不到 room_id ----
                 # 采集器靠 room_id 才能连上去；拿不到 = 弹幕一条都收不到。

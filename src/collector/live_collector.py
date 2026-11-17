@@ -1593,23 +1593,28 @@ class LiveCollector:
         except Exception as e:
             log.error(f"发送 ACK 失败: {e}")
     
-    def _extract_user_id(self, user) -> tuple[str, str, str]:
+    def _extract_user_id(self, user) -> tuple[str, str, str, str]:
         """
         从 User proto 中提取用户 ID。
 
         Returns:
-            tuple[short_id, display_id, internal_id]:
+            tuple[short_id, display_id, internal_id, sec_id]:
             - short_id: 抖音号（用户设置的，可被用户修改，可被搜索）
             - display_id: 抖音 displayId（proto field 38，平台分配的字符串 ID，永远不变）
                           用于后端 API 反查 user_profile；用户一般搜不到这个
             - internal_id: 抖音内部数字 ID（user.id / idStr），不可搜索
+            - sec_id: secUid（proto field 46）—— **唯一可靠的身份标识**，
+                      永久不变且唯一。用来认出「这条弹幕是主播自己发的」
+                      （2026-11-17 实测踩到：门店官方号自己的口播文案
+                       被当成客户提问，还给人家发了留言广告）。
         """
         if not user:
-            return "", "", ""
+            return "", "", "", ""
 
         short_id = ""
         display_id = ""
         internal_id = ""
+        sec_id = ""
 
         try:
             # 1. 优先提取 shortId（抖音号）
@@ -1620,7 +1625,11 @@ class LiveCollector:
             if hasattr(user, 'displayId') and user.displayId:
                 display_id = str(user.displayId)
 
-            # 3. 提取内部数字 ID（idStr / id），仅在 displayId 缺失时回退
+            # 3. 提取 secUid（field 46）—— 永久不变的唯一标识
+            if hasattr(user, 'secUid') and user.secUid:
+                sec_id = str(user.secUid)
+
+            # 4. 提取内部数字 ID（idStr / id），仅在 displayId 缺失时回退
             if not display_id:
                 if hasattr(user, 'idStr') and user.idStr:
                     internal_id = str(user.idStr)
@@ -1630,7 +1639,7 @@ class LiveCollector:
         except Exception:
             pass
 
-        return short_id, display_id, internal_id
+        return short_id, display_id, internal_id, sec_id
 
     async def _process_message(self, method: str, payload: bytes, room_id: str):
         """根据方法名处理消息"""
@@ -1645,7 +1654,7 @@ class LiveCollector:
                 chat_msg.ParseFromString(payload)
 
                 user_name = getattr(chat_msg.user, 'nickName', '未知用户') if chat_msg.HasField('user') else "未知用户"
-                short_id, display_id, internal_id = self._extract_user_id(chat_msg.user) if chat_msg.HasField('user') else ("", "", "")
+                short_id, display_id, internal_id, sec_id = self._extract_user_id(chat_msg.user) if chat_msg.HasField('user') else ("", "", "", "")
                 content = chat_msg.content
 
                 comment = LiveComment(
@@ -1654,7 +1663,8 @@ class LiveCollector:
                     room_id=room_id,
                     user_id=short_id or display_id or internal_id,  # 优先用抖音号，其次 displayId，最后内部 ID
                     user_short_id=short_id,         # 抖音号（可搜、可变）
-                    user_display_id=display_id,        # 平台分配的 displayId（不变，用于反查）
+                    user_display_id=display_id,
+                    user_sec_id=sec_id,        # secUid（永久不变的唯一标识）
                     user_nickname=user_name,
                     user_avatar=getattr(chat_msg.user, 'avatarUrl', '') if chat_msg.HasField('user') else '',
                     monitor_name=self.monitor_name,
@@ -1671,7 +1681,7 @@ class LiveCollector:
                 gift_msg.ParseFromString(payload)
 
                 user_name = getattr(gift_msg.user, 'nickName', '未知用户') if gift_msg.HasField('user') else "未知用户"
-                short_id, display_id, internal_id = self._extract_user_id(gift_msg.user) if gift_msg.HasField('user') else ("", "", "")
+                short_id, display_id, internal_id, sec_id = self._extract_user_id(gift_msg.user) if gift_msg.HasField('user') else ("", "", "", "")
                 gift_name = "礼物"
 
                 comment = LiveComment(
@@ -1681,6 +1691,7 @@ class LiveCollector:
                     user_id=short_id or display_id or internal_id,
                     user_short_id=short_id,
                     user_display_id=display_id,
+                    user_sec_id=sec_id,
                     user_nickname=user_name,
                     user_avatar=getattr(gift_msg.user, 'avatarUrl', '') if gift_msg.HasField('user') else '',
                     monitor_name=self.monitor_name,
@@ -1698,7 +1709,7 @@ class LiveCollector:
                 member_msg.ParseFromString(payload)
 
                 user_name = getattr(member_msg.user, 'nickName', '未知用户') if member_msg.HasField('user') else "未知用户"
-                short_id, display_id, internal_id = self._extract_user_id(member_msg.user) if member_msg.HasField('user') else ("", "", "")
+                short_id, display_id, internal_id, sec_id = self._extract_user_id(member_msg.user) if member_msg.HasField('user') else ("", "", "", "")
 
                 comment = LiveComment(
                     content=f"[进场] {user_name}",
@@ -1707,6 +1718,7 @@ class LiveCollector:
                     user_id=short_id or display_id or internal_id,
                     user_short_id=short_id,
                     user_display_id=display_id,
+                    user_sec_id=sec_id,
                     user_nickname=user_name,
                     user_avatar=getattr(member_msg.user, 'avatarUrl', '') if member_msg.HasField('user') else '',
                     monitor_name=self.monitor_name,
@@ -1723,7 +1735,7 @@ class LiveCollector:
                 like_msg.ParseFromString(payload)
 
                 user_name = getattr(like_msg.user, 'nickName', '未知用户') if like_msg.HasField('user') else "未知用户"
-                short_id, display_id, internal_id = self._extract_user_id(like_msg.user) if like_msg.HasField('user') else ("", "", "")
+                short_id, display_id, internal_id, sec_id = self._extract_user_id(like_msg.user) if like_msg.HasField('user') else ("", "", "", "")
 
                 comment = LiveComment(
                     content=f"[点赞] {user_name}",
@@ -1732,6 +1744,7 @@ class LiveCollector:
                     user_id=short_id or display_id or internal_id,
                     user_short_id=short_id,
                     user_display_id=display_id,
+                    user_sec_id=sec_id,
                     user_nickname=user_name,
                     user_avatar=getattr(like_msg.user, 'avatarUrl', '') if like_msg.HasField('user') else '',
                     monitor_name=self.monitor_name,

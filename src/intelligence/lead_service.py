@@ -46,6 +46,19 @@ class LeadService:
         self._queue: asyncio.Queue = asyncio.Queue(maxsize=_MAX_QUEUE)
         self._worker: Optional[asyncio.Task] = None
         self._self_names = _build_self_names(self.config)
+        # 自家账号的 secUid 集合（2026-11-17 加）
+        # —— 用来认出「这条弹幕是主播自己发的」，排除在线索池外。
+        self._own_sec_ids: set[str] = set()
+        for m in getattr(self.config, "monitors", []) or []:
+            sec = (getattr(m, "sec_user_id", "") or "").strip()
+            if sec:
+                self._own_sec_ids.add(sec)
+        # 自家账号的 display_id（抖音号/displayId）—— secUid 拿不到时的兜底。
+        # MonitorItem 里没有 display_id 字段（只有 name/sec_user_id），
+        # 所以这个集合只能靠「自家账号发过的弹幕」反推 —— 而这需要查库，
+        # 不能在 __init__ 里做（会拖慢启动）。留空即可，
+        # 真正的兜底是 secUid 比对（proto field 46，正常弹幕都有）。
+        self._own_display_ids: set[str] = set()
         # 最近推送过的用户 → 上次推送时间（去重冷却）
         self._pushed_at: dict[str, datetime] = {}
         # 最近写入多维表格的用户 → 上次写入时间（写表冷却）
@@ -101,6 +114,43 @@ class LeadService:
     # 热路径：打分 + 入队（非阻塞）
     # ============================================================
 
+    def _is_own_account(self, comment: LiveComment) -> bool:
+        """这条弹幕是不是「自家/主播账号自己发的」？
+
+        2026-11-17 实测踩到的坑：门店官方号自己在直播间发的口播文案
+        （「SU7-YU7-澎程，首付、分期…点击右下角私信主播领取！！」）
+        被规则打分器判成「价格询问、金融补贴」→ 当成高意向客户入池 →
+        程序**给人家发了留言广告**。等于对着自己人/同行打广告。
+
+        判据（按可靠度）：
+        1. **secUid** —— 永久不变、唯一，最可靠。弹幕发送者的 secUid
+           等于主播的 secUid（= anchor_id）→ 就是主播自己发的。
+        2. **anchor_id 直接比对** —— 采集器拿到的 anchor_id 就是主播 sec_uid，
+           跟发送者 secUid 一样。这是同一件事的两种说法，
+           保留是为了在 secUid 缺失时兜底。
+
+        ⚠ 不用昵称比对：配置里的名字带「认证徽章」后缀
+        （「小米汽车-成都金牛凯德体验店 认证徽章」），
+        弹幕里的昵称没有（「小米汽车-成都金牛凯德体验店」），
+        归一化后对不上 → 排除失效（这就是这个 bug 的根因）。
+        """
+        sender_sec = (getattr(comment, "user_sec_id", "") or "").strip()
+        anchor_sec = (getattr(comment, "anchor_id", "") or "").strip()
+
+        # 主播自己发的
+        if sender_sec and anchor_sec and sender_sec == anchor_sec:
+            return True
+        # 我们监控的账号（可能是连麦/多主播）
+        if sender_sec and sender_sec in self._own_sec_ids:
+            return True
+        # 兜底：抖音号（display_id）跟自家账号的 display_id 一样
+        # （secUid 拿不到时的最后一道防线）
+        if not sender_sec:
+            sender_did = (getattr(comment, "user_display_id", "") or "").strip()
+            if sender_did and sender_did in self._own_display_ids:
+                return True
+        return False
+
     def submit(self, comment: LiveComment) -> Optional[ScoreResult]:
         """
         对一条新弹幕打分，命中则入队等待落库。
@@ -116,6 +166,20 @@ class LeadService:
             return None
         # 平台占位用户不是真人
         if str(comment.user_id or "") in _PLACEHOLDER_USER_IDS:
+            return None
+        # 【2026-11-17 关键修复】主播/自家账号自己发的弹幕**不是线索**
+        #
+        # 实测踩到的坑：门店官方号「小米汽车-成都金牛凯德体验店」自己在直播间
+        # 发的口播文案「SU7-YU7-澎程，首付、分期、全款、补贴各种方案，
+        # 点击右下角私信主播领取！！」被规则打分器判成「价格询问、金融补贴」，
+        # 于是当成一条高意向客户线索入池，程序还**给人家发了留言广告** ——
+        # 等于对着自己人/同行的号发广告。
+        #
+        # 判据用 **secUid**（永久不变、唯一），不用昵称：
+        # 昵称会带「认证徽章」这类后缀（配置里叫「…体验店 认证徽章」，
+        # 弹幕里叫「…体验店」），归一化后对不上 → 排除失效。
+        if self._is_own_account(comment):
+            self.stats["excluded"] += 1
             return None
 
         try:

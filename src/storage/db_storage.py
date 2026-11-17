@@ -284,6 +284,25 @@ class DBStorage:
         except aiosqlite.OperationalError:
             pass  # 字段已存在
 
+        # 数据库迁移：添加 user_sec_id 字段（secUid，唯一可靠的身份标识）
+        #
+        # 用途：认出「这条弹幕是主播/自家账号自己发的」，把它排除在线索池外。
+        # 2026-11-17 实测踩到：门店官方号（小米汽车-成都金牛凯德体验店）自己的
+        # 口播文案「SU7-YU7-澎程，首付、分期…」被判成「价格询问」线索，
+        # 程序还给它发了留言广告 —— 等于给同行/自己的号发广告。
+        try:
+            await self._db.execute("ALTER TABLE live_comments ADD COLUMN user_sec_id TEXT DEFAULT ''")
+            await self._db.commit()
+        except aiosqlite.OperationalError:
+            pass  # 字段已存在
+
+        # 索引：按 secUid 找弹幕（排除自家账号时要用）
+        try:
+            await self._db.execute("CREATE INDEX IF NOT EXISTS idx_live_sec_id ON live_comments(user_sec_id)")
+            await self._db.commit()
+        except aiosqlite.OperationalError:
+            pass
+
         # 创建 user_display_id 索引（用于反查 user profile 等场景）
         try:
             await self._db.execute("CREATE INDEX IF NOT EXISTS idx_live_display_id ON live_comments(user_display_id)")
@@ -944,8 +963,8 @@ class DBStorage:
                 message_type, content, user_id, user_nickname, user_avatar,
                 room_id, anchor_id, anchor_name, monitor_name, create_time,
                 gift_name, gift_count, like_count, raw_data, collected_at,
-                user_short_id, user_display_id
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                user_short_id, user_display_id, user_sec_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             comment.message_type.value if hasattr(comment.message_type, 'value') else str(comment.message_type),
             comment.content,
@@ -964,6 +983,7 @@ class DBStorage:
             comment.collected_at.isoformat(),
             getattr(comment, 'user_short_id', ''),     # 抖音号（可被用户改/搜）
             getattr(comment, 'user_display_id', ''),   # 平台分配的 displayId（不变，后端 API 用）
+            getattr(comment, 'user_sec_id', ''),       # secUid（永久不变的唯一标识）
         ))
         await self._db.commit()
         return cursor.lastrowid
@@ -983,6 +1003,7 @@ class DBStorage:
                 c.raw_data, c.collected_at.isoformat(),
                 getattr(c, 'user_short_id', ''),     # 抖音号
                 getattr(c, 'user_display_id', ''),   # displayId
+                getattr(c, 'user_sec_id', ''),       # secUid（永久不变的唯一标识）
             )
             for c in comments
         ]
@@ -992,8 +1013,8 @@ class DBStorage:
                 message_type, content, user_id, user_nickname, user_avatar,
                 room_id, anchor_id, anchor_name, monitor_name, create_time,
                 gift_name, gift_count, like_count, raw_data, collected_at,
-                user_short_id, user_display_id
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                user_short_id, user_display_id, user_sec_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, rows)
         await self._db.commit()
         return len(comments)

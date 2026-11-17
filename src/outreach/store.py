@@ -25,6 +25,9 @@ from datetime import datetime, timedelta
 from typing import Any, Optional
 
 from ..intelligence.contact_extractor import merge_contact
+from ..utils.logger import get_logger
+
+log = get_logger("outreach_store")
 
 # 触达状态 → leads.outreach_status 的取值
 STATUS_PENDING = "pending"
@@ -369,7 +372,47 @@ class OutreachStore:
             d.setdefault("not_found_count", 0)
             d.setdefault("no_works", 0)
             out.append(d)
+        return self._drop_own_accounts(out)
+
+    # ---- 第二道防线：自家账号绝不能进触达队列 ----
+    #
+    # 第一道防线在采集入口（lead_service.submit），按 secUid 排除主播自己发的弹幕。
+    # 但**历史遗留**的脏线索已经躺在 leads 表里了（2026-11-17 实测：
+    # 门店官方号「小米汽车-成都金牛凯德体验店」自己那条口播文案
+    # 被当成高意向客户，还给它发了留言广告）。
+    # 所以取队列时再挡一次 —— 认据是 secUid（永久不变、唯一）。
+    def _drop_own_accounts(self, leads: list[dict]) -> list[dict]:
+        """把「我们自己监控的账号」从待触达名单里剔掉。"""
+        if not leads:
+            return leads
+        own = self._own_sec_ids()
+        if not own:
+            return leads
+        out = []
+        dropped = 0
+        for d in leads:
+            sec = (d.get("sec_uid") or "").strip()
+            if sec and sec in own:
+                dropped += 1
+                continue
+            out.append(d)
+        if dropped:
+            log.info(f"[触达] 剔掉 {dropped} 条自家账号的线索"
+                     f"（不该给门店官方号发留言）")
         return out
+
+    def _own_sec_ids(self) -> set[str]:
+        """我们监控的账号的 secUid 集合。"""
+        try:
+            from ..config import get_config
+            cfg = get_config()
+            return {
+                (getattr(m, "sec_user_id", "") or "").strip()
+                for m in getattr(cfg, "monitors", []) or []
+                if (getattr(m, "sec_user_id", "") or "").strip()
+            }
+        except Exception:
+            return set()
 
     def get_lead(self, lead_id: int) -> Optional[dict]:
         row = self._conn.execute(

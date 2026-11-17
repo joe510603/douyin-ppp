@@ -36,6 +36,13 @@ class LiveComment(BaseModel):
     user_avatar: str = Field(default="", description="用户头像 URL")
     user_short_id: str = Field(default="", description="抖音号（shortId，仅当用户设置了抖音号时才有效）")
     user_display_id: str = Field(default="", description="抖音 displayId（proto field 38，平台分配的字符串 ID，永远不变；可用于后端 API 反查用户）")
+    # 弹幕发送者的 secUid（proto field 46）。
+    # ⚠ 这是**唯一可靠**的身份标识：昵称会改、会带「认证徽章」这类后缀，
+    #   抖音号也能改 —— 只有 secUid 永久不变且唯一。
+    #   用途：认出「这条弹幕是主播/自家账号自己发的」，把它排除在线索池之外
+    #   （2026-11-17 实测踩到：门店官方号自己的口播文案被当成客户提问，
+    #    还给人家发了留言广告）。
+    user_sec_id: str = Field(default="", description="弹幕发送者 sec_user_id（proto field 46，永久不变的唯一标识）")
     
     # 直播间信息
     room_id: str = Field(default="", description="直播间 room_id")

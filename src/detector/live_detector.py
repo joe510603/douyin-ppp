@@ -55,6 +55,15 @@ class LiveRoomInfo:
     # 这跟「登录态过期」是两回事：要人工过的**验证** ≠ 重新登录，
     # 告警里得说清楚，不然用户会去扫一个没用的码。
     verify_page: bool = False
+    # 页面是不是被**限流降级**了（2026-11-16 加）
+    #
+    # 降级页长这样：正文 ~533 字、含「用户不存在」、没有主播资料。
+    # 实测拿抖音**官方号**做对照也是这个样子 → 证明这不是账号属性，
+    # 而是**我们这个会话被平台降级**了（跟验证码中间页是两回事）：
+    #   · 降级 → 重建 profile 目录 + 降频就能恢复（能自己修）
+    #   · 验证 → 必须人工过（代码修不了）
+    # 两者混在一起，告警就会说错，用户会白扫码。
+    degraded_page: bool = False
 
 
 class LiveDetector:
@@ -555,6 +564,10 @@ class LiveDetector:
                             # 抖音弹了「验证码中间页」—— 这是**要人工过的验证**，
                             # 不是登录态过期。告警必须分开说，不然用户会去扫没用的码。
                             info.verify_page = True
+                        if degraded_page:
+                            # 被**限流降级**了 —— 这跟验证页是两回事：
+                            # 降级能靠重建 profile + 降频自己恢复，验证必须人工过。
+                            info.degraded_page = True
                         info.rendered = bool(
                             sec_user_id and sec_user_id in content
                             and not verify_page and not degraded_page)
