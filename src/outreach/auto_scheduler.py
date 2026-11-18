@@ -207,6 +207,47 @@ class AutoScheduler:
             return float(getattr(o, "auto_round_gap_seconds", 60) or 60)
         return float(max(1, int(o.auto_interval_minutes or 60))) * 60
 
+    def blockers(self, ignore_auto_mode: bool = False) -> list[str]:
+        """现在能不能跑触达？返回**阻塞原因**列表（空 = 能跑）
+
+        抽出来是为了让两个通道共用同一套判断（2026-11-18）：
+          · ``maybe_run`` —— 批量轮询（受 ``auto_mode`` 开关管）
+          · 即时触达通道 —— 只受风控/暂停/额度管，**不看 auto_mode**
+
+        两边各写一套判断的话，早晚会出现「批量那边知道要停、
+        即时那边还在发」的缝 —— 那正好是撞风控的时候。
+        """
+        cfg = get_config()
+        o = cfg.outreach
+        out: list[str] = []
+
+        if not ignore_auto_mode and not o.auto_mode:
+            out.append("自动触达没开")
+        if not o.enabled:
+            out.append("触达功能没启用")
+        if self.runner.is_running:
+            out.append("已有触达任务在跑")
+
+        # 冷却中不跑（真被限流了还要硬撞就是找死）
+        left = int(self.runner.risk_cooldown_left() or 0)
+        if left > 0:
+            out.append(f"限流冷却中，还剩 {left} 分钟")
+
+        # 验证冷却中不跑（撞了拼图没人过 → 抖音还在冷却期里，硬冲只会再撞）
+        vleft = self._verify_cooldown_left()
+        if vleft > 0:
+            out.append(f"验证冷却中，还剩 {vleft} 分钟")
+
+        # 暂停中：等人处理
+        if self._paused:
+            if self._paused_until and datetime.now() >= self._paused_until:
+                # 到点了自动恢复（比如今天已发满，明天再跑）
+                self.clear_pause("暂停时间到，自动恢复")
+            elif not self._force_next:
+                out.append(self._paused_reason or "已暂停，等人工处理")
+
+        return out
+
     async def maybe_run(self) -> bool:
         """检查该不该跑一轮；该跑就跑。
 
@@ -215,37 +256,10 @@ class AutoScheduler:
         cfg = get_config()
         o = cfg.outreach
 
-        if not o.auto_mode:
+        blockers = self.blockers()
+        if blockers:
+            self.last_error = blockers[0]
             return False
-        if not o.enabled:
-            self.last_error = "触达功能没启用"
-            return False
-        if self.runner.is_running:
-            return False
-
-        # 冷却中不跑（真被限流了还要硬撞就是找死）
-        left = int(self.runner.risk_cooldown_left() or 0)
-        if left > 0:
-            self.last_error = f"限流冷却中，还剩 {left} 分钟"
-            return False
-
-        # 验证冷却中不跑（撞了拼图没人过 → 抖音还在冷却期里，硬冲只会再撞）
-        vleft = self._verify_cooldown_left()
-        if vleft > 0:
-            self.last_error = (
-                f"验证冷却中，还剩 {vleft} 分钟"
-                f"（撞了抖音拼图、这一轮没人过；到点自动重试）"
-            )
-            return False
-
-        # 暂停中：等人处理
-        if self._paused:
-            if self._paused_until and datetime.now() >= self._paused_until:
-                # 到点了自动恢复（比如今天已发满，明天再跑）
-                self.clear_pause("暂停时间到，自动恢复")
-            elif not self._force_next:
-                self.last_error = self._paused_reason or "已暂停，等人工处理"
-                return False
 
         # 间隔没到不跑
         if not self._force_next and self.last_run_at:
@@ -287,6 +301,16 @@ class AutoScheduler:
 
         self._after_round(result or {})
         return True
+
+    def note_round_result(self, result: dict) -> None:
+        """一轮跑完之后统一处理（撞验证 → 暂停、发满 → 暂停到明天）
+
+        给即时触达通道用（2026-11-18）：
+        即时触达虽然只跑一条，但它撞的**也是**抖音的风控，
+        必须和批量轮询一样：撞验证就停下来等人、飞书发红卡，
+        而不是硬撞下一条。
+        """
+        self._after_round(result or {})
 
     def _after_round(self, result: dict) -> None:
         """一轮跑完之后：判断要不要暂停"""

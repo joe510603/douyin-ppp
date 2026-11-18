@@ -1079,6 +1079,16 @@ async def on_startup():
     state._outreach_auto_task = loop.create_task(
         get_auto_scheduler().loop(), name="outreach-auto-loop"
     )
+
+    # 即时触达通道（2026-11-18 新增）
+    # 新线索一落库就入队，一轮到就发 —— 不等批量轮询。
+    # 和 auto_mode 独立：auto_mode 关着，这个也能开。
+    from src.outreach.instant_trigger import get_instant_trigger
+    await get_instant_trigger().start()
+    if get_config().outreach.auto_instant:
+        dry = "干跑" if get_config().outreach.auto_instant_dry_run else "真发"
+        log.info(f"⚡ 新线索即时触达已开启（{dry}）")
+
     if get_config().outreach.auto_mode:
         mode = "干跑" if get_config().outreach.auto_dry_run else "真发"
         log.info(
@@ -1111,6 +1121,13 @@ async def on_shutdown():
             await state._outreach_auto_task
         except asyncio.CancelledError:
             pass
+
+    # 即时触达通道
+    try:
+        from src.outreach.instant_trigger import get_instant_trigger
+        await get_instant_trigger().stop()
+    except Exception as e:
+        log.warning(f"停即时触达通道失败: {e}")
 
     # 停止检测线程（daemon 线程，主进程退出时自动终止）
     if hasattr(state, '_detection_thread') and state._detection_thread:

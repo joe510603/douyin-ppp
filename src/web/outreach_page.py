@@ -505,6 +505,131 @@ def create_outreach_page():
                 auto_gap.on_value_change(_save_auto_settings)
                 _refresh_auto_status()
 
+                # ---- ⚡ 新线索即时触达（2026-11-18 新增）----
+                #
+                # 和上面的「🤖 自动触达」是**两个独立开关**，互不影响：
+                #   自动触达 = 批量轮询（一轮一批，轮与轮之间有间隙）
+                #   即时触达 = 新线索一进池就单独发，**积压的旧线索一条都不碰**
+                #
+                # 为什么要分开放：批量触达适合「把积压清一清」，
+                # 即时触达适合「刚问完价的人还在直播间，这时候留言回复率最高」。
+                with ui.element("div").classes("w-full q-mt-sm q-pa-md").style(
+                    "background:#fff7ec; border:1px solid #e0a860; border-radius:8px;"
+                ):
+                    with ui.row().classes("w-full items-center q-gutter-sm"):
+                        ui.label("⚡ 新线索即时触达").classes(
+                            "text-body2 font-weight-bold"
+                        )
+
+                        instant_switch = ui.switch(
+                            "开启",
+                            value=bool(config.outreach.auto_instant),
+                        )
+
+                        instant_dry_switch = ui.switch(
+                            "干跑（不真发）",
+                            value=bool(config.outreach.auto_instant_dry_run),
+                        )
+
+                    with ui.row().classes("w-full items-center q-gutter-sm q-mt-xs"):
+                        instant_gap = ui.number(
+                            "最小间隔(秒)",
+                            value=int(config.outreach.auto_instant_gap_seconds),
+                            min=0, max=600, step=5,
+                        ).props("dense outlined").classes("col-4 col-sm-2 app-input")
+
+                        instant_hour = ui.number(
+                            "每小时上限",
+                            value=int(config.outreach.auto_instant_max_per_hour),
+                            min=0, max=120, step=1,
+                        ).props("dense outlined").classes("col-4 col-sm-2 app-input")
+
+                    instant_status = ui.label("").classes(
+                        "text-caption text-grey-7 q-mt-xs"
+                    )
+
+                    ui.label(
+                        "新线索一进池就单独发它一条 —— 积压的旧线索一条都不会被卷进来。"
+                        "「最小间隔」是两次即时触达之间的冷却：单条触达没有轮内间隔，"
+                        "不加这个，新线索密集时会连着发、直接撞风控。"
+                    ).classes("text-caption text-grey-7 q-mt-xs").style("line-height:1.7;")
+
+                def _refresh_instant_status():
+                    """刷新即时触达状态"""
+                    from ..outreach.instant_trigger import get_instant_trigger
+
+                    try:
+                        st = get_instant_trigger().status()
+                    except Exception as e:
+                        instant_status.text = f"（读取即时触达状态失败：{e}）"
+                        return
+
+                    if not st["configured"]:
+                        instant_status.text = "即时触达：未开启"
+                        return
+                    if not st["enabled"]:
+                        instant_status.text = (
+                            "即时触达：已打开开关，但「启用抖音触达」没开 → 不会跑"
+                        )
+                        return
+
+                    mode = "干跑" if st["dry_run"] else "真发"
+                    bits = [f"即时触达：运行中（{mode}）"]
+                    bits.append(f"待发 {st.get('queued', 0)} 条")
+                    bits.append(
+                        f"已发 {st.get('sent', 0)}　干跑 {st.get('dry', 0)}　"
+                        f"失败 {st.get('failed', 0)}"
+                    )
+                    if st.get("since_last_seconds"):
+                        bits.append(f"距上次 {st['since_last_seconds']} 秒")
+                    if st.get("last_error"):
+                        bits.append(f"（{st['last_error']}）")
+                    instant_status.text = "　".join(bits)
+
+                def _save_instant_settings():
+                    """保存即时触达设置"""
+                    from ..config import get_config, save_config, reload_config
+
+                    cfg = get_config()
+                    cfg.outreach.auto_instant = bool(instant_switch.value)
+                    cfg.outreach.auto_instant_dry_run = bool(instant_dry_switch.value)
+                    try:
+                        # ⚠ 别用 `or 30` —— 0 是合法值（不限速），
+                        #    `0 or 30` 会把用户的「0」悄悄变成 30
+                        cfg.outreach.auto_instant_gap_seconds = int(
+                            instant_gap.value
+                        ) if instant_gap.value is not None else 30
+                    except Exception:
+                        pass
+                    try:
+                        cfg.outreach.auto_instant_max_per_hour = int(
+                            instant_hour.value
+                        ) if instant_hour.value is not None else 20
+                    except Exception:
+                        pass
+                    save_config(cfg)
+                    reload_config()
+                    _refresh_instant_status()
+
+                def _toggle_instant():
+                    _save_instant_settings()
+                    if instant_switch.value:
+                        dry = "干跑" if instant_dry_switch.value else "真发"
+                        ui.notify(
+                            f"即时触达已开启（{dry}），新线索一进池就会发", type="positive"
+                        )
+                    else:
+                        ui.notify("即时触达已关闭", type="info")
+                    _refresh_instant_status()
+
+                instant_switch.on_value_change(_toggle_instant)
+                instant_dry_switch.on_value_change(_save_instant_settings)
+                instant_gap.on_value_change(_save_instant_settings)
+                instant_hour.on_value_change(_save_instant_settings)
+                _refresh_instant_status()
+                # 即时触达是「一直在动」的，状态要能实时看到队列在排空
+                ui.timer(2.0, _refresh_instant_status)
+
                 # 现在两个刷新函数都定义好了，统一刷一次
                 _refresh_outreach_info()
 

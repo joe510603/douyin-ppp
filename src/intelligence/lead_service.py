@@ -272,6 +272,27 @@ class LeadService:
         # ---- 写入多维表格（与群推送解耦：群推送关掉也不影响上表）----
         await self._maybe_sync_bitable(db, lead, result.level)
 
+        # ---- 新线索即时触达（2026-11-18 新增）----
+        #
+        # 放在**落库之后**：只有真正存进线索池了才算「新进线索」。
+        # 通知是**非阻塞**的 —— 触达通道慢或者坏了，都不能拖住实时采集链路。
+        #
+        # 只通知**这一条**，触达通道会按抖音号只处理它，
+        # 积压的旧线索一条都不会被卷进来。
+        try:
+            from ..outreach.instant_trigger import notify_new_lead
+
+            notify_new_lead({
+                "lead_id": lead_id,
+                "display_id": lead.display_id or "",
+                "nickname": lead.nickname or "",
+                "intent_level": lead.intent_level,
+                "intent_score": lead.intent_score,
+            })
+        except Exception as e:
+            # 通知失败**绝不能**影响线索落库 —— 这里只记日志
+            log.warning(f"即时触达通知失败（不影响线索落库）: {e}")
+
         # 是否需要推飞书
         if not self.config.lead.realtime_push:
             return
