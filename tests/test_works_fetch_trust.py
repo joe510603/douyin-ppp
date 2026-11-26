@@ -320,3 +320,64 @@ def test_抓不到不是限流也不是验证():
     账号被限要等解封，要验证码要人过 —— 方向完全不一样。
     """
     assert normalize_kind("works") not in ("verify", "login", "limit")
+
+
+# ============================================================
+# 5. 飞书回拉不能把修复盖回去
+# ============================================================
+
+def _回拉会不会采纳(local_status: str, synced: str, remote_os: str) -> bool:
+    """复刻 lead_service.pull_bitable_status 的判据
+
+    返回 True = 回拉会把飞书的值盖到本地。
+    规则（跟线上代码一致）：
+      · 有同步标记 → 本地状态 == 标记里的值 就算「本地没改过」→ 采纳飞书
+      · 没同步标记 → 本地是默认值就算「本地没改过」→ 采纳飞书
+    """
+    from src.notify.bitable import OUTREACH_LABELS, STATUS_LABELS
+
+    local_st = STATUS_LABELS.get("new", "待处理")
+    local_os = OUTREACH_LABELS.get(local_status, "待触达")
+    if synced:
+        s_st, _, s_os = synced.partition("|")
+        unchanged = (local_st == (s_st or "").strip()) and (
+            local_os == (s_os or "").strip())
+    else:
+        unchanged = local_st == "待处理" and local_os == "待触达"
+    if not unchanged:
+        return False
+    # 采纳飞书的值：只有飞书的值跟本地不同才会真的改
+    return remote_os != local_os
+
+
+def test_修复前回拉会把修复盖回去():
+    """事故复现：修复只改本地 → 5 分钟后被回拉推翻（实测 323→274 被盖回）
+
+    根因：这些线索**从没同步过**状态（标记为空）→
+    回拉认为「本地还是默认值」→ 无条件采纳飞书里的旧值「已跳过」。
+    """
+    # 修复后本地是 pending，但标记还空着 → 回拉会采纳飞书的「已跳过」
+    assert _回拉会不会采纳("pending", "", "已跳过") is True
+
+
+def test_修复后回拉盖不回去():
+    """修复必须**写飞书 + 对齐同步标记**，两边才一致
+
+    只改本地（不管飞书）→ 下一个回拉周期就被推翻；
+    这条测试钉住「写飞书成功 → 标记对齐 → 本地==标记==飞书」这条正确姿势。
+    """
+    from src.notify.bitable import OUTREACH_LABELS, STATUS_LABELS
+
+    local_st = STATUS_LABELS.get("new", "待处理")
+    synced = f"{local_st}|待触达"          # 写飞书成功后对齐
+    # 飞书那边也已经是「待触达」→ 回拉采纳的值 == 本地值 → 不会改
+    assert _回拉会不会采纳("pending", synced, "待触达") is False
+
+
+def test_修复脚本必须写飞书并对齐同步标记():
+    """静态审计：修复脚本少了这两步，历史修复会被回拉推翻"""
+    src = (pathlib.Path(__file__).resolve().parent.parent
+           / "scripts" / "repair_no_works_misjudge.py").read_text(encoding="utf-8")
+    assert "bitable_synced_status" in src, "修复必须对齐同步标记，否则被回拉盖回"
+    assert "patch_fields" in src, "修复必须把「待触达」写回飞书，否则回拉会盖回"
+    assert "待触达" in src, "写回飞书的值必须是「待触达」"

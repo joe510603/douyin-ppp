@@ -359,6 +359,12 @@ class OutreachRunner:
         # 而实际上账号是好的，扫码也没用。
         if "搜索接口" in n or "搜索被限流" in n or "网页版搜索" in n:
             return KIND_SEARCH
+        # ⚠️ works 也要**排在 limit 前面**（2026-11-26）：
+        # 作品限流的文案里带了「限流」两个字（「等限流过去或换网络」），
+        # 先判 limit 会把它误当成「账号被限流」→ 锁 120 分钟冷却 + 发错通知，
+        # 而实际上账号是好的，扫码也没用，错的只是「取作品列表」这一条路。
+        if "作品列表" in n or "抓不到作品" in n or "作品接口" in n:
+            return KIND_WORKS
         if any(k in n for k in ("限流", "软风控", "操作频繁", "访问频繁",
                                  "账号存在异常", "环境异常")):
             return KIND_LIMIT

@@ -199,13 +199,19 @@ def test_网页横幅认得全部停手种类():
     2026-11-12 又加了 ``search``（抖音网页版搜索接口被限流）：
     账号是好的、扫码没用、不该锁冷却——所以必须是**独立**的一种，
     混进 limit 就会误锁 120 分钟 + 发错通知。
+
+    2026-11-26 又加了 ``works``（抖音作品列表接口被限流）：
+    同样是「账号是好的、不是验证码」，但方向又不一样 ——
+    混进 limit 会说成「账号被限流」，把人引到换号/扫码的错误方向；
+    混进 verify 会喊人来过验证码（根本没验证码）。
     """
     from src.outreach.douyin_api import (
-        KIND_LIMIT, KIND_LOGIN, KIND_SEARCH, KIND_VERIFY,
+        KIND_LIMIT, KIND_LOGIN, KIND_SEARCH, KIND_VERIFY, KIND_WORKS,
     )
     from src.web.outreach_page import STOP_KINDS
 
-    assert set(STOP_KINDS) == {KIND_VERIFY, KIND_LIMIT, KIND_LOGIN, KIND_SEARCH}, (
+    assert set(STOP_KINDS) == {KIND_VERIFY, KIND_LIMIT, KIND_LOGIN, KIND_SEARCH,
+                               KIND_WORKS}, (
         f"网页横幅的 kind 集合跟后端对不上：{STOP_KINDS}"
     )
 
@@ -215,7 +221,8 @@ def test_网页不再用旧的captcha词汇():
     from src.web.outreach_page import STOP_KINDS
 
     assert "captcha" not in STOP_KINDS
-    assert all(k in ("verify", "limit", "login", "search") for k in STOP_KINDS)
+    assert all(k in ("verify", "limit", "login", "search", "works")
+               for k in STOP_KINDS)
 
 
 # ============================================================

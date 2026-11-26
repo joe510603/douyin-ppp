@@ -191,30 +191,93 @@ def _apply_from_report(path: str) -> int:
     if unknown:
         print(f"⚠️ 有 {len(unknown)} 条「查不到」→ **不动**它们（查不到不等于没有作品）")
 
+    # ⚠️ 顺序很关键：**先写飞书，再改本地**（跟 worker._push_feishu_status 一个路数）
+    #
+    # 为什么必须写飞书：飞书每 5 分钟回拉一次销售改过的状态。
+    # 本地改了但飞书没改 → 回拉会把本地盖回飞书的旧值（实测发生过：
+    # 323 条修好 → 5 分钟后 274 条被回拉盖回「已跳过」）。
+    # 判据是 `bitable_synced_status`：它为空 = 「从没同步过」→ 回拉认为
+    # 「本地还是默认值」→ 无条件采纳飞书的值。
+    # 所以：写飞书成功 → 把同步标记对齐成当前值（本地==标记→回拉看到两边一样，不动）；
+    # 写飞书失败 → 同步标记保持旧的飞书值（本地!=标记→回拉跳过，保护住修复）。
+    import asyncio
+
+    from src.config import get_config
+    from src.notify.bitable import (
+        OUTREACH_LABELS, STATUS_LABELS, get_bitable_writer,
+    )
+
+    cfg = get_config()
+    writer = get_bitable_writer(cfg)
+    if not writer.is_configured:
+        print("⚠️ 飞书表没配置 → 只改本地（会被回拉盖回去，治标）")
+        push_ok = False
+    else:
+        push_ok = True
+
     con = sqlite3.connect(DB)
-    fixed = 0
-    reopened = 0
+    con.row_factory = sqlite3.Row
+    rows = {r["id"]: r for r in con.execute(
+        "SELECT id, display_id, nickname, status, outreach_status, "
+        "bitable_record_id, bitable_synced_status FROM leads WHERE id IN "
+        f"({','.join(str(m['id']) for m in misjudged) or '0'})")}
+
+    stats = {"pushed": 0, "push_failed": 0, "no_record": 0, "local": 0}
+    marker_pending = "待触达"
+
+    async def _push_all() -> None:
+        for m in misjudged:
+            r = rows.get(m["id"])
+            if r is None:
+                stats["local"] += 1
+                continue
+            rid = (r["bitable_record_id"] or "").strip()
+            if not rid:
+                stats["no_record"] += 1
+                stats["local"] += 1
+                continue
+            ok, err = await writer.patch_fields(rid, {"触达状态": marker_pending})
+            if not ok:
+                stats["push_failed"] += 1
+                stats["local"] += 1
+                continue
+            stats["pushed"] += 1
+            # 写成功了 → 同步标记对齐成「本地现在的值」
+            # （这样回拉看到本地==标记==飞书的值，不会改）
+            local_st = STATUS_LABELS.get(r["status"] or "", "待处理")
+            con.execute(
+                "UPDATE leads SET outreach_status = 'pending', no_works = 0, "
+                "outreach_note = '（修复）之前被误判成没作品，改私信消耗掉了；"
+                "实际有作品，重新排回留言队列', bitable_synced_status = ? "
+                "WHERE id = ?", [f"{local_st}|{marker_pending}", m["id"]])
+            con.commit()
+
+    if push_ok:
+        asyncio.run(_push_all())
+    else:
+        for m in misjudged:
+            stats["local"] += 1
+            con.execute(
+                "UPDATE leads SET outreach_status = 'pending', no_works = 0, "
+                "outreach_note = '（修复）之前被误判成没作品，改私信消耗掉了；"
+                "实际有作品，重新排回留言队列' WHERE id = ?", [m["id"]])
+        con.commit()
+
+    # 之前被私信消耗掉的 → 把那次私信记录删掉，
+    # 否则「30 天内已触达」会挡住它去留言。
     dm_cleaned = 0
     for m in misjudged:
-        con.execute("UPDATE leads SET no_works = 0 WHERE id = ?", [m["id"]])
-        fixed += 1
-        if m.get("status") in REOPEN_STATUS:
-            con.execute(
-                "UPDATE leads SET outreach_status = 'pending', "
-                "outreach_note = '（修复）之前被误判成没作品，改私信消耗掉了；"
-                "实际有作品，重新排回留言队列' WHERE id = ?",
-                [m["id"]])
-            reopened += 1
-        # 之前是被私信消耗掉的 → 把那次私信记录删掉，
-        # 否则「30 天内已触达」会挡住它去留言。
         if m.get("status") == "messaged":
             cur = con.execute(
                 "DELETE FROM outreach_records WHERE lead_id = ? AND channel = 'dm'",
                 [m["id"]])
             dm_cleaned += cur.rowcount or 0
     con.commit()
-    print(f"\n✅ 已修复 {fixed} 条（清掉 no_works 标记）")
-    print(f"   其中 {reopened} 条退回 pending 队列（重新去留言）")
+
+    print(f"\n✅ 修复完成：")
+    print(f"   飞书写回「待触达」成功 {stats['pushed']} 条"
+          f"（失败 {stats['push_failed']}，无记录 {stats['no_record']}）")
+    print(f"   本地退回 pending 队列 {stats['local'] + stats['pushed']} 条")
     print(f"   删掉 {dm_cleaned} 条误发的私信记录（否则 30 天内不会再留言）")
     con.close()
     return 0

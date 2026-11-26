@@ -281,7 +281,9 @@ def test_网页横幅认得search():
     from src.web.outreach_page import STOP_KINDS
 
     assert KIND_SEARCH in STOP_KINDS
-    assert set(STOP_KINDS) == {"verify", "limit", "login", "search"}
+    # 2026-11-26 新增 works（作品列表接口被限流）——也是独立的一种，
+    # 混进 limit 会把方向说反（账号是好的，错的只是取作品这一条路）
+    assert set(STOP_KINDS) == {"verify", "limit", "login", "search", "works"}
 
 
 def test_搜索限流的停手文案不会被误判成账号限流():
