@@ -90,6 +90,18 @@ KIND_SEARCH = "search"
 # 现在私信熔断只停私信通道，评论照发，告警也只说私信的事。
 KIND_DM = "dm"
 
+# 作品列表接口单独被降级（2026-11-26 加）
+#
+# 为什么单独一种：抖音把「主页作品列表」这个接口静默降级时，
+# 页面自己发的请求会回到 **HTTP 200 + 0 字节**，主页的作品网格也渲染不出来。
+# 这跟账号被限、搜索被限、私信被限**都���一样**：
+#   · 账号照常能用（弹幕在收、私信能发、资料接口正常）
+#   · 只有「取作品列表」这一条路被挡
+# 以前把它当成「这个人没作品」→ 改发私信 + 永久标记 no_works，
+# 于是**有作品的人被私信消耗掉、再也不会留言**（抽样 14 条里 9 条是误判）。
+# 现在：抓不到 = 「不知道」→ 退回队列等通道恢复，绝不当成「没有」。
+KIND_WORKS = "works"
+
 # ---- 私信失败的三种分类（2026-11-15 加）----
 #
 # 为什么��要分：以前私信发不出去只有「成功/失败」两种，
@@ -119,6 +131,8 @@ def normalize_kind(kind: str) -> str:
         return KIND_SEARCH
     if k in ("dm", "私信", "私信被限"):
         return KIND_DM
+    if k in ("works", "作品", "作品列表", "作品接口"):
+        return KIND_WORKS
     return KIND_LIMIT
 
 
@@ -148,6 +162,25 @@ class RiskControl(DouyinError):
 
 class NoWorks(DouyinError):
     """这个人没有公开作品（或作品全私密），没法留言。属于「跳过」，不是故障。"""
+
+
+class WorksUnreachable(DouyinError):
+    """**作品列表抓不到** —— 不是「这个人没有作品」。
+
+    2026-11-26 实测（探针证据，实验组+对照组一致）：
+        · 页面自己发的 ``/aweme/v1/web/aweme/post/`` 回到 **HTTP 200 + 0 字节**
+        · 主页作品网格（``[data-e2e="user-post-list"]``）里 **0 条**
+        · 老接口 ``iesdouyin /web/api/v2/aweme/post/`` 同样 **0 字节**
+        · 同期资料接口正常（4365 字节，aweme_count 拿得到）、弹幕正常、私信能发
+          → 只有「取作品列表」这一条路被平台降级（IP 级）
+
+    以前把这种「抓不到」当成「没有作品」→ 改发私信 + 永久标记 no_works，
+    结果 **543 条线索被误判**（抽样 14 条里 9 条实际有 5~107 条作品），
+    有作品的人被私信消耗掉，而且因为 no_works 标记，再也不会去留言。
+
+    **「看不见」≠「不存在」**：抓不到必须是「不知道」，
+    退回队列等通道恢复，不能当成业务结论。
+    """
 
 
 class LeadNotFound(DouyinError):
@@ -259,6 +292,17 @@ class Douyin:
         # 主页作品缓存（sec_uid → 作品列表）
         # 已知 sec_uid 时「定位」和「挑作品」合成一次开页面，省一半时间
         self._works_cache: dict[str, list[dict]] = {}
+        # ---- 最近一次「取作品列表」的可信度（2026-11-26 加）----
+        #
+        # status 只有三种：
+        #   ok     = 真拿到作品了
+        #   empty  = **确实**没有作品（接口正常返回、aweme_list 是空数组）
+        #   failed = **抓不到**（接口 200 但响应体是空的 / 压根没响应 / 页面没渲染）
+        #
+        # 「empty」和「failed」的区别就是这次修复的全部意义：
+        # 以前两者都当成「没作品」→ 私信消耗线索 + 永久标记。
+        # 现在只有 empty 才允许私信；failed 抛 WorksUnreachable 退回队列。
+        self.last_works_fetch: dict = {"status": "", "detail": ""}
         try:
             page.on("response", self._on_decision)
         except Exception:
@@ -1453,6 +1497,13 @@ class Douyin:
             except Exception:
                 pass
 
+        # ⚠ evidence 用来判「抓不到」还是「真没有」（2026-11-26 加）
+        #
+        # 抖音把作品接口静默降级时，页面自己发的请求回到 **HTTP 200 + 0 字节**：
+        #   · 没命中任何响应      → 压根没跑起来
+        #   · 命中了但响应体是空  → 被降级（empty_bodies > 0）
+        #   · 命中了且是合法 JSON → **可信**（哪怕 aweme_list 是空数组 = 真没作品）
+        ev1: dict = {}
         data = self._capture(
             "/aweme/v1/web/aweme/post/",
             do_open,
@@ -1462,7 +1513,9 @@ class Douyin:
             #   原来 2000ms —— 每条线索白等 2 秒。
             #   作品列表是一次性返回的，等 800ms 足够。
             settle=800,
+            evidence=ev1,
         )
+        ev2: dict = {}
         if not any((j.get("aweme_list") or []) for j in data):
             # 再滚一次给它机会（有的号挂载慢）
             data += self._capture(
@@ -1471,7 +1524,13 @@ class Douyin:
                 timeout=6000,
                 expect=lambda j: bool(j.get("aweme_list")),
                 settle=600,
+                evidence=ev2,
             )
+        # **可信** = 拿到了带 aweme_list 字段的合法 JSON（哪怕是空数组）
+        trusted = any(isinstance(j, dict) and "aweme_list" in j for j in data)
+        hits = int(ev1.get("hits", 0)) + int(ev2.get("hits", 0))
+        empties = int(ev1.get("empty_bodies", 0)) + int(ev2.get("empty_bodies", 0))
+        statuses = list(ev1.get("statuses") or []) + list(ev2.get("statuses") or [])
         self.check_risk()
         works: list[dict] = []
         for j in data:
@@ -1502,6 +1561,10 @@ class Douyin:
                 uniq.append(w)
         uniq.sort(key=lambda x: x.get("create_time") or 0, reverse=True)
         if uniq:
+            self.last_works_fetch = {
+                "status": "ok",
+                "detail": f"接口拿到 {len(uniq)} 条（命中 {hits} 次，状态 {statuses}）",
+            }
             return uniq
 
         # ---- DOM 兜底（接口空 / 没捕获到）----
@@ -1533,7 +1596,32 @@ class Douyin:
                 dom.append({"aweme_id": aid, "desc": desc or "", "create_time": 0})
         if dom:
             self.log(f"  接口没给作品，从作品网格拿到 {len(dom)} 个")
+            self.last_works_fetch = {
+                "status": "ok",
+                "detail": f"DOM 兜底拿到 {len(dom)} 条（接口命中 {hits} 次，空响应 {empties} 次）",
+            }
             return dom
+
+        # ---- 到这里：作品列表是空的 ----
+        #
+        # 必须分清两种「空」（2026-11-26 修的真 bug）：
+        #   trusted=True  → 接口正常返回、aweme_list 就是空数组 → **这个人确实没作品**
+        #   trusted=False → 接口 200 但响应体是空的 / 压根没响应 / 页面没渲染
+        #                    → **我们抓不到**，不是「他没作品」
+        # 后者以前被当成「没作品」→ 改发私信 + 永久标记 no_works，
+        # 于是有作品的人被私信消耗掉、再也不会留言（543 条误判）。
+        self.last_works_fetch = {
+            "status": "empty" if trusted else "failed",
+            "detail": (
+                f"接口命中 {hits} 次（空响应体 {empties} 次，状态 {statuses}），"
+                + ("接口说就是没有" if trusted else "响应体是空的/压根没响应 —— 抓不到，不是没有")
+            ),
+        }
+        if not trusted:
+            self.log(
+                f"  ⚠️ 作品列表**抓不到**（接口命中 {hits} 次，空响应体 {empties} 次）"
+                "—— 这不是「这个人没作品」，退回队列等通道恢复"
+            )
         return []
 
     # ------------------------------------------------------------ 发留言

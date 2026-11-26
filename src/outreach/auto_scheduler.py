@@ -41,7 +41,7 @@ from typing import Optional
 
 from ..config import get_config
 from ..utils.logger import get_logger
-from .douyin_api import KIND_LIMIT, KIND_LOGIN, KIND_SEARCH, KIND_VERIFY
+from .douyin_api import KIND_LIMIT, KIND_LOGIN, KIND_SEARCH, KIND_VERIFY, KIND_WORKS
 
 log = get_logger("outreach_auto")
 
@@ -361,6 +361,25 @@ class AutoScheduler:
             self._pause(
                 f"抖音网页版搜索接口被限流，{minutes} 分钟后自动重试"
                 f"（线索没丢，都还在队列里）",
+                kind,
+                until=until,
+            )
+            return
+
+        if kind == KIND_WORKS:
+            # 作品列表接口被限 → 暂停一段时间，到点自动重试。
+            #
+            # 为什么必须暂停（2026-11-26）：
+            #   作品接口被降级时，每一条线索都会被误判成「没作品」→ 改发私信。
+            #   实测一天下来 543 条被误判，其中 23 条已经被私信消耗掉 ——
+            #   有作品的老客户就这样被私信顶掉了，再也不会留言。
+            #   现在 worker 会把抓不到的线索退回队列（不消耗），
+            #   但也别一轮接一轮地撞——限流窗口只会越拖越长。
+            minutes = max(1, int(getattr(o, "works_pause_minutes", 30) or 30))
+            until = datetime.now() + timedelta(minutes=minutes)
+            self._pause(
+                f"抖音作品列表接口被限流，{minutes} 分钟后自动重试"
+                f"（线索没丢，都退回队列了，一条都没消耗）",
                 kind,
                 until=until,
             )

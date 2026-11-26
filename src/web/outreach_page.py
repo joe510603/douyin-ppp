@@ -768,6 +768,8 @@ def create_outreach_page():
                     "unshown": "已提交未展示", "risk": "风控", "need_login": "要登录",
                     "captcha_wait": "等验证", "captcha_resumed": "已继续",
                     "captcha_timeout": "验证超时",
+                    # 退回队列（没消耗这条线索，等通道恢复再来）
+                    "retry": "退回队列",
                 }
 
                 def _console_tick():
