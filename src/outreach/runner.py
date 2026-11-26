@@ -32,7 +32,7 @@ from ..config import get_config
 from ..storage.db_storage import get_db
 from ..utils.logger import get_logger
 from .douyin_api import (
-    KIND_LIMIT, KIND_LOGIN, KIND_SEARCH, KIND_VERIFY, normalize_kind,
+    KIND_LIMIT, KIND_LOGIN, KIND_SEARCH, KIND_VERIFY, KIND_WORKS, normalize_kind,
 )
 from .store import OutreachStore
 
@@ -567,6 +567,14 @@ class OutreachRunner:
                     f"🔍 抖音网页版搜索被限流：{event.get('error')}\n"
                     "   → 账号是好的、扫码没用；等一会儿它自己会恢复，"
                     "下次不用再搜这些号（已记住抖音 ID）"
+                )
+            elif kind == KIND_WORKS:
+                self._append_log(
+                    f"🧱 抖音作品列表接口被限流：{event.get('error')}\n"
+                    "   → **账号是好的，不用扫码，也不是验证码**；"
+                    "只���「取作品列表」这一条路被挡了\n"
+                    "   → 线索都退回队列了，**一条都没消耗**；"
+                    "等它自己恢复（或换个网络）就会继续走留言"
                 )
             else:
                 self._append_log(

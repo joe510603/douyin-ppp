@@ -90,7 +90,13 @@ def main() -> int:
     ap.add_argument("--apply", action="store_true", help="真正改库（默认只报告）")
     ap.add_argument("--limit", type=int, default=0, help="只处理前 N 条（0 = 全部）")
     ap.add_argument("--gap", type=float, default=1.5, help="每次请求之间的间隔秒")
+    ap.add_argument("--from-report", default="",
+                    help="直接用已有报告落库（不再调接口）—— "
+                         "默认 data/logs/repair_no_works_misjudge_dryrun.json")
     args = ap.parse_args()
+
+    if args.from_report:
+        return _apply_from_report(args.from_report)
 
     con = sqlite3.connect(DB)
     con.row_factory = sqlite3.Row
@@ -160,6 +166,57 @@ def main() -> int:
         {"misjudged": misjudged, "real_none": real_none, "unknown": unknown},
         ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"明细已存：{report}")
+    return 0
+
+
+def _apply_from_report(path: str) -> int:
+    """直接用已有报告落库（不再调接口）
+
+    为什么要留这条路：核对要一条条调接口（534 条 ≈ 35 分钟），
+    而且老接口会静默限流，多跑一遍就多一轮被限流的风险。
+    报告里的结论已经够用（aweme_count 是接口原样返回的），直接落库即可。
+    """
+    p = pathlib.Path(path)
+    if not p.exists():
+        p = pathlib.Path("data/logs/repair_no_works_misjudge_dryrun.json")
+    if not p.exists():
+        print("找不到报告文件，先跑一次不带 --apply 的核对")
+        return 2
+    data = json.loads(p.read_text(encoding="utf-8"))
+    misjudged = data.get("misjudged") or []
+    unknown = data.get("unknown") or []
+    print(f"报告：{p}")
+    print(f"误判 {len(misjudged)} / 真没作品 {len(data.get('real_none') or [])} / "
+          f"查不到 {len(unknown)}")
+    if unknown:
+        print(f"⚠️ 有 {len(unknown)} 条「查不到」→ **不动**它们（查不到不等于没有作品）")
+
+    con = sqlite3.connect(DB)
+    fixed = 0
+    reopened = 0
+    dm_cleaned = 0
+    for m in misjudged:
+        con.execute("UPDATE leads SET no_works = 0 WHERE id = ?", [m["id"]])
+        fixed += 1
+        if m.get("status") in REOPEN_STATUS:
+            con.execute(
+                "UPDATE leads SET outreach_status = 'pending', "
+                "outreach_note = '（修复）之前被误判成没作品，改私信消耗掉了；"
+                "实际有作品，重新排回留言队列' WHERE id = ?",
+                [m["id"]])
+            reopened += 1
+        # 之前是被私信消耗掉的 → 把那次私信记录删掉，
+        # 否则「30 天内已触达」会挡住它去留言。
+        if m.get("status") == "messaged":
+            cur = con.execute(
+                "DELETE FROM outreach_records WHERE lead_id = ? AND channel = 'dm'",
+                [m["id"]])
+            dm_cleaned += cur.rowcount or 0
+    con.commit()
+    print(f"\n✅ 已修复 {fixed} 条（清掉 no_works 标记）")
+    print(f"   其中 {reopened} 条退回 pending 队列（重新去留言）")
+    print(f"   删掉 {dm_cleaned} 条误发的私信记录（否则 30 天内不会再留言）")
+    con.close()
     return 0
 
 
