@@ -541,7 +541,7 @@ def create_outreach_page():
                         ).props("dense outlined").classes("col-4 col-sm-2 app-input")
 
                         instant_hour = ui.number(
-                            "每小时上限",
+                            "每小时上限（0=不限）",
                             value=int(config.outreach.auto_instant_max_per_hour),
                             min=0, max=120, step=1,
                         ).props("dense outlined").classes("col-4 col-sm-2 app-input")
@@ -606,7 +606,7 @@ def create_outreach_page():
                     try:
                         cfg.outreach.auto_instant_max_per_hour = int(
                             instant_hour.value
-                        ) if instant_hour.value is not None else 20
+                        ) if instant_hour.value is not None else 0
                     except Exception:
                         pass
                     save_config(cfg)

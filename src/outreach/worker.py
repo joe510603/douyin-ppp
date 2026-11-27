@@ -729,6 +729,26 @@ class OutreachWorker:
         finally:
             self.waiting_human = False
 
+    def _有新线索在排队(self) -> bool:
+        """即时触达队列里有没有等着发的新线索？
+
+        「新线索及时触达」的优先级**高于**批量触达：
+        用户要的是「新线索一进来就立刻触达，老的抖音号不管」。
+        批量触达一轮要跑十几分钟，不让路的话新线索就得等那么久。
+
+        ⚠ 延迟导入：``instant_trigger`` 会 import ``runner``，
+        这里再 import 它容易变成循环依赖（函数内导入就没事）。
+        """
+        try:
+            from .instant_trigger import get_instant_trigger
+
+            it = get_instant_trigger()
+            if not it.enabled:
+                return False
+            return int(it.status().get("queued") or 0) > 0
+        except Exception:
+            return False
+
     def _release_current_lead(self) -> None:
         """把「手上正在处理」的那条线索退回待触达
 
@@ -1517,6 +1537,15 @@ class OutreachWorker:
 
                     # 节奏控制
                     if idx < len(picked) and not self.stop_reason:
+                        # ⚠ 新线索优先（2026-11-27 用户要求「及时触达」）：
+                        #   批量触达连续跑的时候，即时触达会被
+                        #   「已有触达任务在跑」挡住 → 新线索要等整轮跑完
+                        #   （一轮 30 条可能十几分钟），那就不叫「及时」了。
+                        #   所以这里**主动让路**：有新线索排队就先收工，
+                        #   让即时触达先发（剩下的老线索下一轮再说）。
+                        if self._有新线索在排队():
+                            self.log("  ↩ 有新线索排队，先让即时触达发（老线索下一轮）")
+                            break
                         rest_every = int(o.rest_every or 0)
                         if rest_every and sent_in_run and sent_in_run % rest_every == 0:
                             rest = random.randint(int(o.rest_min or 120), int(o.rest_max or 240))

@@ -89,7 +89,8 @@ def cfg_instant(monkeypatch):
     o.auto_instant = False
     o.auto_instant_dry_run = True
     o.auto_instant_gap_seconds = 30
-    o.auto_instant_max_per_hour = 20
+    # 2026-11-27：默认改成「不封顶」（0），恢复成默认值而不是旧的 20
+    o.auto_instant_max_per_hour = 0
     o.enabled = False
 
 
@@ -393,3 +394,91 @@ def test_blockers_忽略_auto_mode(cfg_instant):
     s = AutoScheduler(r)
     assert s.blockers() != [], "普通检查应该被 auto_mode 挡住"
     assert s.blockers(ignore_auto_mode=True) == [], "忽略 auto_mode 时不该被挡"
+
+
+# ============================================================
+# 不设数量限制（2026-11-27 用户要求）
+# ============================================================
+
+def test_每小时上限零表示不封顶(cfg_instant):
+    """用户要求「新线索及时触达，不设数量限制」→ 上限 0 = 不封顶
+
+    ⚠ 0 是合法取值：``int(cap or 20)`` 会把 0 变成 20（0 是 falsy），
+    那样「不封顶」就变成了「每小时最多 20 条」——正好跟用户要求相反。
+    """
+    cfg_instant.auto_instant_max_per_hour = 0
+    t = InstantTrigger()
+    # 假装这一小时已经发了 999 条
+    t._sent_times = [time.time() - 10] * 999
+    assert t._hour_cap_reached() is False, "上限 0 时不该封顶"
+
+    cfg_instant.auto_instant_max_per_hour = 20
+    t2 = InstantTrigger()
+    t2._sent_times = [time.time() - 10] * 25
+    assert t2._hour_cap_reached() is True, "有上限时该封顶（老逻辑没被改坏）"
+
+
+def test_默认配置就是不限():
+    """默认值必须是不封顶（用户明确要求）"""
+    from src.config import Settings
+
+    # 用**新的实例**看默认值 —— 全局单例被测试夹具改过，不能拿它当默认值
+    assert int(Settings().outreach.auto_instant_max_per_hour) == 0
+
+
+# ============================================================
+# 新线索优先：批量触达要让路（否则新线索要等整轮跑完）
+# ============================================================
+
+def test_批量触达会给新线索让路(cfg_instant, monkeypatch):
+    """即时触达队列非空时，批量这一轮提前收工
+
+    不让路的话：新线索要等批量跑完一整轮（30 条，可能十几分钟），
+    那就不叫「及时触达」了。
+    """
+    import src.outreach.instant_trigger as it_mod
+    from src.outreach.worker import OutreachWorker
+
+    class _FakeTrigger:
+        enabled = True
+
+        def status(self):
+            return {"queued": 3}
+
+    monkeypatch.setattr(it_mod, "get_instant_trigger", lambda: _FakeTrigger())
+    w = OutreachWorker.__new__(OutreachWorker)   # 只为调那个方法，不建库
+    assert w._有新线索在排队() is True
+
+    class _EmptyTrigger:
+        enabled = True
+
+        def status(self):
+            return {"queued": 0}
+
+    monkeypatch.setattr(it_mod, "get_instant_trigger", lambda: _EmptyTrigger())
+    assert w._有新线索在排队() is False
+
+    class _OffTrigger:
+        enabled = False
+
+        def status(self):
+            return {"queued": 9}
+
+    monkeypatch.setattr(it_mod, "get_instant_trigger", lambda: _OffTrigger())
+    assert w._有新线索在排队() is False, "即时触达关着时不该让路"
+
+
+def test_即时触达关了批量照常跑(cfg_instant, monkeypatch):
+    """让路逻辑不能把批量触达弄停（关着即时触达时必须照常）"""
+    import src.outreach.instant_trigger as it_mod
+    from src.outreach.worker import OutreachWorker
+
+    class _OffTrigger:
+        enabled = False
+
+        def status(self):
+            return {"queued": 5}
+
+    monkeypatch.setattr(it_mod, "get_instant_trigger", lambda: _OffTrigger())
+    w = OutreachWorker.__new__(OutreachWorker)
+    assert w._有新线索在排队() is False
