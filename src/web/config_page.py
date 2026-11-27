@@ -676,9 +676,9 @@ def create_config_page():
 
         with ui.row().classes("w-full items-end q-col-gutter-sm"):
             outreach_daily = ui.number(
-                "每日留言上限",
+                "每日留言上限（0=不限）",
                 value=config.outreach.daily_limit,
-                min=1, max=200, step=1,
+                min=0, max=2000, step=1,
             ).props("dense outlined").classes("col-6 col-sm-2 app-input")
 
             outreach_min_delay = ui.number(
@@ -852,7 +852,8 @@ def create_config_page():
 
         def save_outreach_config():
             config.outreach.enabled = outreach_enabled_switch.value
-            config.outreach.daily_limit = int(outreach_daily.value or 30)
+            config.outreach.daily_limit = int(
+                outreach_daily.value if outreach_daily.value is not None else 0)
             config.outreach.min_delay = float(outreach_min_delay.value or 45)
             config.outreach.max_delay = float(outreach_max_delay.value or 120)
             config.outreach.adaptive_delay = bool(outreach_adaptive_switch.value)

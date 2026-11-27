@@ -381,3 +381,29 @@ def test_修复脚本必须写飞书并对齐同步标记():
     assert "bitable_synced_status" in src, "修复必须对齐同步标记，否则被回拉盖回"
     assert "patch_fields" in src, "修复必须把「待触达」写回飞书，否则回拉会盖回"
     assert "待触达" in src, "写回飞书的值必须是「待触达」"
+
+
+# ============================================================
+# 6. 回拉的竞态：本地刚改过的，不能被旧快照盖回去
+# ============================================================
+
+def test_回拉不覆盖本轮刚改过的线索():
+    """回拉先读飞书快照、再逐条比对 —— 这中间本地改了就该以本地为准
+
+    实测（2026-11-26）：批量修复 323 条时，正在处理中的 3 条
+    被回拉拿**旧快照**盖回「已跳过」。
+    """
+    from datetime import datetime, timedelta
+
+    from src.intelligence.lead_service import _本地状态比快照新
+
+    snapshot = datetime.now()
+    fmt = "%Y-%m-%d %H:%M:%S"
+    # 本轮开始前 10 分钟改的 → 不是「比快照新」→ 回拉照常采纳飞书的值
+    assert _本地状态比快照新(
+        (snapshot - timedelta(minutes=10)).strftime(fmt), snapshot) is False
+    # 本轮开始后改的 → 比快照新 → 这一轮不能拿飞书的旧快照覆盖它
+    assert _本地状态比快照新(snapshot.strftime(fmt), snapshot) is True
+    # 没有时间戳 / 乱码 → 不当成本轮改的（老数据别被误伤）
+    assert _本地状态比快照新("", snapshot) is False
+    assert _本地状态比快照新("不是时间", snapshot) is False

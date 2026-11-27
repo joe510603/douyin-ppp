@@ -244,8 +244,12 @@ class InstantTrigger:
                 sent_today = int(runner.sent_today() or 0)
             except Exception:
                 sent_today = 0
-            if sent_today >= int(o.daily_limit or 0):
-                self.last_error = f"今日已发满 {sent_today}/{o.daily_limit}"
+            # ⚠️ daily_limit = 0 表示**不限**（2026-11-27 用户要求）
+            #   原来写的是 `int(o.daily_limit or 0)`，daily_limit=0 时算出 0，
+            #   而 `sent_today >= 0` 永远成立 → 即时触达会**一条都发不出去**。
+            daily_limit = int(o.daily_limit if o.daily_limit is not None else 0)
+            if daily_limit > 0 and sent_today >= daily_limit:
+                self.last_error = f"今日已发满 {sent_today}/{daily_limit}"
                 await asyncio.sleep(60)
                 continue
 

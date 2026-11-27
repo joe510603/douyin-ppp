@@ -537,6 +537,28 @@ _FEISHU_OUTREACH_TO_LOCAL = {
 }
 
 
+def _本地状态比快照新(outreach_at: str | None, snapshot_at: datetime) -> bool:
+    """本地状态是不是在这一轮回拉开始**之后**才改的？
+
+    是 → 飞书那边读到的是**旧快照**，拿它覆盖会吃掉刚做的修改
+    （2026-11-26 实测：批量修复后，正在处理中的 3 条被盖回「已跳过」）。
+
+    ``outreach_at`` 是「状态最后一次被写的时间」（worker 改状态时写），
+    比 ``updated_at`` 可靠 —— ``updated_at`` 只在线索内容变化时才动。
+    """
+    raw = str(outreach_at or "").strip()
+    if not raw:
+        return False
+    try:
+        ts = datetime.strptime(raw, "%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return False
+    # 按秒比（SQLite 的 datetime('now','localtime') 只到秒，
+    # 快照时间带微秒）—— 同一秒内改的也算「比快照新」，宁可跳过一轮，
+    # 也不能用旧快照把刚做的修改吃掉。
+    return ts >= snapshot_at.replace(microsecond=0)
+
+
 async def pull_bitable_status(db=None, config=None) -> dict:
     """把飞书表里销售手动改过的状态回流到本地
 
@@ -551,6 +573,20 @@ async def pull_bitable_status(db=None, config=None) -> dict:
         {"pulled": n, "updated": n, "skipped": n, "error": str}
     """
     result = {"pulled": 0, "updated": 0, "skipped": 0, "error": ""}
+
+    # ⚠️ 本轮回拉的「飞书快照时间」（2026-11-26 加）
+    #
+    # 为什么需要：回拉先 fetch_status_map() 拿到飞书的**快照**，
+    # 再逐条跟本地比对。这中间本地可能刚被改过（触达在跑、
+    # 或者刚做完一次批量修复）—— 那时飞书快照已经是**旧值**，
+    # 拿它去覆盖，就会把刚刚的修改吃掉。
+    #
+    # 实测（2026-11-26）：批量修复 323 条线索后，
+    # 正在处理中的 3 条被回拉用旧快照盖回「已跳过」。
+    #
+    # 所以：**本地状态在这一轮开始之后才改过的，一律不采纳飞书的值**
+    #（本地的更新，比飞书的快照新）。
+    snapshot_at = datetime.now()
 
     if config is None:
         config = get_config()
@@ -585,7 +621,7 @@ async def pull_bitable_status(db=None, config=None) -> dict:
     # 取本地有 record_id 的线索（只有这些才对得上飞书的记录）
     cursor = await db._db.execute(
         "SELECT id, display_id, status, outreach_status, bitable_synced_status, "
-        "bitable_record_id FROM leads WHERE display_id != ''"
+        "outreach_at, bitable_record_id FROM leads WHERE display_id != ''"
     )
     rows = await cursor.fetchall()
 
@@ -625,6 +661,13 @@ async def pull_bitable_status(db=None, config=None) -> dict:
         else:
             # 从没同步过 → 本地状态是默认的，采纳飞书的
             local_unchanged = local_st == "待处理" and local_os == "待触达"
+
+        # ⚠️ 本地在这一轮回拉**开始之后**才改过状态 → 飞书快照是旧的，
+        #   拿它覆盖会把刚刚的修改吃掉（2026-11-26 实测：修好的线索被盖回）。
+        #   本地更新 → 本地说了算，这一轮不管它。
+        if _本地状态比快照新(r.get("outreach_at"), snapshot_at):
+            skipped += 1
+            continue
 
         if not local_unchanged:
             skipped += 1

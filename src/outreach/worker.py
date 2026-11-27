@@ -1038,11 +1038,16 @@ class OutreachWorker:
         self._delay_min = delay_min
         self._delay_max = delay_max
         per_run = int(limit or o.max_per_run or 10)
-        daily_limit = int(o.daily_limit or 30)
+        # ⚠️ 2026-11-27：daily_limit 改成 **0 = 不限**（用户要求「不要设限制，
+        #   可以一直触达」）。
+        #   原来写的是 `int(o.daily_limit or 30)` —— **0 会被当成 30**！
+        #   （`or` 只对 None/False/空串生效，0 是 falsy → 整条被吞掉。）
+        #   所以这里必须显式取值，0 就是 0（不限）。
+        daily_limit = int(o.daily_limit if o.daily_limit is not None else 30)
         t_run = time.time()
 
         sent_today = self.st.sent_today()
-        if not dry and sent_today >= daily_limit:
+        if not dry and daily_limit > 0 and sent_today >= daily_limit:
             msg = f"今天已发 {sent_today} 条，达到每日上限 {daily_limit}，收工"
             self.log(msg)
             return {"ok": True, "stopped": msg, "total": 0, "sent": 0,
@@ -1083,13 +1088,16 @@ class OutreachWorker:
             if len(picked) >= per_run:
                 break
 
-        budget = per_run if dry else min(per_run, max(0, daily_limit - sent_today))
+        # 不限（daily_limit <= 0）时，本轮就按 per_run 走，不用算剩余额度
+        budget = (per_run if (dry or daily_limit <= 0)
+                  else min(per_run, max(0, daily_limit - sent_today)))
         picked = picked[:budget]
 
+        limit_txt = "不限" if daily_limit <= 0 else str(daily_limit)
         self.log(
             f"   待触达 {len(leads)} 条 → 本次挑 {len(picked)} 条"
             f"（跳过 {skipped} 条：{dedupe_days} 天内已触达）；"
-            f"今日已发 {sent_today}/{daily_limit}"
+            f"今日已发 {sent_today}/{limit_txt}"
         )
         self._emit(type="start", total=len(picked), dry_run=dry)
 

@@ -322,8 +322,10 @@ def create_outreach_page():
                                 )
                         else:
                             delay_txt = f"间隔 {int(o.min_delay)}-{int(o.max_delay)} 秒"
+                        # daily_limit=0 表示不限（2026-11-27 用户要求）
+                        daily_txt = "不限" if int(o.daily_limit) <= 0 else str(int(o.daily_limit))
                         outreach_info.text = (
-                            f"待触达 {pending} 条　今日已发 {sent}/{o.daily_limit}　"
+                            f"待触达 {pending} 条　今日已发 {sent}/{daily_txt}　"
                             f"模式：{mode}　"
                             f"{delay_txt}"
                         )
