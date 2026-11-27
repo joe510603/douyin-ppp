@@ -30,6 +30,7 @@ import pytest
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
 from src.config import get_config  # noqa: E402
+from src.outreach.douyin_api import DM_FAIL_TARGET  # noqa: E402
 from src.outreach.store import (  # noqa: E402
     STATUS_MESSAGED, STATUS_SKIPPED, OutreachStore,
 )
@@ -225,9 +226,19 @@ def test_私信成功会记一条channel为dm的触达记录(tmp_path):
 
 
 def test_私信发不出去退回跳过(tmp_path):
+    """**对方**关了私信 → 这条永远发不出去 → 跳过（留给人工）
+
+    ⚠ 2026-11-27 起失败要分清是谁的问题（见 tests/test_dm_unavailable.py）：
+      对方关了私信 → 永久 → 跳过；
+      我们环境的问题 / 平台限流 → 临时 → **退回队列**，不判死。
+    """
     w, logs = _worker(tmp_path)
     try:
         dy = _FakeDouyin(dm_ok=False, msg="对方未关注")
+        dy.send_dm = lambda sec_uid, text: {
+            "ok": False, "msg": "主页上没找到可见的「私信」按钮",
+            "kind": DM_FAIL_TARGET, "is_private": False,
+        }
         with pytest.raises(Exception) as ei:
             w._fallback_to_dm(dy, _lead(), {"dry": 0})
         # 失败 → NoWorks（worker 会把它记成「跳过」，留给人工）

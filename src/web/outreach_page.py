@@ -47,6 +47,9 @@ OUTREACH_LABELS = {
     "failed": "失败",
     "skipped": "已跳过",
     "dry_run": "干跑",
+    # 私信通道临时不可用时留的冷却标记（2026-11-27 加）：
+    # 这条线索没被消耗，退回队列等私信恢复。
+    "dm_wait": "等私信恢复",
 }
 
 
@@ -235,6 +238,7 @@ def create_outreach_page():
         failed = result.get("failed", 0)
         skipped = result.get("skipped", 0)
         not_found = result.get("not_found", 0)
+        retry = result.get("retry", 0)
         stopped = result.get("stopped") or ""
 
         msg = (
@@ -245,6 +249,10 @@ def create_outreach_page():
         # 「搜不到人」单列出来——它不是失败，是这些抖音号本来就失效了
         if not_found:
             msg += f"（其中搜不到人 {not_found} 条）"
+        # 「退回队列」也要显示：通道坏了/私信停了的时候，
+        # 那一行不能全是 0 —— 看着像装死，实际上是有东西被挡住了
+        if retry:
+            msg += f"　退回队列 {retry} 条"
         if stopped:
             msg += f"　｜{stopped}"
         outreach_status.text = msg
@@ -823,6 +831,8 @@ def create_outreach_page():
                         bits.append(f"失败 {p['failed']}")
                     if p.get("skipped"):
                         bits.append(f"跳过 {p['skipped']}")
+                    if p.get("retry"):
+                        bits.append(f"退回队列 {p['retry']}")
                     console_state.text = "　｜　".join(bits)
 
                     # 撞验证码时的等待条：显示/隐藏 + 文案

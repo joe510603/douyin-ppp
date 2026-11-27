@@ -482,6 +482,7 @@ class OutreachRunner:
             f"发 {result.get('sent', 0)}　私信 {result.get('messaged', 0)}　"
             f"干跑 {result.get('dry', 0)}　"
             f"失败 {result.get('failed', 0)}　跳过 {result.get('skipped', 0)}"
+            f"　退回 {result.get('retry', 0)}"
         )
         self._append_log(f"■ 触达任务结束：{summary}")
         log.info(f"[触达] 任务结束：{summary}")
@@ -541,18 +542,19 @@ class OutreachRunner:
                     "current": "",
                     "mode": "干跑" if event.get("dry_run") else "真发",
                     "sent": 0, "failed": 0, "skipped": 0, "dry": 0,
-                    "messaged": 0,
+                    "messaged": 0, "retry": 0,
                 }
             elif t == "current":
                 self._progress["index"] = int(event.get("index") or 0)
                 self._progress["current"] = (
                     f"{lead.get('display_id') or ''} {lead.get('nickname') or ''}".strip()
                 )
-            elif t in ("sent", "failed", "skipped", "dry", "unshown", "messaged"):
+            elif t in ("sent", "failed", "skipped", "dry", "unshown", "messaged",
+                       "retry"):
                 self._progress["done"] = int(self._progress.get("done") or 0) + 1
                 key = {"sent": "sent", "failed": "failed", "skipped": "skipped",
                        "dry": "dry", "unshown": "sent",
-                       "messaged": "messaged"}[t]
+                       "messaged": "messaged", "retry": "retry"}[t]
                 self._progress[key] = int(self._progress.get(key) or 0) + 1
                 self._progress["current"] = ""
         if t == "need_login":

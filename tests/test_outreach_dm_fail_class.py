@@ -207,8 +207,13 @@ def test_平台拦了只暂停私信通道不停整个触达(tmp_path):
         w.st.close()
 
 
-def test_私信暂停期间直接跳过不重复发(tmp_path):
-    """暂停期间再遇到没作品的人 → 直接跳过，别再去撞私信。"""
+def test_私信暂停期间直接退回队列不重复发(tmp_path):
+    """暂停期间再遇到没作品的人 → 退回队列等私信恢复，别再去撞私信。
+
+    ⚠ 2026-11-27：以前这里抛 NoWorks → 线索被判 skipped **终态** →
+    这人就再也不会被留言。而私信被限是我们这边的临时状态，
+    跟这个人能不能联系没关系 → 改成 DmUnavailable → 退回 pending。
+    """
     w, _ = _worker(tmp_path, dm_fail_threshold=1, dm_pause_minutes=60)
     try:
         dy = _FakeDouyin(ok=False, msg="私信被拦：操作频繁", kind=DM_FAIL_BLOCKED)

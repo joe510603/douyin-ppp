@@ -144,7 +144,20 @@ CREATE TABLE IF NOT EXISTS outreach_speed (
     -- 验证冷却：撞了抖音的拼图验证、这一轮没人管 → 冷却到什么时候为止。
     -- 跟「慢档」分开：慢档是「间隔拉长」，冷却是「先别搜了」。
     verify_until TEXT DEFAULT '',    -- 验证冷却到什么时候（空 = 没在冷却）
-    verify_reason TEXT DEFAULT ''    -- 为什么进冷却（给人看）
+    verify_reason TEXT DEFAULT '',   -- 为什么进冷却（给人看）
+    -- 作品通道失败计数（2026-11-27 加）：
+    -- 抖音把「主页作品列表」接口降级时（HTTP 200 + 0 字节），
+    -- 每条线索都会被抓成「没作品」。这个计数跨轮累计，
+    -- 用来判断「是不是整条通道坏了」→ 停手 + 叫人。
+    works_fails INTEGER DEFAULT 0,   -- 连续几次抓不到作品列表
+    works_fail_at TEXT DEFAULT '',   -- 最后一次失败的时间（用来算有没有过期）
+    -- 私信通道暂停到什么时候（2026-11-27 加）：
+    -- 以前这个时间只存在 worker 的内存里，而 worker **每轮都会新建**
+    -- → 「暂停私信 60 分钟」实际只管用了当前这一轮，下一轮照发照撞。
+    dm_paused_until TEXT DEFAULT '',
+    -- 连续几次私信被平台拦（2026-11-27 加）：跨轮累计，
+    -- 到阈值就暂停私信通道（只停私信，留言照发）。
+    dm_fails INTEGER DEFAULT 0
 );
 """
 
@@ -195,6 +208,13 @@ class OutreachStore:
             for col, ddl2 in (
                 ("verify_until", "TEXT DEFAULT ''"),
                 ("verify_reason", "TEXT DEFAULT ''"),
+                # 作品通道失败计数（2026-11-27 加，老库要补列）
+                ("works_fails", "INTEGER DEFAULT 0"),
+                ("works_fail_at", "TEXT DEFAULT ''"),
+                # 私信通道暂停截止时间（2026-11-27 加，老库要补列）
+                ("dm_paused_until", "TEXT DEFAULT ''"),
+                # 连续私信被拦的计数（2026-11-27 加，老库要补列）
+                ("dm_fails", "INTEGER DEFAULT 0"),
             ):
                 if col not in sp_cols:
                     try:
@@ -331,6 +351,24 @@ class OutreachStore:
         if min_score:
             sql.append(" AND intent_score >= ?")
             params.append(float(min_score))
+
+        # ⚠ 私信通道临时不可用时（额度用完 / 平台限流），那条线索会退回 pending。
+        #
+        #   问题：它的**排序位置没变**（last_hit_at 没动）→ 下一轮又被第一个挑中，
+        #   白花 20 秒重新搜一遍这个人。队列头部要是坐满了这种线索，
+        #   整轮就在原地打转 —— 私信停了，**留言也跟着停了**，
+        #   正好违背「私信停了，触达不要停」。
+        #
+        #   办法：刚因为「私信不可用」退回来的线索，先晾 30 分钟。
+        #   （只写 outreach_records，不动 leads.outreach_status ——
+        #     所以飞书那边看到的还是「待触达」，不会多出新的下拉选项。）
+        sql.append(
+            " AND NOT EXISTS ("
+            "  SELECT 1 FROM outreach_records r"
+            "  WHERE r.lead_id = leads.id AND r.status = 'dm_wait'"
+            "  AND r.created_at >= datetime('now','localtime','-30 minutes')"
+            ")"
+        )
 
         if sort_by == "intent":
             sql.append(" ORDER BY intent_score DESC, id DESC")
@@ -856,6 +894,166 @@ class OutreachStore:
         try:
             self._conn.execute(
                 "UPDATE outreach_speed SET verify_until='', verify_reason='', "
+                "updated_at=datetime('now','localtime') WHERE id=1"
+            )
+            self._conn.commit()
+        except Exception:
+            pass
+
+    # ================================================================
+    # 作品通道失败计数（跨轮累计，2026-11-27 加）
+    # ================================================================
+
+    def works_fail_count(self, window_min: int = 30) -> int:
+        """连续几次「作品列表抓不到」（**跨轮**累计）
+
+        为什么要跨轮累计（2026-11-27 实测发现）：
+        计数器原来只是 ``run()`` 里的一个局部变量，**每轮清零**。
+        而「即时触达」每轮只处理 1 条新线索 → 每轮最多失败 1 次 →
+        永远到不了「连续 3 条」的阈值 → 熔断**从来没触发过**。
+        结果：作品接口从 17:58 起就在降级，飞书一张卡片都没发，
+        用户完全不知情（而线索确实一条没丢，但也没人知道该换 IP）。
+
+        超过 ``window_min`` 分钟的失败不算数：
+        那么久以前的一次失败说明通道大概率已经恢复过，
+        拿它凑数会把「现在第一次失败」误报成「连续 N 次」。
+        """
+        try:
+            row = self._conn.execute(
+                "SELECT works_fails, works_fail_at FROM outreach_speed WHERE id = 1"
+            ).fetchone()
+        except Exception:
+            return 0
+        if not row:
+            return 0
+        n = int(row["works_fails"] or 0)
+        if n <= 0:
+            return 0
+        at = str(row["works_fail_at"] or "")
+        if not at:
+            return 0
+        try:
+            ts = datetime.strptime(at, "%Y-%m-%d %H:%M:%S")
+        except Exception:
+            return 0
+        if (datetime.now() - ts).total_seconds() > max(1, int(window_min)) * 60:
+            return 0
+        return n
+
+    def bump_works_fail(self) -> int:
+        """记一次「作品列表抓不到」，返回累计次数"""
+        n = self.works_fail_count() + 1
+        try:
+            self._conn.execute(
+                "INSERT INTO outreach_speed (id, works_fails, works_fail_at, "
+                "updated_at) VALUES (1, ?, datetime('now','localtime'), "
+                "datetime('now','localtime')) "
+                "ON CONFLICT(id) DO UPDATE SET works_fails=excluded.works_fails, "
+                "works_fail_at=excluded.works_fail_at, "
+                "updated_at=datetime('now','localtime')",
+                [n],
+            )
+            self._conn.commit()
+        except Exception:
+            pass
+        return n
+
+    def clear_works_fail(self) -> None:
+        """作品通道恢复了 → 计数清零"""
+        try:
+            self._conn.execute(
+                "UPDATE outreach_speed SET works_fails=0, works_fail_at='', "
+                "updated_at=datetime('now','localtime') WHERE id=1"
+            )
+            self._conn.commit()
+        except Exception:
+            pass
+
+    # ================================================================
+    # 私信通道暂停（跨轮，2026-11-27 加）
+    # ================================================================
+
+    def dm_pause_until(self) -> float:
+        """私信通道暂停到什么时候（epoch 秒；0 = 没暂停）
+
+        为什么必须存 DB（2026-11-27 发现）：
+        这个时间以前只存在 worker 的内存里，而 worker **每轮都会新建**
+        （runner._run_in_thread 每次 new 一个）→
+        「连续 N 条私信被拦 → 暂停私信 60 分钟」实际只管用了**当前这一轮**，
+        下一轮又从 0 开始撞。暂停形同虚设。
+        """
+        try:
+            row = self._conn.execute(
+                "SELECT dm_paused_until FROM outreach_speed WHERE id = 1"
+            ).fetchone()
+        except Exception:
+            return 0.0
+        if not row:
+            return 0.0
+        raw = str(row["dm_paused_until"] or "").strip()
+        if not raw:
+            return 0.0
+        try:
+            return float(raw)
+        except Exception:
+            return 0.0
+
+    def set_dm_pause_until(self, epoch: float) -> None:
+        """记下私信通道暂停到什么时候"""
+        try:
+            self._conn.execute(
+                "INSERT INTO outreach_speed (id, dm_paused_until, updated_at) "
+                "VALUES (1, ?, datetime('now','localtime')) "
+                "ON CONFLICT(id) DO UPDATE SET dm_paused_until=excluded.dm_paused_until, "
+                "updated_at=datetime('now','localtime')",
+                [str(float(epoch or 0))],
+            )
+            self._conn.commit()
+        except Exception:
+            pass
+
+    def clear_dm_pause(self) -> None:
+        """私信通道恢复了 → 解除暂停"""
+        try:
+            self._conn.execute(
+                "UPDATE outreach_speed SET dm_paused_until='', "
+                "updated_at=datetime('now','localtime') WHERE id=1"
+            )
+            self._conn.commit()
+        except Exception:
+            pass
+
+    def dm_fail_count(self) -> int:
+        """连续几次私信被平台拦（跨轮累计）"""
+        try:
+            row = self._conn.execute(
+                "SELECT dm_fails FROM outreach_speed WHERE id = 1"
+            ).fetchone()
+        except Exception:
+            return 0
+        return int(row["dm_fails"] or 0) if row else 0
+
+    def bump_dm_fail(self) -> int:
+        """记一次「私信被平台拦」，返回累计次数"""
+        n = self.dm_fail_count() + 1
+        try:
+            self._conn.execute(
+                "INSERT INTO outreach_speed (id, dm_fails, updated_at) "
+                "VALUES (1, ?, datetime('now','localtime')) "
+                "ON CONFLICT(id) DO UPDATE SET dm_fails=excluded.dm_fails, "
+                "updated_at=datetime('now','localtime')",
+                [n],
+            )
+            self._conn.commit()
+        except Exception:
+            pass
+        return n
+
+    def clear_dm_fail(self) -> None:
+        """私信通道恢复了（发出去一条 / 已暂停）→ 计数清零"""
+        try:
+            self._conn.execute(
+                "UPDATE outreach_speed SET dm_fails=0, "
                 "updated_at=datetime('now','localtime') WHERE id=1"
             )
             self._conn.commit()

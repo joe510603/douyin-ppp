@@ -37,7 +37,7 @@ from .douyin_api import (
     Douyin, DouyinError, KIND_DM, KIND_LIMIT, KIND_LOGIN, KIND_SEARCH, KIND_VERIFY,
     KIND_WORKS,
     DM_FAIL_BLOCKED, DM_FAIL_ENV, DM_FAIL_TARGET,
-    LeadNotFound, NoWorks, NotLoggedIn, RiskControl, SearchNotReady,
+    DmUnavailable, LeadNotFound, NoWorks, NotLoggedIn, RiskControl, SearchNotReady,
     SearchUnavailable, VERIFY_TEXTS, WorksUnreachable, normalize_kind,
 )
 from .store import (
@@ -299,10 +299,27 @@ class OutreachWorker:
         self._silent_blocks = 0
         # 连续「私信发不出去」的次数（私信功能被限的信号）
         # ⚠ 只统计「平台拦了」那一种（对方关了私信 / 环境问题都不算）
+        #
+        # ⚠ 跨轮有效（2026-11-27 修）：worker 每轮都新建，
+        #   这个计数以前只活在内存里 → 每轮只有 1 条私信的话永远到不了阈值
+        #   → 「私信熔断」从来没触发过。现在存 DB。
         self._dm_failed = 0
+        try:
+            self._dm_failed = int(self.st.dm_fail_count() or 0)
+        except Exception:
+            pass
         # 私信通道暂停到什么时候（0 = 没暂停）
         # 只停私信，不停整个触达 —— 评论是另一个通道
+        #
+        # ⚠ 这个时间必须**跨轮**有效（2026-11-27 修）：
+        #   worker 每轮都会新建，这个暂停以前只活在内存里 →
+        #   「暂停私信 60 分钟」实际只管用了当前这一轮，下一轮照撞。
+        #   现在从 DB 读，写也写进 DB。
         self._dm_paused_until = 0.0
+        try:
+            self._dm_paused_until = float(self.st.dm_pause_until() or 0)
+        except Exception:
+            pass
         # 上一条走的是哪个渠道（私信之后要等更久）
         self._last_channel = ""
         # 撞验证码时用它跟主线程同步「人工验证完了，继续」
@@ -980,6 +997,18 @@ class OutreachWorker:
             # 飞书写失败不影响主流程继续跑
             self.log(f"  ⚠️ 飞书状态回写失败: {e}")
 
+    def _bump_works_fail(self) -> int:
+        """记一次「作品列表抓不到」，返回**跨轮累计**的次数
+
+        计数存在 DB 里（outreach_speed 表），所以：
+          · 跨轮累计 → 即时触达每轮只处理 1 条也能累计到阈值
+          · 服务重启也不丢 → 通道还坏着，重启后第一次失败就知道
+        """
+        try:
+            return int(self.st.bump_works_fail())
+        except Exception:
+            return 1
+
     def _synced_marker(self, lead: dict, outreach_status: str) -> str:
         """生成「上次同步进飞书的状态」标记（处理状态|触达状态）
 
@@ -1125,6 +1154,14 @@ class OutreachWorker:
             "ok": True, "total": len(picked), "sent": 0, "failed": 0,
             "skipped": skipped, "dry": 0, "dry_run": dry, "stopped": "",
             "not_found": 0, "messaged": 0,
+            # 「退回队列」的条数（2026-11-27 加）
+            #
+            # 为什么要单独列出来：以前一轮跑完只显示
+            # 「发 0 私信 0 干跑 0 失败 0 跳过 0」——
+            # 线索其实是被**退回队列**了（通道坏了/私信停了），但那行全是 0，
+            # 看着像「什么都没发生」。用户看到这种行会以为程序在装死。
+            # 通道坏掉的时候，**必须一眼看得出「有东西被挡住了」**。
+            "retry": 0,
         }
         if not picked:
             self.log("没有要处理的线索，结束")
@@ -1146,7 +1183,10 @@ class OutreachWorker:
         #   抓不到作品 = **平台把作品接口降级了**（我们的通道坏了）
         # 后者必须停手 + 叫人，不然每条都会走「没作品→私信」，
         # 把本来有作品的客户一个个私信消耗掉（实测 543 条误判）。
-        consecutive_works_fail = 0
+        #
+        # ⚠ 计数存在 **DB** 里（跨轮累计），不是本轮的局部变量：
+        #   「即时触达」每轮只处理 1 条 → 每轮最多失败 1 次 →
+        #   本地变量永远到不了阈值 → 熔断从来没触发过（2026-11-27 实测）。
         sent_in_run = 0
         max_err = int(o.fail_stop_threshold or 3)
 
@@ -1199,7 +1239,6 @@ class OutreachWorker:
                         self._handle_one(dy, lead, summary)
                         consecutive_errors = 0
                         consecutive_not_found = 0
-                        consecutive_works_fail = 0
                     except RiskControl as e:
                         # 优先用异常自带的类型（只有一套判据），
                         # 老异常没有 kind 时再退回关键词判断。
@@ -1288,6 +1327,40 @@ class OutreachWorker:
                         self.log(f"  ⏭️ {e}")
                         self._set_status(lead, STATUS_SKIPPED, str(e))
                         self._emit(type="skipped", lead=lead, error=str(e))
+                    except DmUnavailable as e:
+                        # 私信通道**临时**不可用（额度用完 / 正在冷却 / 发不出去）
+                        # （2026-11-27 用户要求：「私信可以设置上限，
+                        #   但是私信停了，触达不要停」）
+                        #
+                        # 这条要**退回 pending**，不能判死：
+                        #   私信停是**我们这边**的临时状态（额度到头 / 平台限流），
+                        #   跟这个人能不能被联系没关系。
+                        #   以前抛 NoWorks → skipped 终态 → 这人再也不会被留言。
+                        #
+                        # 同时：私信停**不停整个触达** ——
+                        #   有作品的线索走留言，跟私信额度毫无关系，照发。
+                        #
+                        # 再加一条冷却标记（outreach_records.status='dm_wait'）：
+                        #   退回 pending 的线索排序位置不变 → 下一轮又从队头挑中它，
+                        #   白花 20 秒重搜一遍。记一笔 dm_wait 让队列先晾它 30 分钟，
+                        #   免得私信一停、整轮在原地打转把留言也拖住。
+                        consecutive_not_found = 0
+                        summary["retry"] = summary.get("retry", 0) + 1
+                        self.log(f"  ⏭️ {e}")
+                        self._set_status(lead, STATUS_PENDING, str(e))
+                        try:
+                            self.st.add_touch(
+                                lead_id=lead["id"],
+                                record_id=lead.get("bitable_record_id") or "",
+                                display_id=lead["display_id"],
+                                nickname=lead.get("nickname") or "",
+                                sec_uid=lead.get("sec_uid") or "",
+                                channel="dm", status="dm_wait", error=str(e)[:200],
+                            )
+                        except Exception as te:
+                            # 冷却标记写不进去也不能影响触达本身
+                            self.log(f"  ⚠️ 私信冷却标记写入失败（不影响本轮）: {str(te)[:80]}")
+                        self._emit(type="retry", lead=lead, error=str(e))
                     except WorksUnreachable as e:
                         # 作品列表**抓不到** —— 不是「这个人没作品」（2026-11-26 加）
                         #
@@ -1300,7 +1373,12 @@ class OutreachWorker:
                         # 私信 + 永久标记 no_works → 有作品的人被私信顶掉，
                         # 而且再也不会留言（实测 543 条误判，抽样 64% 是错的）。
                         consecutive_not_found = 0
-                        consecutive_works_fail += 1
+                        # ⚠ 计数是**跨轮**累计的（存在 DB 里），不是本轮的局部变量。
+                        #   原因（2026-11-27 实测）：「即时触达」每轮只处理 1 条
+                        #   新线索 → 每轮最多失败 1 次 → 永远到不了阈值 3 →
+                        #   熔断从来没触发过 → 作品接口降级了大半小时，
+                        #   飞书一张卡片都没发，用户完全不知情。
+                        consecutive_works_fail = self._bump_works_fail()
                         summary["retry"] = summary.get("retry", 0) + 1
                         self.log(f"  ⏭️ {e}")
                         self._set_status(lead, STATUS_PENDING, str(e))
@@ -1314,6 +1392,7 @@ class OutreachWorker:
                             msg = (f"连续 {consecutive_works_fail} 条都抓不到作品列表"
                                    "（抖音把作品接口降级了：HTTP 200 但响应体是空的）"
                                    "，已停手 —— 这不是账号的问题，别重登、别重跑，"
+                                   "线索一条没丢（都退回队列了），"
                                    "等限流过去或换网络再继续")
                             self.stop_reason = msg
                             self._stop_kind = KIND_WORKS
@@ -1582,6 +1661,7 @@ class OutreachWorker:
         self.log(
             f"\n本轮结束：发 {summary['sent']}　干跑 {summary['dry']}　"
             f"失败 {summary['failed']}　跳过 {summary['skipped']}"
+            f"　退回 {summary.get('retry', 0)}"
             + (f"　停止原因：{self.stop_reason}" if self.stop_reason else "")
         )
         self.log(
@@ -1864,10 +1944,18 @@ class OutreachWorker:
         # ---- 私信通道暂停中？（平台把私信限了）----
         # 只停私信，**评论照发** —— 这跟「私信被限会连留言一起废」正好相反：
         # 陌生人私信和评论是两个通道，账号被限私信不代表评论也发不出去。
+        #
+        # ⚠ 2026-11-27：这里以前抛 NoWorks → 线索被判 skipped 终态 →
+        #   这人就**再也不会被留言**了。而私信被限是我们这边的临时状态，
+        #   跟这个人能不能联系没关系 → 属于冤案。
+        #   改成 DmUnavailable → 退回 pending 等冷却过去再来。
         if self._dm_paused_until > time.time():
             left_min = int((self._dm_paused_until - time.time()) // 60) + 1
-            self.log(f"  ⏭️ 私信通道暂停中（还剩 {left_min} 分钟），这条先跳过，评论不受影响")
-            raise NoWorks(f"{why}；私信通道暂停中（抖音把私信限了）".strip("；"))
+            self.log(f"  ⏭️ 私信通道暂停中（还剩 {left_min} 分钟），"
+                     "这条退回队列等私信恢复，**留言通道不受影响**")
+            raise DmUnavailable(
+                f"{why}；私信通道暂停中（抖音把私信限了，还剩 {left_min} 分钟）".strip("；")
+            )
 
         # 记下「这个人确认没作品」。
         #
@@ -1886,10 +1974,27 @@ class OutreachWorker:
             raise NoWorks(why or "该用户没有公开作品")
 
         # ---- 额度 ----
+        #
+        # ⚠ 2026-11-27：以前这里抛 NoWorks → 线索被判 skipped 终态，
+        #   这个人就**再也不会被留言**了。可私信额度用完是**今天额度到头了**，
+        #   跟这个人能不能联系没关系 → 冤案。
+        #   改成 DmUnavailable → 退回 pending，明天额度有了再来。
+        #
+        # ⚠⚠ 另一个坑：**dm_daily_limit <= 0 不是「今天发完了」，是「私信关了」**
+        #   （配置成 0 / 负数 = 不发私信）。
+        #   这两种必须分开，否则关掉私信的机器上，
+        #   每条「没作品」的线索都会永远退回队列 → 队列被塞满、永远转不完。
+        #   私信关掉了 + 没作品 → **确实没渠道了** → 跳过是对的。
+        dm_limit = int(getattr(o, "dm_daily_limit", 20) or 0)
+        if dm_limit <= 0:
+            self.log(f"  ⏭️ 没有作品，而且私信已关闭（dm_daily_limit={dm_limit}）"
+                     f"—— 这条没有可用的触达渠道，跳过")
+            raise NoWorks(f"{why}；私信已关闭（dm_daily_limit={dm_limit}）".strip("；"))
         left = self._dm_quota_left()
         if left <= 0:
-            self.log(f"  ⏭️ 没有作品，私信额度也用完了（今天 {int(o.dm_daily_limit)} 条）")
-            raise NoWorks(f"{why}；私信额度已用完".strip("；"))
+            self.log(f"  ⏭️ 没有作品，今天的私信额度用完了（{dm_limit} 条），"
+                     "这条退回队列等明天，**留言通道不受影响**")
+            raise DmUnavailable(f"{why}；私信额度已用完（今天 {dm_limit} 条）".strip("；"))
 
         # ---- 私密账号：先认出来，销售那边要区别对待 ----
         #
@@ -1932,9 +2037,17 @@ class OutreachWorker:
                 self.log(f"  ⏭️ 私信发不出去：{msg}"
                          f"（对方侧的问题，账号没事，这条跳过）")
             elif fail_kind == DM_FAIL_ENV:
-                self.log(f"  ⏭️ 私信发不出去：{msg}（我们自己的环境问题，这条跳过）")
+                # 我们自己的环境问题（输入框没渲染 / 内容没输进去）→ **临时**，
+                # 这条退回队列下次再来，不能判死（对方没问题，是我们没发出去）
+                self.log(f"  ⏭️ 私信发不出去：{msg}"
+                         f"（我们自己的环境问题，这条退回队列，**留言通道不受影响**）")
             else:
-                self._dm_failed += 1
+                # 跨轮累计（存 DB）——worker 每轮都新建，
+                # 只放内存的话「连续 N 条被拦」的熔断永远触发不了
+                try:
+                    self._dm_failed = int(self.st.bump_dm_fail())
+                except Exception:
+                    self._dm_failed += 1
                 self.log(f"  ❌ 私信被拦：{msg}"
                          f"（连续 {self._dm_failed} 次，账号的私信功能可能被限）")
 
@@ -1952,16 +2065,47 @@ class OutreachWorker:
                     # 账号被限私信不代表评论也发不出去。
                     pause_min = int(getattr(o, "dm_pause_minutes", 60) or 60)
                     self._dm_paused_until = time.time() + pause_min * 60
+                    # 写进 DB：worker 每轮都新建，只放内存的话
+                    # 这个「暂停 60 分钟」下一轮就失效了（2026-11-27 修）
+                    try:
+                        self.st.set_dm_pause_until(self._dm_paused_until)
+                    except Exception:
+                        pass
                     self._dm_failed = 0
+                    try:
+                        self.st.clear_dm_fail()
+                    except Exception:
+                        pass
                     reason = (f"连续 {thr} 条私信被平台拦了，私信功能多半被限了，"
                               f"已暂停私信 {pause_min} 分钟（**评论照发，不影响留言**）")
                     self.log(f"  🛑 {reason}")
                     self._emit(type="risk", lead=lead, error=reason, kind=KIND_DM)
                     self._notify_risk(KIND_DM, reason, lead)
-            raise NoWorks(f"{why}；私信也没发出去（{msg}）".strip("；"))
+            # ⚠ 2026-11-27：失败要**分清是暂时还是永久**（用户要求：
+            #   「私信可以设置上限，但是私信停了，触达不要停」）。
+            #
+            #   对方关了私信（DM_FAIL_TARGET）→ **永久** → 跳过是对的，
+            #     这个人我们永远发不出私信，留给人工。
+            #   我们环境的问题 / 平台把私信限了（ENV / BLOCKED）→ **暂时** →
+            #     以前抛 NoWorks → skipped 终态 → 这人就再也不会被联系了，
+            #     而私信停是我们这边的状态，跟这个人没关系 → 冤案。
+            #     改成 DmUnavailable → 退回 pending，私信恢复后还能再试。
+            if fail_kind == DM_FAIL_TARGET:
+                raise NoWorks(f"{why}；私信也没发出去（{msg}）".strip("；"))
+            raise DmUnavailable(f"{why}；私信暂时发不出去（{msg}）".strip("；"))
 
         # ---- 成功 ----
         self._dm_failed = 0
+        try:
+            self.st.clear_dm_fail()
+        except Exception:
+            pass
+        # 私信发得出去 → 通道是好的 → 解除暂停
+        try:
+            self.st.clear_dm_pause()
+            self._dm_paused_until = 0.0
+        except Exception:
+            pass
         self.st.add_touch(
             lead_id=lead["id"], record_id=lead.get("bitable_record_id") or "",
             display_id=lead["display_id"], nickname=lead.get("nickname") or "",
@@ -2081,9 +2225,17 @@ class OutreachWorker:
         #     这里再取一次不花额外时间，所以删掉 no_works 的跳过分支不亏。）
         works = dy.fetch_works(lead["sec_uid"], limit=20)
         dy.check_risk()
+        wst = (getattr(dy, "last_works_fetch", None) or {}).get("status") or ""
+        if wst != "failed":
+            # 作品通道这次是通的 → 「连续抓不到」的计数清零
+            # （跨轮累计的，通道一恢复就得清，否则下一条失败会被误报成
+            #   「连续 N 次」——那个 N 里混着几小时前的老账）
+            try:
+                self.st.clear_works_fail()
+            except Exception:
+                pass
         work = self._pick_work(works)
         if not work:
-            wst = (getattr(dy, "last_works_fetch", None) or {}).get("status") or ""
             if wst == "failed":
                 # 「抓不到」≠「没有」→ 退回队列等通道恢复，别私信消耗这条线索
                 raise WorksUnreachable(
