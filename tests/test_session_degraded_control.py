@@ -54,7 +54,13 @@ class _FakePage:
         self._title = title
         self.url = DOUYIN + "/user/xxx"
 
-    def evaluate(self, _js: str, *_a):
+    def evaluate(self, script: str, *_a):
+        # 验证码探测那几段 JS 要返回布尔值；这里统一说「没有验证码」
+        if "captcha" in script or "verifycenter" in script:
+            return False
+        # 作品网格兜底要返回 [[aid, desc], ...]
+        if "scroll-list" in script or "data-e2e" in script:
+            return []
         return self._body
 
     def title(self) -> str:
@@ -66,6 +72,7 @@ class _FakePage:
     def goto(self, url: str, **_kw) -> None:
         self.url = url
 
+    @property
     def mouse(self):
         class _M:
             def wheel(self, *_a):
@@ -124,6 +131,21 @@ _NORMAL_BODY = (
     "问界M9 试驾预约\n"
     "小米YU7 发布会回顾\n"
 )
+
+
+def _stub_capture(dy, hits: int = 0, empties: int = 0) -> None:
+    """把 _capture 换成「什么都没抓到」的版本（并照常执行动作）
+
+    真实 _capture 会：执行 action（开主页）→ 等响应 → 把证据写进 evidence。
+    """
+    def _cap(url, action, **kw):
+        ev = kw.get("evidence")
+        if ev is not None:
+            ev.update({"hits": hits, "empty_bodies": empties,
+                       "statuses": [], "parsed": 0})
+        action()
+        return []
+    dy._capture = _cap
 
 
 def _dy(**kw) -> _FakeDouyin:
@@ -255,7 +277,63 @@ def test_对照被降级时也要缓存():
 
 
 # ============================================================
-# 5. worker 要真的把对照账号给到 Douyin
+# 5. 作品数 0 + 会话正常 → 真没作品（不是「抓不到」）
+# ============================================================
+
+def test_资料说作品数0且会话正常就判真没作品():
+    """抖音对 0 作品的号**压根不发**作品请求
+
+    2026-11-28 实测：悲伤Kitty猫 aweme_count=0 → 作品请求一次都没发；
+    天令 aweme_count=3 → 正常发了，抓到 3 条。
+    所以「作品请求没来」不能一律当「抓不到」——
+    否则这条线索会在队列里永远转圈（每轮白花 24 秒）。
+    """
+    dy = _dy(control_body=_NORMAL_BODY, control_title="正常",
+             target_body=_NORMAL_BODY, target_title="悲伤Kitty猫的抖音 - 抖音")
+    dy._profile_info = lambda sec_uid: {
+        "sec_uid": sec_uid, "nickname": "悲伤Kitty猫",
+        "unique_id": "Matlc520", "signature": "", "aweme_count": 0,
+    }
+    _stub_capture(dy)
+    works = dy._fetch_works_page("MS4wLjABAAAATARGET")
+    assert works == [], works
+    st = dy.last_works_fetch
+    assert st["status"] == "empty", st
+    assert "作品数是 0" in st["detail"], st
+
+
+def test_会话坏的时候不能判真没作品():
+    """会话坏 + 作品数 0 → 不能当成「真没作品」（可能是我们瞎了）"""
+    dy = _dy(control_body=_SHELL_BODY, control_title="壳页",
+             target_body=_SHELL_BODY, target_title="壳页")
+    dy._profile_info = lambda sec_uid: {
+        "sec_uid": sec_uid, "nickname": "悲伤Kitty猫",
+        "unique_id": "Matlc520", "signature": "", "aweme_count": 0,
+    }
+    _stub_capture(dy)
+    dy._fetch_works_page("MS4wLjABAAAATARGET")
+    st = dy.last_works_fetch
+    assert st["status"] == "failed", st
+    assert st["diag"] == "session", st
+
+
+def test_作品数不是0就不能判真没作品():
+    """资料说 aweme_count>0 → 说明他是有作品的 → 抓不到就是抓不到"""
+    dy = _dy(control_body=_NORMAL_BODY, control_title="正常",
+             target_body=_NORMAL_BODY, target_title="正常")
+    dy._profile_info = lambda sec_uid: {
+        "sec_uid": sec_uid, "nickname": "天令",
+        "unique_id": "lyj312690", "signature": "", "aweme_count": 3,
+    }
+    _stub_capture(dy)
+    dy._fetch_works_page("MS4wLjABAAAATARGET")
+    st = dy.last_works_fetch
+    assert st["status"] == "failed", st
+    assert st["diag"] == "endpoint", st
+
+
+# ============================================================
+# 6. worker 要真的把对照账号给到 Douyin
 # ============================================================
 
 def test_worker会挑自家门店号当对照():

@@ -1802,14 +1802,35 @@ class Douyin:
 
         # ---- 到这里：作品列表是空的 ----
         #
-        # 必须分清两种「空」（2026-11-26 修的真 bug）：
-        #   trusted=True  → 接口正常返回、aweme_list 就是空数组 → **这个人确实没作品**
-        #   trusted=False → 接口 200 但响应体是空的 / 压根没响应 / 页面没渲染
-        #                    → **我们抓不到**，不是「他没作品」
+        # 必须分清三种「空」（2026-11-26 / 11-28 两次修的真 bug）：
+        #   trusted=True    → 接口正常返回、aweme_list 就是空数组 → **这个人确实没作品**
+        #   really_empty=True → **资料接口说作品数是 0** → 也是真没作品
+        #                      （抖音对 0 作品的号**压根不发**这个请求，
+        #                        所以「一次都没命中」不能一律当成抓不到）
+        #   其它            → 接口 200 但响应体是空的 / 压根没响应 / 页面没渲染
+        #                      → **我们抓不到**，不是「他没作品」
         # 后者以前被当成「没作品」→ 改发私信 + 永久标记 no_works，
         # 于是有作品的人被私信消耗掉、再也不会留言（543 条误判）。
+        really_empty = False
+        session_broken = False
+        if not trusted:
+            # 判据：**资料接口的作品数**（老 web API，不依赖页面渲染，是权威的）
+            # 2026-11-28 实测：悲伤Kitty猫 aweme_count=0 → 页面确实没发作品请求
+            #                  天令 aweme_count=3 → 页面正常发了，抓到 3 条
+            #
+            # ⚠ 要**两个信号一起**才算「真没作品」：
+            #   ① 资料接口说作品数是 0（账号存在、确实没有作品）
+            #   ② 会话是好的（对照账号能正常渲染 → 不是我们瞎了）
+            #   少任何一个都不下结论 —— 宁可退回队列，也别误发私信。
+            _pinfo = self._profile_info(sec_uid)
+            session_broken = self._session_broken()
+            if (_pinfo and int(_pinfo.get("aweme_count") or 0) == 0
+                    and not session_broken):
+                really_empty = True
+                self.log("  ℹ️ 资料接口说这个人作品数是 0、会话也正常 → "
+                         "**他确实没有作品**（抖音对没作品的号不会发作品请求）")
         self.last_works_fetch = {
-            "status": "empty" if trusted else "failed",
+            "status": "empty" if (trusted or really_empty) else "failed",
             # 证据要**结构化**地留下来（2026-11-27 加）：
             # 光有一句 detail 不够，外层要按证据说不同的诊断。
             #
@@ -1822,14 +1843,17 @@ class Douyin:
             #   所以拿对照账号（自家门店号）看一眼才知道是哪一种。
             "hits": hits,
             "empties": empties,
-            "diag": ("session" if (not trusted and self._session_broken())
-                     else ("endpoint" if not trusted else "")),
+            "diag": ("session" if (not trusted and not really_empty and session_broken)
+                     else ("endpoint" if (not trusted and not really_empty) else "")),
             "detail": (
-                f"接口命中 {hits} 次（空响应体 {empties} 次，状态 {statuses}），"
-                + ("接口说就是没有" if trusted else "响应体是空的/压根没响应 —— 抓不到，不是没有")
+                "接口说就是没有" if trusted else
+                ("资料接口说作品数是 0（抖音对没作品的号不发这个请求）"
+                 if really_empty else
+                 f"接口命中 {hits} 次（空响应体 {empties} 次，状态 {statuses}），"
+                 "响应体是空的/压根没响应 —— 抓不到，不是没有")
             ),
         }
-        if not trusted:
+        if not trusted and not really_empty:
             self.log(
                 f"  ⚠️ 作品列表**抓不到**（接口命中 {hits} 次，空响应体 {empties} 次）"
                 "—— 这不是「这个人没作品」，退回队列等通道恢复"
