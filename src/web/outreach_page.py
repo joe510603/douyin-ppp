@@ -15,6 +15,7 @@ from nicegui import ui
 
 from ..config import get_config
 from ..utils.logger import get_logger
+from ..outreach.stop_text import works_stop_text
 
 log = get_logger("outreach_page")
 
@@ -889,17 +890,15 @@ def create_outreach_page():
                                 "3. 急着要的话，用抖音 App 手动发一条（App 端不受影响）"
                             )
                         elif kind == "works":
+                            # ⚠ 文案**只有这一份**（stop_text.py），跟飞书卡片同源。
+                            # 以前这里自己写了一份，11-27 改飞书文案时忘了改网页 →
+                            # 网页还在说「接口回空响应体」，跟飞书说的完全两回事，
+                            # 用户只会以为系统乱了。
+                            _t, _b = works_stop_text(stop.get("diag") or "")
                             stop_text.text = (
-                                "🧱 抖音**作品列表接口**被限了，已停手。\n"
+                                f"{_t}\n"
                                 f"原因：{reason}\n"
-                                "你的账号是好的，不用扫码，也不是验证码——\n"
-                                "只有「取作品列表」这一条路被挡了（它回 HTTP 200 但响应体是空的）。\n"
-                                "**线索一条都没消耗**：抓不到就退回队列，不会当成「这人没作品」。\n"
-                                "怎么办：\n"
-                                "1. 等 30 分钟到几小时它自己会恢复（别反复重试，\n"
-                                "   重试只会让限流窗口一直续着）\n"
-                                "2. 急着要的话换个网络（手机热点）再跑\n"
-                                "3. 恢复后会继续走**留言**（不会再私信消耗）"
+                                f"{_b}"
                             )
                         else:
                             stop_text.text = (

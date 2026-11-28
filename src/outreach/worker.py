@@ -53,6 +53,7 @@ from .store import (
     STATUS_SKIPPED,
     OutreachStore,
 )
+from .stop_text import works_stop_text
 from ..intelligence.contact_extractor import extract_contacts
 
 # 触达状态 → 飞书表「触达状态」列的文案
@@ -295,6 +296,10 @@ class OutreachWorker:
         # 这一轮是因为什么停手的：verify / limit / login / 空
         # 跟 stop_reason 一起落库，服务重启后横幅还能恢复
         self._stop_kind = ""
+        # 停手的**诊断**（works 用）：session / endpoint / 空
+        # 跟 kind 一样要落库 —— 网页横幅要靠它选文案，
+        # 不能靠解析 note 文案（文案会漂）。
+        self._stop_diag = ""
         self._dry = True
         # 连续「发出去但回查不到」的次数（软风控信号）
         self._silent_blocks = 0
@@ -474,41 +479,11 @@ class OutreachWorker:
                 "   届时会另发一张卡片提醒你"
             )
         elif kind == KIND_WORKS:
-            if diag == "session":
-                # 主页压根没渲染 → 两种可能（reason 里会说清是哪一种）：
-                #   ① 整个会话被降级（对照账号也打不开）
-                #   ② 单个主页没加载出来（资料接口说账号还在）
-                title = "🧱 抖音主页没渲染出来，触达已停手（**没有私信消耗你的线索**）"
-                steps = (
-                    "**你的账号没问题，不用扫码，也不是验证码。**\n"
-                    "抖音给我们看的**主页是空壳**：标题在、正文只剩站点框架，\n"
-                    "作品列表的请求压根没发出来。\n"
-                    "（账号本身可能是好的——资料接口能查到这个人）\n\n"
-                    "为什么必须停：系统分不清「抓不到」和「这个人真的没作品」，\n"
-                    "以前会误判成「没作品」→ 改发私信 → **有作品的老客户被私信顶掉**。\n"
-                    "现在抓不到就把线索**退回队列**，一条都不消耗。\n\n"
-                    "怎么办：\n"
-                    "1. 等一会儿抖音自己恢复（一般几十分钟到几小时）\n"
-                    "2. 急着要的话**换个网络**（手机热点）再跑\n"
-                    "3. **别反复重试**——重试只会让限流拖得更久\n"
-                    "4. 已退回队列的线索，等恢复后会重新走**留言**（不再私信）"
-                )
-            else:
-                title = "🧱 抖音不给我们作品列表了，触达已停手（**没有私信消耗你的线索**）"
-                steps = (
-                    "**你的账号没问题，不用扫码，也不是验证码。**\n"
-                    "抖音的「主页作品列表」这条路**不响应了**：\n"
-                    "页面连取作品的请求都不发（会话本身是正常的——\n"
-                    "对照的自家门店号主页能正常打开，资料也能拿到）。\n\n"
-                    "为什么必须停：系统分不清「抓不到」和「这个人真的没作品」，\n"
-                    "以前会误判成「没作品」→ 改发私信 → **有作品的老客户被私信顶掉**。\n"
-                    "现在抓不到就把线索**退回队列**，一条都不消耗。\n\n"
-                    "怎么办：\n"
-                    "1. 不用做任何事，等 30 分钟到几小时，它会自己恢复\n"
-                    "2. 急着要的话换个网络（手机热点）再跑\n"
-                    "3. **别反复重试**——重试只会让限流拖得更久\n"
-                    "4. 已退回队列的线索，等通道恢复后会重新走**留言**（不再私信）"
-                )
+            # ⚠ 文案**只有这一份**（stop_text.py）——
+            # 网页横幅那边也用它。以前两边各写一份，改了一边忘了另一边，
+            # 于是飞书说「不给我们作品列表了」、网页还在说「接口回空响应体」，
+            # 同一件事两套互相矛盾的说法。
+            title, steps = works_stop_text(diag)
         else:
             title = "🛑 抖音触达撞上账号限流，已停手"
             steps = (
@@ -1120,6 +1095,7 @@ class OutreachWorker:
         # 每轮从头开始（同一个 worker 对象可能被复用跑多轮）
         self.stop_reason = ""
         self._stop_kind = ""
+        self._stop_diag = ""
         # 本轮的临时间隔覆盖（网页上当场调，不写回配置）
         self._delay_min = delay_min
         self._delay_max = delay_max
@@ -1454,6 +1430,7 @@ class OutreachWorker:
                                    "线索一条没丢（都退回队列了），别重登、别重跑")
                             self.stop_reason = msg
                             self._stop_kind = KIND_WORKS
+                            self._stop_diag = _kind
                             self.log(f"🛑 {msg}")
                             self._emit(type="risk", lead=lead, error=msg,
                                        kind=KIND_WORKS, diag=_kind)
@@ -1714,6 +1691,7 @@ class OutreachWorker:
         self.st.finish_run(
             run_id, sent=summary["sent"], failed=summary["failed"],
             skipped=summary["skipped"], note=note, kind=self._stop_kind,
+            diag=self._stop_diag,
         )
         summary["stopped"] = self.stop_reason
         # 停手的**种类**要结构化带出去（不是靠文案猜）——

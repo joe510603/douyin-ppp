@@ -308,37 +308,51 @@ class OutreachRunner:
         return 0
 
     def last_risk_stop(self) -> dict:
-        """最近一次「触达停手」的情况
+        """最近一次「触达停手」的情况（**过期的不算数**）
 
         内存里的状态重启就没了，但停手这件事记在 ``outreach_runs`` 里，
         页面刷新、服务重启之后都该继续显示横幅——
         用户不一定记得十分钟前跑过一次，不能让他对着空气猜。
 
-        优先读 ``outreach_runs.kind``（结构化的停手种类），
-        老记录没有这一列，才退回按 note 文案猜。
+        ⚠ 但**停手是有时效的**（2026-11-28 修的真 bug）：
+        以前这里是「从最近 5 轮里找**第一条**带 kind 的」，
+        于是昨晚 20:58 那次 works 停手会**一直挂着**——
+        今天 11:00 都成功发出留言了（通道早恢复了），
+        用户打开网页还是看到「🧱 作品列表接口被限了，已停手」，
+        以为系统根本没修好（其实文案早就换了，只是没人撤横幅）。
+
+        现在的判据：**从新到旧看，第一轮「没有整体停手」的记录就说明通道当时是通的
+        → 那次停手已经过去 → 不显示横幅**。
+
+        判据用结构化的 ``kind`` 字段（老记录没这列才退回按文案猜）。
         """
         if self._risk_stop:
             return dict(self._risk_stop)
         try:
             st = OutreachStore(self._db_path())
             try:
-                runs = st.recent_runs(limit=5)
+                runs = st.recent_runs(limit=20)
             finally:
                 st.close()
         except Exception:
             return {}
         for r in runs:
             note = str(r.get("note") or "")
-            if not note:
-                continue
-            # 新记录：直接用存好的种类，不用猜
             kind = str(r.get("kind") or "").strip().lower()
-            if kind in (KIND_VERIFY, KIND_LIMIT, KIND_LOGIN, KIND_SEARCH):
-                return {"kind": kind, "reason": note}
+            diag = str(r.get("diag") or "").strip().lower()
+            # 新记录：直接用存好的种类，不用猜
+            if kind in (KIND_VERIFY, KIND_LIMIT, KIND_LOGIN, KIND_SEARCH, KIND_WORKS):
+                return {"kind": kind, "reason": note, "diag": diag}
+            if kind:
+                # 是停手，但**不是整体停手**（比如 dm：只停私信，评论照发）
+                # → 整体还在跑 → 更早的横幅早就过期了
+                return {}
             # 老记录（没有 kind 列）：按文案猜
             guessed = self._kind_from_note(note)
             if guessed:
-                return {"kind": guessed, "reason": note}
+                return {"kind": guessed, "reason": note, "diag": diag}
+            # 这一轮**没有**因风控停手 → 通道当时是通的 → 旧横幅过期
+            return {}
         return {}
 
     @staticmethod
@@ -562,7 +576,10 @@ class OutreachRunner:
             self._append_log("⚠️ 需要登录：请先扫码登录触达专用浏览器")
         elif t == "risk":
             kind = normalize_kind(str(event.get("kind") or ""))
-            self._risk_stop = {"kind": kind, "reason": str(event.get("error") or "")}
+            # diag 一起带着（works 用）—— 网页横幅要靠它选文案，
+            # 不能解析 reason 文案（文案会漂）。
+            self._risk_stop = {"kind": kind, "reason": str(event.get("error") or ""),
+                               "diag": str(event.get("diag") or "")}
             if kind == "login":
                 self._append_log(f"🔑 登录态失效：{event.get('error')}　→ 请扫码登录")
             elif kind == "verify":

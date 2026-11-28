@@ -229,6 +229,16 @@ class OutreachStore:
                 self._conn.execute(
                     "ALTER TABLE outreach_runs ADD COLUMN kind TEXT DEFAULT ''"
                 )
+            # diag = 停手的**诊断**（2026-11-28 加，老库要补列）
+            #
+            # kind 说「因为什么停手」，diag 说「到底是哪一种情况」：
+            #   session  → 主页压根没渲染（对照账号也打不开）
+            #   endpoint → 会话正常，只有取作品这条路没响应
+            # 网页横幅要靠它选文案 —— 不落库就只能解析 note 文案，文案一改就漂。
+            if "diag" not in cols:
+                self._conn.execute(
+                    "ALTER TABLE outreach_runs ADD COLUMN diag TEXT DEFAULT ''"
+                )
             # 明细表的补列（v2.0.11 之后陆续加的）
             rec_cols = {r[1] for r in
                         self._conn.execute("PRAGMA table_info(outreach_records)")}
@@ -781,20 +791,24 @@ class OutreachStore:
 
     def finish_run(
         self, run_id: int, sent: int = 0, failed: int = 0, skipped: int = 0,
-        note: str = "", kind: str = ""
+        note: str = "", kind: str = "", diag: str = ""
     ) -> None:
         """收尾一轮触达
 
         kind = 这一轮是因为什么停手的：verify / limit / login / 空
         （空 = 正常跑完，或者自己撞到连续异常主动停手）
 
+        diag = 停手的诊断（works 用）：session / endpoint / 空
+        ——「到底是哪一种情况」的**结构化**结论，别去解析 note 文案。
+
         单独存一列而不是塞进 note：note 是给人看的文案，
-        kind 是给机器读的判断依据，混在一起早晚对不上。
+        kind/diag 是给机器读的判断依据，混在一起早晚对不上。
         """
         self._conn.execute(
             "UPDATE outreach_runs SET sent = ?, failed = ?, skipped = ?, note = ?, "
-            "kind = ?, finished_at = datetime('now','localtime') WHERE id = ?",
-            [sent, failed, skipped, (note or "")[:300], (kind or "")[:20], run_id],
+            "kind = ?, diag = ?, finished_at = datetime('now','localtime') WHERE id = ?",
+            [sent, failed, skipped, (note or "")[:300], (kind or "")[:20],
+             (diag or "")[:20], run_id],
         )
         self._conn.commit()
 
