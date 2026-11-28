@@ -169,7 +169,48 @@ def test_对照正常时照旧判对方没了():
 
 
 # ============================================================
-# 3. 没有对照账号 → 不下结论
+# 3. 资料接口是权威判据（2026-11-28 实测加）
+# ============================================================
+
+def test_资料接口说人还在就不能判死():
+    """主页是空壳、写着「用户不存在」，但**资料接口说这个人还在**
+
+    2026-11-28 实测：悲伤Kitty猫 的主页变成壳页（正文只剩站点框架、
+    末尾挂着「用户不存在」），可标题是「悲伤Kitty猫的抖音」、
+    资料接口也查得到他 —— **账号好好的，是我们没加载出来**。
+    这种时候判「账号没了」→ not_found → 累计 3 次判死 → 真客户被冤死。
+    """
+    dy = _dy(control_body=_NORMAL_BODY, control_title="正常",
+             target_body=_SHELL_BODY, target_title="壳页")
+    dy._profile_info = lambda sec_uid: {
+        "sec_uid": sec_uid, "nickname": "悲伤Kitty猫",
+        "unique_id": "Matlc520", "signature": "", "aweme_count": 0,
+    }
+    with pytest.raises(SessionDegraded) as ei:
+        dy.resolve_by_sec_uid("MS4wLjABAAAATARGET")
+    assert "资料接口" in str(ei.value), str(ei.value)
+
+
+def test_资料接口说人没了且对照正常才判死():
+    """两道判据都不成立 → 他才是真没了"""
+    dy = _dy(control_body=_NORMAL_BODY, control_title="正常",
+             target_body=_SHELL_BODY, target_title="壳页")
+    dy._profile_info = lambda sec_uid: None      # 接口查不到（可能也被限流）
+    with pytest.raises(LeadNotFound):
+        dy.resolve_by_sec_uid("MS4wLjABAAAATARGET")
+
+
+def test_资料接口查不到时不能当成账号没了():
+    """接口限流返回空 ≠ 账号没了 → 还要问对照账号"""
+    dy = _dy(control_body=_SHELL_BODY, control_title="壳页",
+             target_body=_SHELL_BODY, target_title="壳页")
+    dy._profile_info = lambda sec_uid: None
+    with pytest.raises(SessionDegraded):
+        dy.resolve_by_sec_uid("MS4wLjABAAAATARGET")
+
+
+# ============================================================
+# 4. 没有对照账号 → 不下结论
 # ============================================================
 
 def test_没有对照账号就不判死():

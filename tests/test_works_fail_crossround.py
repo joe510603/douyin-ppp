@@ -46,17 +46,17 @@ from src.outreach.worker import OutreachWorker  # noqa: E402
 class _FakeDouyin:
     """假装是个 Douyin：作品抓取按指定方式失败
 
-    ``hits``/``empties`` 是抓取证据：
-      · hits=0, empties=0 → 主页压根没渲染（整个会话被降级）
-      · hits>0, empties>0 → 作品接口回了空响应体（这一条路被降级）
+    ``hits``/``empties`` 是抓取证据，``diag`` 是**结论**：
+      · "session"  → 对照账号也打不开 → 整个会话被降级
+      · "endpoint" → 会话正常，但取作品这条路没响应
     """
 
     def __init__(self, works_status: str = "failed", hits: int = 0,
-                 empties: int = 0):
+                 empties: int = 0, diag: str = "endpoint"):
         self.works_status = works_status
         self.last_works_fetch = {
             "status": works_status, "detail": "",
-            "hits": hits, "empties": empties,
+            "hits": hits, "empties": empties, "diag": diag,
         }
         self.sent_dm: list[tuple[str, str]] = []
 
@@ -180,7 +180,7 @@ def test_每轮一条也累计得到阈值(tmp_path, monkeypatch):
     w._notify_risk = lambda kind, reason, lead=None, diag="": (
         notified.append((kind, reason, diag)) or True)
     try:
-        dy = _FakeDouyin(works_status="failed")
+        dy = _FakeDouyin(works_status="failed", diag="session")
         # 第 1 轮：1 条失败 → 还没到阈值
         r1 = _跑一轮(w, dy, limit=1, monkeypatch=monkeypatch)
         assert r1.get("stop_kind") != KIND_WORKS, f"第 1 轮不该停手：{r1}"
@@ -325,10 +325,10 @@ def test_主页没渲染算会话降级(tmp_path, monkeypatch):
     """
     w, logs = _worker(tmp_path, n=3)
     try:
-        dy = _FakeDouyin(works_status="failed", hits=0, empties=0)
+        dy = _FakeDouyin(works_status="failed", hits=0, empties=0, diag="session")
         _跑一轮(w, dy, limit=1, monkeypatch=monkeypatch)
         joined = " ".join(logs)
-        assert "会话" in joined or "主页压根没渲染" in joined, joined
+        assert "整个会话" in joined, joined
     finally:
         w.st.close()
 
@@ -337,10 +337,11 @@ def test_空响应体算接口降级(tmp_path, monkeypatch):
     """接口回了 200 但响应体是空 → 这一条路被降级"""
     w, logs = _worker(tmp_path, n=3)
     try:
-        dy = _FakeDouyin(works_status="failed", hits=2, empties=2)
+        dy = _FakeDouyin(works_status="failed", hits=2, empties=2, diag="endpoint")
         _跑一轮(w, dy, limit=1, monkeypatch=monkeypatch)
         joined = " ".join(logs)
-        assert "空响应体" in joined, joined
+        assert "作品列表" in joined, joined
+        assert "整个会话" not in joined, "会话正常时别说是会话降级"
     finally:
         w.st.close()
 
@@ -353,13 +354,39 @@ def test_诊断分类写进异常(tmp_path, monkeypatch):
     try:
         # hits=0 → session
         with pytest.raises(WorksUnreachable) as ei:
-            w._handle_one(_FakeDouyin("failed", hits=0, empties=0),
+            w._handle_one(_FakeDouyin("failed", hits=0, empties=0,
+                                      diag="session"),
                           _lead(), {"dry": 0})
         assert ei.value.diag == "session", ei.value.diag
         # empties>0 → endpoint
         with pytest.raises(WorksUnreachable) as ei2:
-            w._handle_one(_FakeDouyin("failed", hits=1, empties=1),
+            w._handle_one(_FakeDouyin("failed", hits=1, empties=1,
+                                      diag="endpoint"),
                           _lead(), {"dry": 0})
         assert ei2.value.diag == "endpoint", ei2.value.diag
+    finally:
+        w.st.close()
+
+
+def test_会话正常时别把作品路没响应说成会话降级(tmp_path, monkeypatch):
+    """2026-11-28 实测纠正：hits=0 **不等于**会话降级
+
+    实测：对照账号（自家门店号）渲染得好好的、目标主页昵称也拿到了，
+    但作品 XHR 一次都没发出来 —— hits 也是 0。
+    这时候说「整个会话被降级了」就是误导（处置方式都不一样）。
+    判据只有一个：**对照账号能不能渲染**。
+    """
+    from src.outreach.douyin_api import WorksUnreachable
+
+    w, _ = _worker(tmp_path, n=1)
+    try:
+        dy = _FakeDouyin("failed", hits=0, empties=0)
+        # 会话是好的（对照账号正常）
+        dy.last_works_fetch = {"status": "failed", "detail": "接口命中 0 次",
+                               "hits": 0, "empties": 0, "diag": "endpoint"}
+        with pytest.raises(WorksUnreachable) as ei:
+            w._handle_one(dy, _lead(), {"dry": 0})
+        assert ei.value.diag == "endpoint", ei.value.diag
+        assert "整个会话" not in str(ei.value), str(ei.value)
     finally:
         w.st.close()

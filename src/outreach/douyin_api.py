@@ -352,6 +352,8 @@ class Douyin:
         self._control_ok = False
         self._control_checked_at = 0.0
         self._control_have = False
+        # 资料查询缓存（sec_uid → 资料 dict|None）
+        self._profile_cache: dict[str, dict | None] = {}
         self._search_health_reason = ""
         # 最近一次搜索返回的用户（批量缓存 sec_uid 用）
         self.last_search_users: list[dict] = []
@@ -437,6 +439,21 @@ class Douyin:
             return self.page.evaluate("document.body ? document.body.innerText : ''") or ""
         except Exception:
             return ""
+
+    def _session_broken(self) -> bool:
+        """会话是不是被降级了（拿对照账号判断）
+
+        ⚠ 会导航页面（对照账号的主页）→ 只能在**抓取已经结束之后**调用。
+
+        没有对照账号时返回 False（=「不知道」），
+        不能把「不知道」说成「会话坏了」。
+        """
+        if not self._control_sec_uid:
+            return False
+        try:
+            return not self._control_renders()
+        except Exception:
+            return False
 
     # ================================================================
     # 对照账号：分清「他没了」和「我们瞎了」（2026-11-27 加）
@@ -1443,17 +1460,32 @@ class Douyin:
 
             早点抛出去，别白等十几秒的接口超时。
 
-            ⚠ 「用户不存在」**不能直接当结论**（2026-11-27 实测）：
-              降级壳页里也写着「用户不存在」，
-              老代码直接判「账号失效」→ 线索记 not_found →
+            ⚠「用户不存在」**不能直接当结论**（2026-11-27/28 两轮实测）：
+              抖音把主页模块加载失败时，页面会变成一个壳：
+              标题还是对的（"悲伤Kitty猫的抖音"），正文只剩站点框架，
+              末尾还挂着「用户不存在」—— **账号好好的，是我们没加载出来**。
+              老代码看到这句话就判「账号没了」→ 线索记 not_found →
               累计 3 次就判 skipped **终态** → 真客户被冤死。
-              实测同一个人 4 次渲染正常、1 次变壳页 —— 账号好好的，是我们瞎了。
-              所以这里**重新**做一次对照（不走缓存），
-              对照账号也坏 → 是我们被降级；对照账号正常 → 他才是真没了。
+
+              判据按可信度排（2026-11-28 实测整理）：
+              ① **资料 API 能拿到这个人** → 账号确实在 → 页面没渲染出来
+                 → 退回队列，不判死（接口不依赖页面渲染，是权威的）
+              ② **对照账号（自家门店号）也打不开** → 整个会话被降级
+                 → 退回队列，不判死
+              ③ 都不成立 → 他才是真没了 → 判 not_found（留给人工）
             """
             body = self._body_text()
             if any(w in body for w in ("该用户已注销", "账号已注销", "用户不存在",
                                        "作品不存在", "暂时无法查看")):
+                info = self._profile_info(sec_uid)
+                if info and (info.get("nickname") or info.get("unique_id")):
+                    raise SessionDegraded(
+                        "主页显示「用户不存在」，但**资料接口说这个人还在**"
+                        f"（昵称「{info.get('nickname') or '（空）'}」）"
+                        "—— 是主页没渲染出来，不是账号没了；"
+                        "这条退回队列，不判死",
+                        diag="session",
+                    )
                 if not self._control_renders(max_age=0.0):
                     raise SessionDegraded(
                         "抖音把整个会话降级了（主页被换成「用户不存在」的壳页，"
@@ -1475,7 +1507,7 @@ class Douyin:
                 aweme_count = w["author_aweme_count"]
         # 个人简介：这条快路径**不搜索**，所以手上没有简介，得单独去取
         signature = ""
-        pinfo = self.fetch_profile_info(sec_uid)
+        pinfo = self._profile_info(sec_uid)
         if pinfo:
             signature = pinfo.get("signature") or ""
             if not nickname:
@@ -1512,6 +1544,22 @@ class Douyin:
         "https://www.iesdouyin.com/web/api/v2/user/info/"
         "?sec_uid={sec}&aid=1128&_signature=_02B4Z6wo00f01"
     )
+
+    def _profile_info(self, sec_uid: str) -> dict | None:
+        """带缓存的资料查询（同一轮别重复打这个接口）
+
+        为什么要缓存：判定「账号是不是真没了」要用它，
+        而取简介也要用它 —— 不缓存的话一条线索打两次。
+        """
+        key = str(sec_uid or "").strip()
+        if key in self._profile_cache:
+            return self._profile_cache[key]
+        try:
+            info = self.fetch_profile_info(key)
+        except Exception:
+            info = None
+        self._profile_cache[key] = info
+        return info
 
     def fetch_profile_info(self, sec_uid: str) -> dict | None:
         """拿用户资料：昵称 / **完整个人简介** / 抖音号 / 作品数
@@ -1763,12 +1811,19 @@ class Douyin:
         self.last_works_fetch = {
             "status": "empty" if trusted else "failed",
             # 证据要**结构化**地留下来（2026-11-27 加）：
-            # 光有一句 detail 不够，外层要按证据说不同的诊断：
-            #   hits=0      → 主页压根没渲染出来（页面连请求都没发）
-            #                → 整个**会话**被降级了（不是作品接口这一条路）
-            #   empties>0   → 作品接口回了空响应体（这一条路被降级）
+            # 光有一句 detail 不够，外层要按证据说不同的诊断。
+            #
+            # ⚠ 判「会话降级」还是「这条接口没响应」，**依据是对照账号**，
+            #   不是 hits（2026-11-28 实测纠正）：
+            #     会话被降级 → 主页变成「用户不存在」壳页 → 页面连请求都不发
+            #     但 hits=0 **也可能**是会话完全正常、只是作品这条路没响应
+            #     （实测：对照账号渲染正常、目标主页昵称也拿到了，
+            #       但作品 XHR 一次都没发出来 → 还是 hits=0）
+            #   所以拿对照账号（自家门店号）看一眼才知道是哪一种。
             "hits": hits,
             "empties": empties,
+            "diag": ("session" if (not trusted and self._session_broken())
+                     else ("endpoint" if not trusted else "")),
             "detail": (
                 f"接口命中 {hits} 次（空响应体 {empties} 次，状态 {statuses}），"
                 + ("接口说就是没有" if trusted else "响应体是空的/压根没响应 —— 抓不到，不是没有")
