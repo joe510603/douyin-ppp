@@ -133,6 +133,13 @@ def _跑一轮(w, leads, monkeypatch, dy=None):
         def fetch_works(self, sec_uid, limit=20):
             return dy.fetch_works(sec_uid, limit)
 
+        def set_control_account(self, sec_uid: str) -> None:
+            """对照账号（2026-11-27）：真实 Douyin 用它分清「他没了」和「我们瞎了」。
+
+            假对象不用真做对照，记下来就行（省得每个测试都去开一个对照页）。
+            """
+            self.control_sec_uid = sec_uid
+
     monkeypatch.setattr(worker_mod, "Douyin", _FakeDouyin)
 
     class _Ctx:

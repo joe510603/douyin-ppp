@@ -38,7 +38,8 @@ from .douyin_api import (
     KIND_WORKS,
     DM_FAIL_BLOCKED, DM_FAIL_ENV, DM_FAIL_TARGET,
     DmUnavailable, LeadNotFound, NoWorks, NotLoggedIn, RiskControl, SearchNotReady,
-    SearchUnavailable, VERIFY_TEXTS, WorksUnreachable, normalize_kind,
+    SearchUnavailable, SessionDegraded, VERIFY_TEXTS, WorksUnreachable,
+    normalize_kind,
 )
 from .store import (
     STATUS_COMMENTED,
@@ -394,7 +395,8 @@ class OutreachWorker:
             return KIND_VERIFY
         return KIND_LIMIT
 
-    def _notify_risk(self, kind: str, reason: str, lead: Optional[dict] = None) -> bool:
+    def _notify_risk(self, kind: str, reason: str, lead: Optional[dict] = None,
+                     diag: str = "") -> bool:
         """触达停手了 → 飞书通知你
 
         **任何**让触达停下来的情况都要通知，不能只有验证码才发。
@@ -472,21 +474,40 @@ class OutreachWorker:
                 "   届时会另发一张卡片提醒你"
             )
         elif kind == KIND_WORKS:
-            title = "🧱 抖音作品列表接口被限了，触达已停手（**没有私信消耗你的线索**）"
-            steps = (
-                "**你的账号没问题，不用扫码，也不是验证码。**\n"
-                "抖音把「主页作品列表」这个接口静默降级了：它回 HTTP 200，\n"
-                "但**响应体是空的**，主页的作品网格也渲染不出来。\n"
-                "（实测：资料接口正常、弹幕正常、私信能发，只有取作品这条路被挡）\n\n"
-                "为什么必须停：系统分不清「抓不到」和「这个人真的没作品」，\n"
-                "以前会误判成「没作品」→ 改发私信 → **有作品的老客户被私信顶掉**。\n"
-                "现在抓不到就把线索**退回队列**，一条都不消耗。\n\n"
-                "怎么办：\n"
-                "1. 不用做任何事，等 30 分钟到几小时，接口会自己恢复\n"
-                "2. 急着要的话换个网络（手机热点）再跑\n"
-                "3. **别反复重试**——重试只会让限流拖得更久\n"
-                "4. 已退回队列的线索，等通道恢复后会重新走**留言**（不再私信）"
-            )
+            if diag == "session":
+                # 主页压根没渲染 → 整个会话被降级（不是作品接口这一条路）
+                title = "🧱 抖音主页打不开（整个会话被降级），触达已停手（**没有私信消耗你的线索**）"
+                steps = (
+                    "**你的账号没问题，不用扫码，也不是验证码。**\n"
+                    "抖音给我们看的**整个网页版会话**被降级了：\n"
+                    "主页打开是一个「用户不存在」的壳页，\n"
+                    "页面连作品列表的请求都没发出去。\n"
+                    "（不只是作品接口坏，是**主页根本渲染不出来**）\n\n"
+                    "为什么必须停：系统分不清「抓不到」和「这个人真的没作品」，\n"
+                    "以前会误判成「没作品」→ 改发私信 → **有作品的老客户被私信顶掉**。\n"
+                    "现在抓不到就把线索**退回队列**，一条都不消耗。\n\n"
+                    "怎么办：\n"
+                    "1. 等一会儿抖音自己恢复（一般几十分钟到几小时）\n"
+                    "2. 急着要的话**换个网络**（手机热点）再跑\n"
+                    "3. **别反复重试**——重试只会让限流拖得更久\n"
+                    "4. 已退回队列的线索，等恢复后会重新走**留言**（不再私信）"
+                )
+            else:
+                title = "🧱 抖音作品列表接口被限了，触达已停手（**没有私信消耗你的线索**）"
+                steps = (
+                    "**你的账号没问题，不用扫码，也不是验证码。**\n"
+                    "抖音把「主页作品列表」这个接口静默降级了：它回 HTTP 200，\n"
+                    "但**响应体是空的**，主页的作品网格也渲染不出来。\n"
+                    "（实测：资料接口正常、弹幕正常、私信能发，只有取作品这条路被挡）\n\n"
+                    "为什么必须停：系统分不清「抓不到」和「这个人真的没作品」，\n"
+                    "以前会误判成「没作品」→ 改发私信 → **有作品的老客户被私信顶掉**。\n"
+                    "现在抓不到就把线索**退回队列**，一条都不消耗。\n\n"
+                    "怎么办：\n"
+                    "1. 不用做任何事，等 30 分钟到几小时，接口会自己恢复\n"
+                    "2. 急着要的话换个网络（手机热点）再跑\n"
+                    "3. **别反复重试**——重试只会让限流拖得更久\n"
+                    "4. 已退回队列的线索，等通道恢复后会重新走**留言**（不再私信）"
+                )
         else:
             title = "🛑 抖音触达撞上账号限流，已停手"
             steps = (
@@ -997,6 +1018,21 @@ class OutreachWorker:
             # 飞书写失败不影响主流程继续跑
             self.log(f"  ⚠️ 飞书状态回写失败: {e}")
 
+    def _control_sec_uid(self) -> str:
+        """挑一个「必然存在」的对照账号（自家门店号）
+
+        用它来判断「页面说不存在」是**他真没了**还是**我们被降级了**。
+        门店官方号的主页一定在（我们自己天天在用）。
+
+        找不到就用空字符串 —— 那时**不下**「账号没了」的结论
+        （宁可多试几次，也不能冤死一个真客户）。
+        """
+        for m in (getattr(self.cfg, "monitors", []) or []):
+            sec = (getattr(m, "sec_user_id", "") or "").strip()
+            if sec:
+                return sec
+        return ""
+
     def _bump_works_fail(self) -> int:
         """记一次「作品列表抓不到」，返回**跨轮累计**的次数
 
@@ -1204,6 +1240,10 @@ class OutreachWorker:
             with self._page_ctx(profile_dir, bool(o.headless), session) as page:
                 self._page = page
                 dy = Douyin(page, shot_dir=shots, log=self.log)
+                # 给它一个「必然存在」的对照账号（自家门店号）——
+                # 用来分清「页面说这个人不存在」是**他真没了**还是**我们被降级了**
+                # （降级壳页里也写着「用户不存在」，不对照就会冤死真客户）。
+                dy.set_control_account(self._control_sec_uid())
                 # 存一份：等人工验证时要靠它判断「验证码是不是已经过了」
                 self._dy = dy
                 if not dy.cookies_ok():
@@ -1389,17 +1429,32 @@ class OutreachWorker:
                             #   except 块里抛出的异常**不会**被同一个 try 的
                             #   其他 except 接住 → 会直接冲出整个 run()。
                             #   所以这里内联停手（跟 RiskControl 分支一个路数）。
-                            msg = (f"连续 {consecutive_works_fail} 条都抓不到作品列表"
-                                   "（抖音把作品接口降级了：HTTP 200 但响应体是空的）"
-                                   "，已停手 —— 这不是账号的问题，别重登、别重跑，"
-                                   "线索一条没丢（都退回队列了），"
-                                   "等限流过去或换网络再继续")
+                            #
+                            # 诊断按**证据**分两种（2026-11-27 实测）：
+                            #   session  → 主页压根没渲染 → 整个会话被降级
+                            #   endpoint → 作品接口回空响应体 → 这一条路被挡
+                            _kind = str(getattr(e, "diag", "") or "")
+                            if _kind == "session":
+                                _cause = ("主页压根没渲染出来（页面连作品请求都没发）"
+                                          "—— 抖音把**整个会话**降级了")
+                                _fix = ("这不是验证码、也不是登录问题；"
+                                        "等它自己恢复，或换个网络（手机热点）再试")
+                            elif _kind == "endpoint":
+                                _cause = "抖音把作品接口降级了（HTTP 200 但空响应体）"
+                                _fix = "等它自己恢复，或换个网络（手机热点）再试"
+                            else:
+                                _cause = "作品列表抓不到"
+                                _fix = "等它自己恢复，或换个网络（手机热点）再试"
+                            msg = (f"连续 {consecutive_works_fail} 条线索取不到作品/主页"
+                                   f"（{_cause}）"
+                                   f"，已停手 —— {_fix}；"
+                                   "线索一条没丢（都退回队列了），别重登、别重跑")
                             self.stop_reason = msg
                             self._stop_kind = KIND_WORKS
                             self.log(f"🛑 {msg}")
                             self._emit(type="risk", lead=lead, error=msg,
-                                       kind=KIND_WORKS)
-                            self._notify_risk(KIND_WORKS, msg, lead)
+                                       kind=KIND_WORKS, diag=_kind)
+                            self._notify_risk(KIND_WORKS, msg, lead, diag=_kind)
                             # 线索保持 pending（**不是失败**）—— 它没被联系过，
                             # 通道恢复后还会走留言。
                             break
@@ -1448,11 +1503,17 @@ class OutreachWorker:
                             self._emit(type="skipped", lead=lead, error=note)
                         else:
                             self._set_status(lead, STATUS_NOT_FOUND, str(e))
-                            self.st.add_touch(
-                                lead_id=lead["id"], record_id=lead.get("bitable_record_id") or "",
-                                display_id=lead["display_id"], nickname=lead.get("nickname") or "",
-                                status="not_found", error=str(e),
-                            )
+                            # ⚠ 干跑**不写触达记录**（2026-11-27 修）：
+                            #   「干跑完全不改状态」是这套的规矩，
+                            #   但这条路径以前照写 not_found 记录 →
+                            #   干跑一次，触达记录里就多一条「搜不到这个人」，
+                            #   后面复盘时看着像真发生过。
+                            if not self._dry:
+                                self.st.add_touch(
+                                    lead_id=lead["id"], record_id=lead.get("bitable_record_id") or "",
+                                    display_id=lead["display_id"], nickname=lead.get("nickname") or "",
+                                    status="not_found", error=str(e),
+                                )
                             self._emit(type="skipped", lead=lead, error=str(e))
                         # ⚠ 这里**不停手**（2026-11-13 用户反馈纠正）：
                         #   「是不是转牛角尖了，一直在搜索搜不到的人，然后一直触发风控？
@@ -2238,9 +2299,32 @@ class OutreachWorker:
         if not work:
             if wst == "failed":
                 # 「抓不到」≠「没有」→ 退回队列等通道恢复，别私信消耗这条线索
+                #
+                # ⚠ 诊断要按**实际证据**说（2026-11-27 实测）：
+                #   hits=0    → 主页压根没渲染出来，页面连作品请求都没发
+                #               → 这是**整个会话**被降级了（检测器那边
+                #                 同样在报「正文533字/用户不存在」），
+                #                 不是「作品接口这一条路被挡」
+                #   empties>0 → 作品接口回了空响应体（这一条路被降级）
+                # 两种的处置不一样，不能都写成「作品接口降级」。
+                wst_ev = getattr(dy, "last_works_fetch", None) or {}
+                _hits = int(wst_ev.get("hits") or 0)
+                _empties = int(wst_ev.get("empties") or 0)
+                if _hits == 0 and _empties == 0:
+                    _diag_kind = "session"
+                    _diag = ("主页压根没渲染出来（页面连作品请求都没发）"
+                             "—— 多半是抖音把**整个会话**降级了"
+                             "（主页被换成「用户不存在」的壳页）")
+                elif _empties > 0:
+                    _diag_kind = "endpoint"
+                    _diag = "抖音把作品接口降级了（HTTP 200 但空响应体）"
+                else:
+                    _diag_kind = ""
+                    _diag = f"作品列表抓不到（{wst_ev.get('detail') or '没有可用响应'}）"
                 raise WorksUnreachable(
-                    "作品列表抓不到（抖音把作品接口降级了：HTTP 200 但响应体是空的）"
-                    "—— 这条退回队列等通道恢复，不能当成「这个人没作品」"
+                    f"作品列表抓不到（{_diag}）"
+                    "—— 这条退回队列等通道恢复，不能当成「这个人没作品」",
+                    diag=_diag_kind,
                 )
             self._fallback_to_dm(dy, lead, summary, why="该用户没有可用的公开作品")
             return

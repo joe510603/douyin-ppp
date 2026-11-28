@@ -96,6 +96,13 @@ class _FakeDouyin:
     def cookies_ok(self) -> bool:
         return True
 
+    def set_control_account(self, sec_uid: str) -> None:
+        """对照账号（2026-11-27）：真实 Douyin 用它分清「他没了」和「我们瞎了」。
+
+        假对象不用真做对照，记下来就行（省得每个测试都去开一个对照页）。
+        """
+        self.control_sec_uid = sec_uid
+
 
 def _建库(tmp_path, n: int = 3):
     db = tmp_path / "t.db"
@@ -304,7 +311,7 @@ def test_连续抓不到就停手(tmp_path, monkeypatch):
         w.st.close()
 
     assert res.get("stop_kind") == KIND_WORKS, res
-    assert "抓不到作品" in str(res.get("stopped") or ""), res
+    assert "取不到作品" in str(res.get("stopped") or ""), res
     # 一条私信都不能发出去
     # （发出去就等于把有作品的客户私信消耗掉了）
 

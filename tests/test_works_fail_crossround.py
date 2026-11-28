@@ -44,11 +44,20 @@ from src.outreach.worker import OutreachWorker  # noqa: E402
 
 
 class _FakeDouyin:
-    """假装是个 Douyin：作品抓取按指定方式失败"""
+    """假装是个 Douyin：作品抓取按指定方式失败
 
-    def __init__(self, works_status: str = "failed"):
+    ``hits``/``empties`` 是抓取证据：
+      · hits=0, empties=0 → 主页压根没渲染（整个会话被降级）
+      · hits>0, empties>0 → 作品接口回了空响应体（这一条路被降级）
+    """
+
+    def __init__(self, works_status: str = "failed", hits: int = 0,
+                 empties: int = 0):
         self.works_status = works_status
-        self.last_works_fetch = {"status": works_status, "detail": ""}
+        self.last_works_fetch = {
+            "status": works_status, "detail": "",
+            "hits": hits, "empties": empties,
+        }
         self.sent_dm: list[tuple[str, str]] = []
 
     def fetch_works(self, sec_uid: str, limit: int = 20) -> list:
@@ -76,6 +85,13 @@ class _FakeDouyin:
 
     def cookies_ok(self) -> bool:
         return True
+
+    def set_control_account(self, sec_uid: str) -> None:
+        """对照账号（2026-11-27）：真实 Douyin 用它分清「他没了」和「我们瞎了」。
+
+        假对象不用真做对照，记下来就行（省得每个测试都去开一个对照页）。
+        """
+        self.control_sec_uid = sec_uid
 
 
 def _建库(tmp_path, n: int = 3):
@@ -136,6 +152,19 @@ def _跑一轮(w, dy, limit: int = 1, monkeypatch=None):
     return w.run(limit=limit)
 
 
+def _lead(**kw) -> dict:
+    lead = {
+        "id": 1, "display_id": "dy_1", "nickname": "昵称1",
+        "sec_uid": "MS4wLjABAAAAtest1", "store": "测试门店",
+        "car_model": "小米SU7", "contact_type": "", "contact_value": "",
+        "evidence": "[]", "monitor_name": "测试直播间",
+        "bitable_record_id": "", "intent_level": "high", "intent_score": 90,
+        "no_works": 0,
+    }
+    lead.update(kw)
+    return lead
+
+
 # ============================================================
 # 1. 跨轮累计
 # ============================================================
@@ -148,7 +177,8 @@ def test_每轮一条也累计得到阈值(tmp_path, monkeypatch):
     """
     w, logs = _worker(tmp_path, n=3)
     notified = []
-    w._notify_risk = lambda kind, reason, lead=None: notified.append((kind, reason)) or True
+    w._notify_risk = lambda kind, reason, lead=None, diag="": (
+        notified.append((kind, reason, diag)) or True)
     try:
         dy = _FakeDouyin(works_status="failed")
         # 第 1 轮：1 条失败 → 还没到阈值
@@ -165,9 +195,11 @@ def test_每轮一条也累计得到阈值(tmp_path, monkeypatch):
         r3 = _跑一轮(w, dy, limit=1, monkeypatch=monkeypatch)
         assert r3.get("stop_kind") == KIND_WORKS, f"第 3 轮该停手：{r3}"
         assert notified, "该发飞书卡片告诉用户"
-        kind, reason = notified[0]
+        kind, reason, diag = notified[0]
         assert kind == KIND_WORKS, kind
-        assert "抓不到作品" in reason, reason
+        assert "取不到作品" in reason, reason
+        # 诊断要分对：主页压根没渲染 → 会话被降级（不是作品接口这一条路）
+        assert diag == "session", diag
     finally:
         w.st.close()
 
@@ -276,5 +308,58 @@ def test_降级期间绝不发私信(tmp_path, monkeypatch):
         dy = _FakeDouyin(works_status="failed")
         _跑一轮(w, dy, limit=3, monkeypatch=monkeypatch)
         assert dy.sent_dm == [], f"绝不能发私信，实际 {dy.sent_dm}"
+    finally:
+        w.st.close()
+
+
+# ============================================================
+# 5. 诊断要按证据分两种，不能一律说「作品接口降级」
+# ============================================================
+
+def test_主页没渲染算会话降级(tmp_path, monkeypatch):
+    """接口压根没响应 → 是**整个会话**被降级，不是作品接口这一条路
+
+    实测（2026-11-27 20:48）：作品抓取证据是「接口命中 0 次、空响应体 0 次」，
+    跟检测器报的「正文533字/用户不存在」是同一件事 —— 主页根本没渲染。
+    这时还跟用户说「作品接口被限了」就是误导。
+    """
+    w, logs = _worker(tmp_path, n=3)
+    try:
+        dy = _FakeDouyin(works_status="failed", hits=0, empties=0)
+        _跑一轮(w, dy, limit=1, monkeypatch=monkeypatch)
+        joined = " ".join(logs)
+        assert "会话" in joined or "主页压根没渲染" in joined, joined
+    finally:
+        w.st.close()
+
+
+def test_空响应体算接口降级(tmp_path, monkeypatch):
+    """接口回了 200 但响应体是空 → 这一条路被降级"""
+    w, logs = _worker(tmp_path, n=3)
+    try:
+        dy = _FakeDouyin(works_status="failed", hits=2, empties=2)
+        _跑一轮(w, dy, limit=1, monkeypatch=monkeypatch)
+        joined = " ".join(logs)
+        assert "空响应体" in joined, joined
+    finally:
+        w.st.close()
+
+
+def test_诊断分类写进异常(tmp_path, monkeypatch):
+    """diag 是结构化的（外层拼文案不许解析 str(e)）"""
+    from src.outreach.douyin_api import WorksUnreachable
+
+    w, _ = _worker(tmp_path, n=1)
+    try:
+        # hits=0 → session
+        with pytest.raises(WorksUnreachable) as ei:
+            w._handle_one(_FakeDouyin("failed", hits=0, empties=0),
+                          _lead(), {"dry": 0})
+        assert ei.value.diag == "session", ei.value.diag
+        # empties>0 → endpoint
+        with pytest.raises(WorksUnreachable) as ei2:
+            w._handle_one(_FakeDouyin("failed", hits=1, empties=1),
+                          _lead(), {"dry": 0})
+        assert ei2.value.diag == "endpoint", ei2.value.diag
     finally:
         w.st.close()

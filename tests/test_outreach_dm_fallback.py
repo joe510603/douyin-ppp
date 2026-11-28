@@ -75,6 +75,13 @@ class _FakeDouyin:
     def check_risk(self) -> None:
         return None
 
+    def set_control_account(self, sec_uid: str) -> None:
+        """对照账号（2026-11-27）：真实 Douyin 用它分清「他没了」和「我们瞎了」。
+
+        假对象不用真做对照，记下来就行（省得每个测试都去开一个对照页）。
+        """
+        self.control_sec_uid = sec_uid
+
 
 def _建库(tmp_path):
     """建一个带 leads 表的测试库

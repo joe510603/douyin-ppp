@@ -198,6 +198,40 @@ class WorksUnreachable(DouyinError):
 
     **「看不见」≠「不存在」**：抓不到必须是「不知道」，
     退回队列等通道恢复，不能当成业务结论。
+
+    ``diag``：结构化的诊断（2026-11-27 加）——
+    外层要用它拼告警文案，别去解析 ``str(e)``（文案会漂）。
+    取值：
+      · ``"session"`` 主页压根没渲染出来 → **整个会话**被降级了
+      · ``"endpoint"`` 作品接口回了空响应体 → 这一条路被降级
+      · ``""`` 没归类
+    """
+
+    def __init__(self, message: str = "", diag: str = ""):
+        super().__init__(message)
+        self.diag = diag or ""
+
+
+class SessionDegraded(WorksUnreachable):
+    """**整个网页版会话被降级了** —— 不是「这个人没作品」，也不是「这个人没了」。
+
+    2026-11-27 20:57 实测（线上抓的）：
+        抖音把我们的会话降级时，**主页被换成「用户不存在」的壳页**
+        （正文 533 字，页面连作品列表的请求都不发）。
+
+    ⚠ 最坑的地方：壳页里写着「用户不存在」，
+      老代码直接判「这个抖音号死了」→ 线索记 ``not_found`` →
+      累计 3 次就判 ``skipped`` **终态** → **真客户被冤死**。
+
+      实测同一个人（悲伤Kitty猫）4 次渲染正常、1 次变壳页 ——
+      账号好好的，是我们瞎了。
+
+    所以「用户不存在」必须**拿一个必然存在的账号做对照**才能下结论
+    （2026-11-15 的教训：官方号对照才是决定性证据）。
+    对照账号也显示不存在 → 是我们被降级了 → 这条退回队列，不消耗。
+
+    它继承 ``WorksUnreachable``：会话降级时作品列表当然也抓不到，
+    计数、熔断、告警走同一套（只停作品/会话通道，别的照发）。
     """
 
 
@@ -304,6 +338,20 @@ class Douyin:
         # 白等 90~120 秒慢档，还白白丢掉一批线索。
         self._search_health_at = 0.0
         self._search_health_state = "ok"
+        # ---- 对照账号（2026-11-27 加）----
+        #
+        # 一个「必然存在」的账号（自家门店号），用来回答：
+        # 「页面说这个人不存在」——是**他真没了**，还是**我们被降级了**？
+        #
+        # 降级时主页会被换成「用户不存在」的壳页 → 老代码当成账号失效 →
+        # 线索记 not_found → 累计 3 次判 skipped **终态** → 真客户被冤死
+        # （2026-11-27 20:57 实测：同一个人 4 次正常、1 次变壳页）。
+        #
+        # 缓存 10 分钟：降级是**持续状态**，不用每条线索都去对照一次。
+        self._control_sec_uid = ""
+        self._control_ok = False
+        self._control_checked_at = 0.0
+        self._control_have = False
         self._search_health_reason = ""
         # 最近一次搜索返回的用户（批量缓存 sec_uid 用）
         self.last_search_users: list[dict] = []
@@ -389,6 +437,63 @@ class Douyin:
             return self.page.evaluate("document.body ? document.body.innerText : ''") or ""
         except Exception:
             return ""
+
+    # ================================================================
+    # 对照账号：分清「他没了」和「我们瞎了」（2026-11-27 加）
+    # ================================================================
+
+    def set_control_account(self, sec_uid: str) -> None:
+        """设一个「必然存在」的对照账号（自家门店号）
+
+        用来回答那个致命的问题：
+        「页面说这个人不存在」——是**他真没了**，还是**我们被降级了**？
+
+        没有对照账号时，宁可**不下**「账号没了」的结论：
+        冤死一个真客户，比多试一两次的代价大得多。
+        """
+        self._control_sec_uid = str(sec_uid or "").strip()
+
+    def _control_renders(self, max_age: float = 600.0) -> bool:
+        """对照账号能不能正常渲染
+
+        True  = 我们的会话是好的（那「用户不存在」就是真的）
+        False = 我们被降级了（那「用户不存在」不可信）
+
+        ⚠ 必须在**打开目标主页之前**调用 ——
+          它会导航到对照账号的页面，在目标主页开着的时候调用会把页面导航走。
+        """
+        if not self._control_sec_uid:
+            return False        # 没有对照账号 → 不敢下「账号没了」的结论
+        now = time.time()
+        if self._control_have and (now - self._control_checked_at) < max_age:
+            return self._control_ok
+        ok = False
+        try:
+            self._goto(f"{DOUYIN}/user/{self._control_sec_uid}")
+            self.page.wait_for_timeout(900)
+            body = self._body_text() or ""
+            try:
+                title = self.page.title() or ""
+            except Exception:
+                title = ""
+            degraded = (
+                "用户不存在" in body or "该用户已注销" in body
+                or "账号已注销" in body or "作品不存在" in body
+                or "暂时无法查看" in body
+                or len(body.strip()) < 60
+                or "验证" in title or "验证码" in title
+            )
+            ok = not degraded
+        except Exception:
+            ok = False
+        self._control_ok = ok
+        self._control_have = True
+        self._control_checked_at = now
+        if ok:
+            self.log("  ✓ 对照账号正常渲染 → 会话是好的")
+        else:
+            self.log("  ⚠️ 对照账号也打不开 → **是我们被降级了**，不是对方的问题")
+        return ok
 
     def check_risk(self) -> None:
         """每次都过一遍风控信号；命中就抛 RiskControl，由调度器整体停机。"""
@@ -1321,14 +1426,41 @@ class Douyin:
         self.ensure_login()
         self.log(f"  已有 sec_uid，跳过搜索，直接开主页：{sec_uid[:20]}…")
 
+        # ⚠ 先确认会话是不是好的（2026-11-27 加）
+        #
+        # 降级时主页会被换成「用户不存在」的壳页 →
+        # 老代码当成「这个号没了」→ 线索记 not_found → 累计 3 次判死。
+        # 先拿对照账号（自家门店号）看一眼：我们瞎了还是他真没了。
+        if not self._control_renders():
+            raise SessionDegraded(
+                "抖音把整个会话降级了（对照账号也打不开，主页被换成「用户不存在」的壳页）"
+                "—— 这条退回队列等会话恢复，不能当成「这个抖音号没了」",
+                diag="session",
+            )
+
         def _check_alive() -> None:
             """主页一打开就判一下账号还在不在
 
             早点抛出去，别白等十几秒的接口超时。
+
+            ⚠ 「用户不存在」**不能直接当结论**（2026-11-27 实测）：
+              降级壳页里也写着「用户不存在」，
+              老代码直接判「账号失效」→ 线索记 not_found →
+              累计 3 次就判 skipped **终态** → 真客户被冤死。
+              实测同一个人 4 次渲染正常、1 次变壳页 —— 账号好好的，是我们瞎了。
+              所以这里**重新**做一次对照（不走缓存），
+              对照账号也坏 → 是我们被降级；对照账号正常 → 他才是真没了。
             """
             body = self._body_text()
             if any(w in body for w in ("该用户已注销", "账号已注销", "用户不存在",
                                        "作品不存在", "暂时无法查看")):
+                if not self._control_renders(max_age=0.0):
+                    raise SessionDegraded(
+                        "抖音把整个会话降级了（主页被换成「用户不存在」的壳页，"
+                        "对照账号同样打不开）"
+                        "—— 这条退回队列等会话恢复，不能当成「这个抖音号没了」",
+                        diag="session",
+                    )
                 raise LeadNotFound("抖音号已失效（主页提示用户不存在/已注销）")
 
         works = self._fetch_works_page(sec_uid, after_open=_check_alive)
@@ -1630,6 +1762,13 @@ class Douyin:
         # 于是有作品的人被私信消耗掉、再也不会留言（543 条误判）。
         self.last_works_fetch = {
             "status": "empty" if trusted else "failed",
+            # 证据要**结构化**地留下来（2026-11-27 加）：
+            # 光有一句 detail 不够，外层要按证据说不同的诊断：
+            #   hits=0      → 主页压根没渲染出来（页面连请求都没发）
+            #                → 整个**会话**被降级了（不是作品接口这一条路）
+            #   empties>0   → 作品接口回了空响应体（这一条路被降级）
+            "hits": hits,
+            "empties": empties,
             "detail": (
                 f"接口命中 {hits} 次（空响应体 {empties} 次，状态 {statuses}），"
                 + ("接口说就是没有" if trusted else "响应体是空的/压根没响应 —— 抓不到，不是没有")

@@ -68,6 +68,9 @@ def _douyin(page, works=None) -> Douyin:
 
     dy._fetch_works_page = _fake_fetch  # type: ignore[assignment]
     dy.ensure_login = lambda: None  # type: ignore[assignment]
+    # 这个测试不涉及「会话被降级」→ 对照账号一律当作正常
+    # （真实实现会开一个对照页面；这里假页面开不了，直接给结论）
+    dy._control_renders = lambda max_age=600.0: True  # type: ignore[assignment]
     return dy
 
 
